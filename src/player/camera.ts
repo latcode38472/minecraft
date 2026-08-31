@@ -17,9 +17,7 @@ export class MouseLook {
   ) {
     document.addEventListener('mousemove', (e) => {
       if (!this.locked) return;
-      this.yaw -= e.movementX * MOUSE_SENSITIVITY;
-      this.pitch -= e.movementY * MOUSE_SENSITIVITY;
-      this.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, this.pitch));
+      this.rotate(e.movementX, e.movementY, MOUSE_SENSITIVITY);
     });
     document.addEventListener('pointerlockchange', () => {
       this.locked = document.pointerLockElement === this.lockTarget;
@@ -28,6 +26,13 @@ export class MouseLook {
 
   requestLock(): void {
     this.lockTarget.requestPointerLock();
+  }
+
+  /** Apply a look delta in screen pixels — used by both mouse and touch input. */
+  rotate(dxPixels: number, dyPixels: number, sensitivity: number): void {
+    this.yaw -= dxPixels * sensitivity;
+    this.pitch -= dyPixels * sensitivity;
+    this.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, this.pitch));
   }
 
   /** Position the camera at the eye point with current yaw/pitch. */

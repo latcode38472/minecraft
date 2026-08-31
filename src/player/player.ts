@@ -19,10 +19,17 @@ import {
   WATER_SPEED_FACTOR,
   WATER_TERMINAL_VELOCITY,
 } from '../constants';
-import type { Input } from '../input';
 import type { World } from '../world/world';
 
 const EPSILON = 0.001;
+
+/** Device-agnostic movement intent; forward/strafe may be analog (joystick). */
+export interface MoveInput {
+  forward: number;
+  strafe: number;
+  jump: boolean;
+  sneak: boolean;
+}
 
 export class Player {
   /** Feet position (bottom centre of the AABB). */
@@ -40,23 +47,21 @@ export class Player {
     return out.set(this.position.x, this.position.y + PLAYER_EYE_HEIGHT, this.position.z);
   }
 
-  update(dt: number, input: Input, yaw: number): void {
-    const sneaking = input.isDown('ShiftLeft') || input.isDown('ShiftRight');
+  update(dt: number, move: MoveInput, yaw: number): void {
     this.updateWaterState();
 
-    // Wish direction in the horizontal plane, relative to camera yaw.
-    let fwd = 0;
-    let strafe = 0;
-    if (input.isDown('KeyW')) fwd += 1;
-    if (input.isDown('KeyS')) fwd -= 1;
-    if (input.isDown('KeyD')) strafe += 1;
-    if (input.isDown('KeyA')) strafe -= 1;
+    // Wish direction in the horizontal plane, relative to camera yaw. Analog
+    // magnitudes below 1 scale the speed; diagonals get normalised.
+    let fwd = move.forward;
+    let strafe = move.strafe;
     const len = Math.hypot(fwd, strafe);
-    let speed = sneaking ? SNEAK_SPEED : WALK_SPEED;
+    let speed = move.sneak ? SNEAK_SPEED : WALK_SPEED;
     if (this.feetInWater) speed *= WATER_SPEED_FACTOR;
     if (len > 0) {
-      fwd /= len;
-      strafe /= len;
+      if (len > 1) {
+        fwd /= len;
+        strafe /= len;
+      }
       const sin = Math.sin(yaw);
       const cos = Math.cos(yaw);
       this.velocity.x = (-sin * fwd + cos * strafe) * speed;
@@ -67,15 +72,15 @@ export class Player {
     }
 
     if (this.feetInWater) {
-      if (input.isDown('Space')) {
+      if (move.jump) {
         this.velocity.y = SWIM_UP_SPEED;
       } else {
         this.velocity.y -= WATER_GRAVITY * dt;
-        if (sneaking) this.velocity.y -= WATER_GRAVITY * dt;
+        if (move.sneak) this.velocity.y -= WATER_GRAVITY * dt;
         this.velocity.y = Math.max(this.velocity.y, -WATER_TERMINAL_VELOCITY);
       }
     } else {
-      if (input.isDown('Space') && this.onGround) this.velocity.y = JUMP_SPEED;
+      if (move.jump && this.onGround) this.velocity.y = JUMP_SPEED;
       this.velocity.y -= GRAVITY * dt;
       this.velocity.y = Math.max(this.velocity.y, -TERMINAL_VELOCITY);
     }

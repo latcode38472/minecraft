@@ -14,6 +14,8 @@ Production build: `npm run build`, serve with `npm run preview`.
 
 ## Controls
 
+### Desktop
+
 | Input | Action |
 | --- | --- |
 | Click | capture mouse (Esc releases) |
@@ -28,8 +30,28 @@ Production build: `npm run build`, serve with `npm run preview`.
 | T | skip time forward (test day/night) |
 | F3 | debug overlay |
 
+### Mobile / touch
+
+Touch devices get Pocket-Edition-style controls automatically (best in
+landscape):
+
+| Input | Action |
+| --- | --- |
+| Left pad | move (analog) |
+| Drag anywhere else | look |
+| Tap | break targeted block |
+| Press & hold | place selected block (repeats) |
+| ▲ button | jump / swim up (hold) |
+| ▼ button | sneak / swim down (toggle) |
+| Tap hotbar | select block |
+| ❚❚ button | pause / show menu |
+
+Touch defaults to a 4-chunk view distance for phone GPUs. Detection uses the
+primary-pointer media query, so touchscreen laptops keep the desktop scheme;
+append `?touch=1` to force touch controls on any device.
+
 URL parameters: `?seed=12345` starts a specific world (a new seed wipes saved
-edits), `?reset` wipes the save entirely.
+edits), `?reset` wipes the save entirely, `?touch=1` forces touch controls.
 
 ## What's in the MVP
 
@@ -43,6 +65,7 @@ edits), `?reset` wipes the save entirely.
 - Day/night cycle driving sun light, ambient light, sky and fog colour
 - Baked ambient occlusion + directional face shading on chunk meshes
 - Generated sound effects (break / place / footsteps) via WebAudio
+- Mobile touch controls: virtual joystick, drag-look, tap/hold to break/place
 - World persistence in IndexedDB: seed, player state, and per-chunk edit diffs,
   auto-saved every 5 s and on tab hide
 
@@ -69,6 +92,7 @@ src/
     player.ts        AABB physics: axis-separated collision, swim, substeps
   ui/
     hud.ts           hotbar, FPS counter, debug panel, toasts
+    touch.ts         virtual joystick, look/tap/long-press gestures, buttons
   main.ts            bootstrapping and the frame loop
 ```
 

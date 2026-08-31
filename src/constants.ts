@@ -30,6 +30,13 @@ export const REACH_DISTANCE = 5; // blocks
 export const BREAK_REPEAT_MS = 240; // hold-to-break repeat interval
 export const PLACE_REPEAT_MS = 240;
 
+// Touch controls
+export const TOUCH_LOOK_SENSITIVITY = 0.0042; // radians per pixel dragged
+export const TOUCH_TAP_MAX_MS = 260; // release faster than this = tap (break)
+export const TOUCH_LONG_PRESS_MS = 350; // hold longer than this = place
+export const TOUCH_TAP_CANCEL_PX = 14; // finger travel beyond this = look drag
+export const TOUCH_DEFAULT_VIEW_DISTANCE = 4;
+
 // Day/night
 export const DAY_LENGTH_SECONDS = 600; // one full cycle
 export const START_TIME_OF_DAY = 0.35; // 0=midnight 0.25=sunrise 0.5=noon 0.75=sunset

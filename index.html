@@ -2,11 +2,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>Voxelcraft</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='6' fill='%236aaa40'/%3E%3Crect y='6' width='16' height='10' fill='%23866043'/%3E%3C/svg%3E" />
     <style>
-      html, body { margin: 0; padding: 0; overflow: hidden; height: 100%; background: #000; }
+      html, body {
+        margin: 0; padding: 0; overflow: hidden; height: 100%; background: #000;
+        touch-action: none; overscroll-behavior: none;
+        -webkit-user-select: none; user-select: none;
+        -webkit-tap-highlight-color: transparent;
+      }
       #app { position: fixed; inset: 0; }
       canvas { display: block; }
 
@@ -25,9 +33,10 @@
       }
 
       #hotbar {
-        left: 50%; bottom: 10px; transform: translateX(-50%);
+        left: 50%; bottom: calc(10px + env(safe-area-inset-bottom)); transform: translateX(-50%);
         display: flex; gap: 4px; padding: 4px;
         background: rgba(0, 0, 0, 0.35); border-radius: 4px;
+        pointer-events: auto; touch-action: none;
       }
       .slot {
         width: 46px; height: 46px; border: 2px solid #666; border-radius: 3px;
@@ -55,6 +64,48 @@
       #menu table { font-size: 14px; color: #ccc; border-spacing: 12px 3px; }
       #menu td:first-child { color: #fff; text-align: right; }
       @keyframes pulse { 50% { opacity: 0.4; } }
+
+      /* Touch controls: shown only when main.ts adds .touch to <html>. */
+      .touch-only { display: none; }
+      html.touch .desktop-only { display: none; }
+      html.touch span.touch-only { display: inline; }
+      html.touch table.touch-only { display: table; }
+      #touch-ui { display: none; }
+      html.touch #touch-ui { display: block; }
+      #touch-ui > * { position: fixed; pointer-events: auto; touch-action: none; z-index: 5; }
+      #joystick {
+        left: 20px; bottom: calc(80px + env(safe-area-inset-bottom));
+        width: 130px; height: 130px; border-radius: 50%;
+        background: rgba(0, 0, 0, 0.25); border: 2px solid rgba(255, 255, 255, 0.35);
+      }
+      #joystick-knob {
+        position: absolute; left: 50%; top: 50%; width: 56px; height: 56px;
+        border-radius: 50%; background: rgba(255, 255, 255, 0.45);
+        transform: translate(-50%, -50%);
+      }
+      .touch-btn {
+        display: flex; align-items: center; justify-content: center;
+        color: #fff; font-family: 'Courier New', monospace;
+        background: rgba(0, 0, 0, 0.35); border: 2px solid rgba(255, 255, 255, 0.5);
+        border-radius: 50%;
+      }
+      #btn-jump {
+        right: 24px; bottom: calc(96px + env(safe-area-inset-bottom));
+        width: 74px; height: 74px; font-size: 30px;
+      }
+      #btn-sneak {
+        right: 112px; bottom: calc(84px + env(safe-area-inset-bottom));
+        width: 52px; height: 52px; font-size: 18px;
+      }
+      #btn-sneak.on { background: rgba(255, 255, 255, 0.55); color: #222; }
+      #btn-pause {
+        right: 12px; top: calc(10px + env(safe-area-inset-top));
+        width: 44px; height: 44px; font-size: 14px; border-radius: 8px;
+      }
+      @media (max-width: 760px) {
+        .slot { width: 34px; height: 34px; }
+        #menu h1 { font-size: 30px; }
+      }
     </style>
   </head>
   <body>
@@ -67,8 +118,10 @@
     <div id="hotbar" class="hud"></div>
     <div id="menu">
       <h1>VOXELCRAFT</h1>
-      <div class="hint">Click to play</div>
-      <table>
+      <div class="hint">
+        <span class="desktop-only">Click</span><span class="touch-only">Tap</span> to play
+      </div>
+      <table class="desktop-only">
         <tr><td>W A S D</td><td>move</td></tr>
         <tr><td>Mouse</td><td>look</td></tr>
         <tr><td>Space</td><td>jump / swim up</td></tr>
@@ -80,6 +133,15 @@
         <tr><td>T</td><td>skip time</td></tr>
         <tr><td>F3</td><td>debug info</td></tr>
         <tr><td>Esc</td><td>release mouse</td></tr>
+      </table>
+      <table class="touch-only">
+        <tr><td>Left pad</td><td>move</td></tr>
+        <tr><td>Drag screen</td><td>look</td></tr>
+        <tr><td>Tap</td><td>break block</td></tr>
+        <tr><td>Press &amp; hold</td><td>place block</td></tr>
+        <tr><td>&#9650;</td><td>jump / swim up (hold)</td></tr>
+        <tr><td>&#9660;</td><td>sneak / swim down (toggle)</td></tr>
+        <tr><td>Tap hotbar</td><td>select block</td></tr>
       </table>
     </div>
     <script type="module" src="/src/main.ts"></script>

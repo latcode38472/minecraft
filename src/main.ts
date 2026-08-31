@@ -11,10 +11,13 @@ import {
   PLACE_REPEAT_MS,
   REACH_DISTANCE,
   SAVE_INTERVAL_MS,
+  TOUCH_DEFAULT_VIEW_DISTANCE,
+  TOUCH_LOOK_SENSITIVITY,
 } from './constants';
 import { Input } from './input';
 import { MouseLook } from './player/camera';
-import { Player } from './player/player';
+import { Player, type MoveInput } from './player/player';
+import { TouchControls, isTouchDevice } from './ui/touch';
 import { raycastVoxel, type RayHit } from './raycast';
 import { SaveStore, type SaveMeta } from './save';
 import { Sky } from './sky';
@@ -51,8 +54,12 @@ async function boot(): Promise<void> {
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
   scene.fog = new THREE.Fog(0x87ceeb, 10, 100);
 
+  const touchDevice = params.has('touch') || isTouchDevice();
+  if (touchDevice) document.documentElement.classList.add('touch');
+
   let viewDistance = clampViewDistance(
-    Number(localStorage.getItem('voxelcraft.viewDistance')) || DEFAULT_VIEW_DISTANCE,
+    Number(localStorage.getItem('voxelcraft.viewDistance')) ||
+      (touchDevice ? TOUCH_DEFAULT_VIEW_DISTANCE : DEFAULT_VIEW_DISTANCE),
   );
   applyViewDistance();
 
@@ -103,14 +110,31 @@ async function boot(): Promise<void> {
   highlight.visible = false;
   scene.add(highlight);
 
-  // --- Pointer lock / menu ---
+  // --- Play state: pointer lock on desktop, an explicit flag on touch ---
   const menu = document.getElementById('menu')!;
-  menu.addEventListener('click', () => {
+  let touchPlaying = false;
+  const isPlaying = (): boolean => (touchDevice ? touchPlaying : look.locked);
+
+  const touch = touchDevice ? new TouchControls(document.getElementById('app')!) : null;
+  if (touch) {
+    touch.onPause = () => {
+      touchPlaying = false;
+      menu.style.display = 'flex';
+      flushSave();
+    };
+  }
+
+  menu.addEventListener('pointerup', () => {
     initAudio();
-    look.requestLock();
+    if (touchDevice) {
+      touchPlaying = true;
+      menu.style.display = 'none';
+    } else {
+      look.requestLock();
+    }
   });
   document.addEventListener('pointerlockchange', () => {
-    menu.style.display = look.locked ? 'none' : 'flex';
+    if (!touchDevice) menu.style.display = look.locked ? 'none' : 'flex';
   });
 
   // --- Mouse actions (hold to repeat) ---
@@ -137,27 +161,45 @@ async function boot(): Promise<void> {
     return raycastVoxel(world, eye, lookDir, REACH_DISTANCE);
   }
 
+  function breakAt(hit: RayHit): void {
+    if (!BLOCKS[hit.id].breakable) return;
+    world.setBlock(hit.x, hit.y, hit.z, Block.Air);
+    playBreak(BLOCKS[hit.id].sound);
+  }
+
+  function placeAt(hit: RayHit): boolean {
+    const px = hit.x + hit.normal[0];
+    const py = hit.y + hit.normal[1];
+    const pz = hit.z + hit.normal[2];
+    const id = hud.selectedBlock;
+    const occupied = world.getBlock(px, py, pz);
+    if (occupied !== Block.Air && occupied !== Block.Water) return false;
+    if (BLOCKS[id].solid && player.intersectsBlock(px, py, pz)) return false;
+    if (!world.setBlock(px, py, pz, id)) return false;
+    playPlace(BLOCKS[id].sound);
+    return true;
+  }
+
   function handleActions(nowMs: number): void {
-    if (!look.locked || (!breakHeld && !placeHeld) || nowMs < nextActionAt) return;
+    const taps = touch?.takeBreakTaps() ?? 0;
+    if (!isPlaying()) return;
+
+    // Touch taps break immediately, bypassing the hold-repeat timer.
+    if (taps > 0) {
+      const tapHit = currentTarget();
+      if (tapHit) breakAt(tapHit);
+    }
+
+    const wantBreak = breakHeld;
+    const wantPlace = placeHeld || (touch?.placeHeld ?? false);
+    if ((!wantBreak && !wantPlace) || nowMs < nextActionAt) return;
     const hit = currentTarget();
     if (!hit) return;
-    if (breakHeld) {
-      if (!BLOCKS[hit.id].breakable) return;
-      world.setBlock(hit.x, hit.y, hit.z, Block.Air);
-      playBreak(BLOCKS[hit.id].sound);
+    if (wantBreak) {
+      breakAt(hit);
       nextActionAt = nowMs + BREAK_REPEAT_MS;
-    } else if (placeHeld) {
-      const px = hit.x + hit.normal[0];
-      const py = hit.y + hit.normal[1];
-      const pz = hit.z + hit.normal[2];
-      const id = hud.selectedBlock;
-      const occupied = world.getBlock(px, py, pz);
-      if (occupied !== Block.Air && occupied !== Block.Water) return;
-      if (BLOCKS[id].solid && player.intersectsBlock(px, py, pz)) return;
-      if (world.setBlock(px, py, pz, id)) {
-        playPlace(BLOCKS[id].sound);
-        nextActionAt = nowMs + PLACE_REPEAT_MS;
-      }
+    } else if (wantPlace && placeAt(hit)) {
+      nextActionAt = nowMs + PLACE_REPEAT_MS;
     }
   }
 
@@ -178,7 +220,7 @@ async function boot(): Promise<void> {
       }
     }
     const wheel = input.takeWheelSteps();
-    if (wheel !== 0 && look.locked) hud.cycleSlot(wheel);
+    if (wheel !== 0 && isPlaying()) hud.cycleSlot(wheel);
   }
 
   // --- Persistence ---
@@ -208,7 +250,7 @@ async function boot(): Promise<void> {
   });
 
   // --- Debug hook for automated smoke tests ---
-  (window as unknown as Record<string, unknown>).__voxel = { world, player, sky, look };
+  (window as unknown as Record<string, unknown>).__voxel = { world, player, sky, look, touch };
 
   // --- Main loop ---
   let lastTime = performance.now();
@@ -220,7 +262,24 @@ async function boot(): Promise<void> {
     handleKeys();
     handleActions(nowMs);
 
-    if (look.locked) player.update(dt, input, look.yaw);
+    if (touch) {
+      const [lookDx, lookDy] = touch.takeLookDelta();
+      if (isPlaying()) look.rotate(lookDx, lookDy, TOUCH_LOOK_SENSITIVITY);
+    }
+
+    const clamp1 = (v: number): number => Math.max(-1, Math.min(1, v));
+    const move: MoveInput = {
+      forward: clamp1(
+        (input.isDown('KeyW') ? 1 : 0) - (input.isDown('KeyS') ? 1 : 0) + (touch?.moveForward ?? 0),
+      ),
+      strafe: clamp1(
+        (input.isDown('KeyD') ? 1 : 0) - (input.isDown('KeyA') ? 1 : 0) + (touch?.moveStrafe ?? 0),
+      ),
+      jump: input.isDown('Space') || (touch?.jumpHeld ?? false),
+      sneak:
+        input.isDown('ShiftLeft') || input.isDown('ShiftRight') || (touch?.sneakOn ?? false),
+    };
+    if (isPlaying()) player.update(dt, move, look.yaw);
     world.update(player.position.x, player.position.z, viewDistance);
     sky.update(dt);
 
@@ -229,7 +288,7 @@ async function boot(): Promise<void> {
       playStep();
     }
 
-    const hit = look.locked ? currentTarget() : null;
+    const hit = isPlaying() ? currentTarget() : null;
     highlight.visible = hit !== null;
     if (hit) highlight.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
 

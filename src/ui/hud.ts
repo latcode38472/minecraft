@@ -42,6 +42,10 @@ export class Hud {
       key.textContent = String(i + 1);
       slot.append(icon, key);
       slot.title = BLOCKS[blockId].name;
+      slot.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        this.selectSlot(i);
+      });
       hotbar.append(slot);
       this.slots.push(slot);
     });
