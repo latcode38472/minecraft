@@ -13,10 +13,13 @@ import {
   SAVE_INTERVAL_MS,
   TOUCH_DEFAULT_VIEW_DISTANCE,
   TOUCH_LOOK_SENSITIVITY,
+  TOUCH_MAX_CHUNK_GENS_PER_FRAME,
+  TOUCH_MESH_BUDGET_MS,
 } from './constants';
 import { Input } from './input';
 import { MouseLook } from './player/camera';
 import { Player, type MoveInput } from './player/player';
+import { AutoQuality } from './autoquality';
 import { TouchControls, isTouchDevice } from './ui/touch';
 import { raycastVoxel, type RayHit } from './raycast';
 import { SaveStore, type SaveMeta } from './save';
@@ -45,8 +48,17 @@ async function boot(): Promise<void> {
   }
 
   // --- Renderer & scene ---
-  const renderer = new THREE.WebGLRenderer({ antialias: false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  let renderer: THREE.WebGLRenderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+  } catch {
+    document.getElementById('menu')!.innerHTML =
+      '<h1>VOXELCRAFT</h1><div>This browser does not support WebGL 2,<br>which the game needs to render. Try updating your browser or OS.</div>';
+    return;
+  }
+  const basePixelRatio = Math.min(window.devicePixelRatio, 2);
+  let pixelScale = 1; // lowered by AutoQuality under load
+  renderer.setPixelRatio(basePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.getElementById('app')!.appendChild(renderer.domElement);
 
@@ -73,7 +85,11 @@ async function boot(): Promise<void> {
     (scene.fog as THREE.Fog).far = far * 0.95;
     camera.far = far * 1.5 + 64;
     camera.updateProjectionMatrix();
-    localStorage.setItem('voxelcraft.viewDistance', String(viewDistance));
+  }
+
+  function applyPixelScale(scale: number): void {
+    pixelScale = scale;
+    renderer.setPixelRatio(basePixelRatio * scale);
   }
 
   window.addEventListener('resize', () => {
@@ -123,6 +139,19 @@ async function boot(): Promise<void> {
       flushSave();
     };
   }
+
+  // Adaptive quality on touch: phone GPUs vary a lot, so track the real frame
+  // rate and trade render resolution / view distance for smoothness.
+  const autoQuality = touchDevice
+    ? new AutoQuality(viewDistance, {
+        setViewDistance: (v) => {
+          viewDistance = v;
+          applyViewDistance();
+        },
+        setPixelScale: applyPixelScale,
+        notify: (msg) => hud.toast(msg),
+      })
+    : null;
 
   menu.addEventListener('pointerup', () => {
     initAudio();
@@ -214,8 +243,10 @@ async function boot(): Promise<void> {
         sky.timeOfDay = (sky.timeOfDay + 0.05) % 1;
         hud.toast(`Time: ${(sky.timeOfDay * 24).toFixed(1)}h`);
       } else if (code === 'BracketLeft' || code === 'BracketRight') {
+        if (autoQuality?.enabled) autoQuality.disable(); // manual override wins
         viewDistance = clampViewDistance(viewDistance + (code === 'BracketRight' ? 1 : -1));
         applyViewDistance();
+        localStorage.setItem('voxelcraft.viewDistance', String(viewDistance));
         hud.toast(`View distance: ${viewDistance} chunks`);
       }
     }
@@ -250,7 +281,15 @@ async function boot(): Promise<void> {
   });
 
   // --- Debug hook for automated smoke tests ---
-  (window as unknown as Record<string, unknown>).__voxel = { world, player, sky, look, touch };
+  (window as unknown as Record<string, unknown>).__voxel = {
+    world,
+    player,
+    sky,
+    look,
+    touch,
+    autoQuality,
+    getViewDistance: () => viewDistance,
+  };
 
   // --- Main loop ---
   let lastTime = performance.now();
@@ -280,8 +319,15 @@ async function boot(): Promise<void> {
         input.isDown('ShiftLeft') || input.isDown('ShiftRight') || (touch?.sneakOn ?? false),
     };
     if (isPlaying()) player.update(dt, move, look.yaw);
-    world.update(player.position.x, player.position.z, viewDistance);
+    world.update(
+      player.position.x,
+      player.position.z,
+      viewDistance,
+      touchDevice ? TOUCH_MAX_CHUNK_GENS_PER_FRAME : undefined,
+      touchDevice ? TOUCH_MESH_BUDGET_MS : undefined,
+    );
     sky.update(dt);
+    if (isPlaying()) autoQuality?.update(dt);
 
     if (player.stepAccumulator > STEP_INTERVAL_BLOCKS) {
       player.stepAccumulator = 0;
@@ -304,7 +350,7 @@ async function boot(): Promise<void> {
         `chunks ${world.chunks.size} (pending mesh ${world.pendingMeshCount})`,
         `draw calls ${renderer.info.render.calls}  tris ${renderer.info.render.triangles}`,
         `seed ${seed}  time ${(sky.timeOfDay * 24).toFixed(1)}h`,
-        `view ${viewDistance} chunks`,
+        `view ${viewDistance} chunks  render ${Math.round(pixelScale * 100)}%`,
       ].join('\n'),
     );
 

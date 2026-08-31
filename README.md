@@ -50,6 +50,15 @@ Touch defaults to a 4-chunk view distance for phone GPUs. Detection uses the
 primary-pointer media query, so touchscreen laptops keep the desktop scheme;
 append `?touch=1` to force touch controls on any device.
 
+**Adaptive quality (touch only):** the game watches its real frame rate and
+walks a quality ladder automatically — lowering render resolution first
+(100% → 80% → 66%), then view distance — whenever FPS stays under 45, and
+stepping back up after a sustained smooth stretch. Weak or hot phones settle
+at whatever their hardware can hold instead of lagging. Touch devices also
+use smaller per-frame chunk generation/meshing budgets so world streaming
+never causes visible hitches. A device without WebGL 2 gets a clear message
+instead of a black screen.
+
 URL parameters: `?seed=12345` starts a specific world (a new seed wipes saved
 edits), `?reset` wipes the save entirely, `?touch=1` forces touch controls.
 

@@ -106,7 +106,13 @@ export class World {
   }
 
   /** Stream chunks around the player and process the remesh queue. */
-  update(playerX: number, playerZ: number, viewDistance: number): void {
+  update(
+    playerX: number,
+    playerZ: number,
+    viewDistance: number,
+    maxGensPerFrame = MAX_CHUNK_GENS_PER_FRAME,
+    meshBudgetMs = MESH_BUDGET_MS,
+  ): void {
     this.frame++;
     const pcx = Math.floor(playerX / CHUNK_SIZE);
     const pcz = Math.floor(playerZ / CHUNK_SIZE);
@@ -120,14 +126,14 @@ export class World {
           const key = Chunk.key(pcx + dx, pcz + dz);
           if (this.chunks.has(key)) continue;
           this.createChunk(pcx + dx, pcz + dz);
-          if (++gens >= MAX_CHUNK_GENS_PER_FRAME) break outer;
+          if (++gens >= maxGensPerFrame) break outer;
         }
       }
     }
 
     if (this.frame % 30 === 0) this.unloadDistantChunks(pcx, pcz, viewDistance);
 
-    this.processMeshQueue(pcx, pcz);
+    this.processMeshQueue(pcx, pcz, meshBudgetMs);
   }
 
   private createChunk(cx: number, cz: number): void {
@@ -157,7 +163,7 @@ export class World {
     }
   }
 
-  private processMeshQueue(pcx: number, pcz: number): void {
+  private processMeshQueue(pcx: number, pcz: number, budgetMs: number): void {
     if (this.dirtyQueue.size === 0) return;
     const queue = [...this.dirtyQueue].sort(
       (a, b) =>
@@ -167,7 +173,7 @@ export class World {
     for (const chunk of queue) {
       this.remesh(chunk);
       this.dirtyQueue.delete(chunk);
-      if (performance.now() - start > MESH_BUDGET_MS) break;
+      if (performance.now() - start > budgetMs) break;
     }
   }
 

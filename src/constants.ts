@@ -10,6 +10,10 @@ export const MAX_VIEW_DISTANCE = 12;
 export const UNLOAD_PADDING = 2; // chunks beyond view distance before unload
 export const MAX_CHUNK_GENS_PER_FRAME = 4;
 export const MESH_BUDGET_MS = 7; // per-frame time budget for remeshing
+// Touch devices get smaller per-frame streaming budgets: spreading the same
+// work over more frames trades load-in speed for fewer visible hitches.
+export const TOUCH_MAX_CHUNK_GENS_PER_FRAME = 2;
+export const TOUCH_MESH_BUDGET_MS = 5;
 
 // Player
 export const PLAYER_HALF_WIDTH = 0.3;
