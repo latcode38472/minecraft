@@ -1,243 +1,49 @@
-// Entity lifecycle: updates, scene membership, mob spawning/despawning, and
-// the ray-vs-mob query the player's attacks use.
+// Lifecycle for client-side entities — today that means arrows in flight.
+//
+// Mobs and dropped items are simulated elsewhere (the server in multiplayer, a
+// local RoomSimulation in singleplayer) and drawn by WorldView, so nothing in
+// here has to be authoritative: an arrow is a local effect whose *hits* are
+// reported to whoever owns the target.
 
 import * as THREE from 'three';
-import { Block, isSolid } from '../blocks';
-import {
-  MAX_MOBS,
-  MOB_DESPAWN_DISTANCE,
-  MOB_SPAWN_INTERVAL_S,
-  MOB_SPAWN_MAX_DISTANCE,
-  MOB_SPAWN_MIN_DISTANCE,
-  NIGHT_END,
-  NIGHT_START,
-} from '../constants';
-import type { World } from '../world/world';
-import { Entity, Mob, type EntityContext } from './entity';
-import { ItemDrop } from './itemdrop';
-import { Pig } from './pig';
-import { Zombie } from './zombie';
-
-const MAX_DROPS = 80;
-const MAX_HOSTILE = 12;
-const MAX_PASSIVE = 10;
-
-export interface MobHit {
-  mob: Mob;
-  distance: number;
-}
-
-export function isNightTime(timeOfDay: number): boolean {
-  return timeOfDay >= NIGHT_START || timeOfDay < NIGHT_END;
-}
-
-let nextMobId = 1;
+import { MOB_DESPAWN_DISTANCE } from '../constants';
+import { Entity, type EntityContext } from './entity';
 
 export class EntityManager {
   readonly entities: Entity[] = [];
-  /** Network ids for mobs, so guests can address the host's mobs. */
-  readonly mobIds = new WeakMap<Mob, number>();
-  /** Ids removed since the last drain, for the host's mob_removed message. */
-  readonly removedMobIds: number[] = [];
-  private spawnTimer = 0;
+  private readonly scene: THREE.Scene;
 
-  constructor(
-    private readonly scene: THREE.Scene,
-    private readonly world: World,
-  ) {}
+  constructor(scene: THREE.Scene) {
+    this.scene = scene;
+  }
 
   add(entity: Entity): void {
     this.entities.push(entity);
-    if (entity instanceof Mob) this.mobIds.set(entity, nextMobId++);
     this.scene.add(entity.object);
-  }
-
-  /** Find a mob by its network id (host side, when a guest reports a hit). */
-  mobById(id: number): Mob | null {
-    for (const entity of this.entities) {
-      if (entity instanceof Mob && this.mobIds.get(entity) === id) return entity;
-    }
-    return null;
-  }
-
-  /** Snapshot of live mobs for the network, in protocol-friendly shape. */
-  mobSnapshot(): { id: number; kind: 'zombie' | 'pig'; x: number; y: number; z: number; yaw: number; hp: number }[] {
-    const out = [];
-    for (const entity of this.entities) {
-      if (!(entity instanceof Mob) || entity.dead) continue;
-      const id = this.mobIds.get(entity);
-      if (id === undefined) continue;
-      out.push({
-        id,
-        kind: entity instanceof Zombie ? ('zombie' as const) : ('pig' as const),
-        x: entity.position.x,
-        y: entity.position.y,
-        z: entity.position.z,
-        yaw: entity.yaw,
-        hp: entity.health,
-      });
-    }
-    return out;
-  }
-
-  spawnDrop(id: string, count: number, x: number, y: number, z: number, damage?: number): void {
-    const drops = this.entities.filter((e) => e instanceof ItemDrop);
-    if (drops.length >= MAX_DROPS) this.remove(drops[0]);
-    const drop = new ItemDrop(id, count, damage);
-    drop.position.set(x, y, z);
-    // A little scatter so a stack of drops doesn't stack into one pixel.
-    drop.velocity.set((Math.random() - 0.5) * 1.5, 2.2, (Math.random() - 0.5) * 1.5);
-    this.add(drop);
   }
 
   private remove(entity: Entity): void {
     const index = this.entities.indexOf(entity);
     if (index === -1) return;
     this.entities.splice(index, 1);
-    if (entity instanceof Mob) {
-      const id = this.mobIds.get(entity);
-      if (id !== undefined) this.removedMobIds.push(id);
-    }
     this.scene.remove(entity.object);
     entity.dispose();
   }
 
-  update(ctx: EntityContext, timeOfDay: number): void {
+  /** Tick every entity, then retire the dead and the far-away. */
+  update(ctx: EntityContext): void {
     for (const entity of this.entities) entity.update(ctx);
-    this.reapDead(ctx);
-
-    this.spawnTimer -= ctx.dt;
-    if (this.spawnTimer <= 0) {
-      this.spawnTimer = MOB_SPAWN_INTERVAL_S;
-      this.trySpawnMob(ctx.playerPos, isNightTime(timeOfDay));
-    }
-  }
-
-  /**
-   * Remove dead and far-away entities, dropping loot for dead mobs.
-   * Split out of `update` so multiplayer guests — which do not simulate mobs —
-   * can still retire their own arrows and item drops.
-   */
-  reapDead(ctx: EntityContext): void {
     // Iterate backwards: we splice as we go.
     for (let i = this.entities.length - 1; i >= 0; i--) {
       const entity = this.entities[i];
       const far =
         entity.position.distanceToSquared(ctx.playerPos) >
         MOB_DESPAWN_DISTANCE * MOB_DESPAWN_DISTANCE;
-      if (entity.dead) {
-        if (entity instanceof Mob) {
-          entity.dropLoot(ctx);
-          ctx.onMobDeath();
-        }
-        this.remove(entity);
-      } else if (far) {
-        this.remove(entity);
-      }
+      if (entity.dead || far) this.remove(entity);
     }
-  }
-
-  /** Nearest mob whose bounding box the ray enters, within `maxDist`. */
-  raycastMob(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): MobHit | null {
-    let best: MobHit | null = null;
-    for (const entity of this.entities) {
-      if (!(entity instanceof Mob)) continue;
-      const t = rayBoxDistance(origin, dir, entity, maxDist);
-      if (t !== null && (!best || t < best.distance)) best = { mob: entity, distance: t };
-    }
-    return best;
-  }
-
-  get mobCount(): number {
-    return this.entities.reduce((n, e) => n + (e instanceof Mob ? 1 : 0), 0);
-  }
-
-  private trySpawnMob(playerPos: THREE.Vector3, night: boolean): void {
-    const mobs = this.entities.filter((e): e is Mob => e instanceof Mob);
-    if (mobs.length >= MAX_MOBS) return;
-    const hostile = night;
-    const existing = mobs.filter((m) =>
-      hostile ? m instanceof Zombie : m instanceof Pig,
-    ).length;
-    if (existing >= (hostile ? MAX_HOSTILE : MAX_PASSIVE)) return;
-
-    const spot = this.findSpawnSpot(playerPos);
-    if (!spot) return;
-    const mob = hostile ? new Zombie() : new Pig();
-    mob.position.copy(spot);
-    mob.yaw = Math.random() * Math.PI * 2;
-    this.add(mob);
-  }
-
-  /**
-   * Look for a standing spot on loaded ground, ringed around the player.
-   * Unloaded chunks read as air here, so they simply fail the ground test.
-   */
-  private findSpawnSpot(playerPos: THREE.Vector3): THREE.Vector3 | null {
-    for (let attempt = 0; attempt < 12; attempt++) {
-      const angle = Math.random() * Math.PI * 2;
-      const dist =
-        MOB_SPAWN_MIN_DISTANCE + Math.random() * (MOB_SPAWN_MAX_DISTANCE - MOB_SPAWN_MIN_DISTANCE);
-      const x = Math.floor(playerPos.x + Math.cos(angle) * dist);
-      const z = Math.floor(playerPos.z + Math.sin(angle) * dist);
-      const surface = this.world.terrain.heightAt(x, z);
-
-      // Scan a window around the generated surface for real (possibly edited) ground.
-      for (let y = surface + 6; y >= Math.max(1, surface - 8); y--) {
-        const ground = this.world.getBlock(x, y, z);
-        if (!isSolid(ground) || ground === Block.Leaves) continue;
-        const feet = this.world.getBlock(x, y + 1, z);
-        const head = this.world.getBlock(x, y + 2, z);
-        if (feet !== Block.Air || head !== Block.Air) break;
-        return new THREE.Vector3(x + 0.5, y + 1, z + 0.5);
-      }
-    }
-    return null;
   }
 
   clear(): void {
     for (const entity of [...this.entities]) this.remove(entity);
   }
-}
-
-/**
- * Slab-method ray/AABB test against a mob's body box. Returns the entry
- * distance, or null when the ray misses or the hit is beyond `maxDist`.
- */
-function rayBoxDistance(
-  origin: THREE.Vector3,
-  dir: THREE.Vector3,
-  mob: Mob,
-  maxDist: number,
-): number | null {
-  const pad = 0.1; // forgiving hitbox, so glancing aim still connects
-  const min = [
-    mob.position.x - mob.shape.halfWidth - pad,
-    mob.position.y - pad,
-    mob.position.z - mob.shape.halfWidth - pad,
-  ];
-  const max = [
-    mob.position.x + mob.shape.halfWidth + pad,
-    mob.position.y + mob.shape.height + pad,
-    mob.position.z + mob.shape.halfWidth + pad,
-  ];
-  const o = [origin.x, origin.y, origin.z];
-  const d = [dir.x, dir.y, dir.z];
-
-  let tMin = 0;
-  let tMax = maxDist;
-  for (let axis = 0; axis < 3; axis++) {
-    if (Math.abs(d[axis]) < 1e-8) {
-      if (o[axis] < min[axis] || o[axis] > max[axis]) return null;
-      continue;
-    }
-    const inv = 1 / d[axis];
-    let t1 = (min[axis] - o[axis]) * inv;
-    let t2 = (max[axis] - o[axis]) * inv;
-    if (t1 > t2) [t1, t2] = [t2, t1];
-    tMin = Math.max(tMin, t1);
-    tMax = Math.min(tMax, t2);
-    if (tMin > tMax) return null;
-  }
-  return tMin;
 }

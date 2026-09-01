@@ -17,7 +17,7 @@ import {
   WATER_SPEED_FACTOR,
   WATER_TERMINAL_VELOCITY,
 } from '../constants';
-import { bodyOverlapsBlock, moveWithCollision, type BodyShape } from '../physics';
+import { bodyOverlapsBlock, moveWithCollision, type BodyShape } from '../shared/voxel';
 import type { World } from '../world/world';
 
 /** Device-agnostic movement intent; forward/strafe may be analog (joystick). */

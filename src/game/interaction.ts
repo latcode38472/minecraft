@@ -11,8 +11,6 @@ import {
   PLAYER_ATTACK_RANGE,
   REACH_DISTANCE,
 } from '../constants';
-import type { Mob } from '../entities/entity';
-import type { EntityManager } from '../entities/manager';
 import type { Station } from '../items/crafting';
 import type { Inventory, ItemStack } from '../items/inventory';
 import { getItem } from '../items/items';
@@ -20,7 +18,7 @@ import type { Player } from '../player/player';
 import { raycastVoxel, type RayHit } from '../raycast';
 import type { World } from '../world/world';
 
-/** A networked player the local player can shoot or hit. */
+/** Anything alive the local player can shoot or hit: a mob or another player. */
 export interface CombatTarget {
   id: string;
   position: THREE.Vector3;
@@ -33,17 +31,16 @@ export interface InteractionHooks {
   onPlaceBlock(def: BlockDef): void;
   onAttack(): void;
   /**
-   * Everything networked that can be hit: remote players, and (on a guest)
-   * the host's mobs. Mob ids are prefixed "mob:" so one list serves both.
-   * Empty in singleplayer.
+   * Everything that can be hit: simulated mobs plus any remote players. Mob
+   * ids are prefixed "mob:" so one list serves both.
    */
   combatTargets(): CombatTarget[];
-  /** Melee or arrow hit on a networked target — routed through the server. */
-  onHitPlayer(id: string, damage: number): void;
+  /** Melee or arrow hit — routed to whichever simulation owns the target. */
+  onHitTarget(id: string, damage: number): void;
   /** Fire an arrow from the eye along `dir`, with the given draw strength. */
   fireArrow(origin: THREE.Vector3, dir: THREE.Vector3, charge: number): void;
-  /** Our own network id, so mob kills can be credited. */
-  localPlayerId(): string;
+  /** Spawn a block's drop into the simulation that owns the world. */
+  spawnDrop(id: string, count: number, x: number, y: number, z: number): void;
   /** Feed the player; returns false when already full so the food is kept. */
   tryEat(hunger: number): boolean;
   onOpenStation(station: Station): void;
@@ -104,7 +101,6 @@ export class Interaction {
     private readonly world: World,
     private readonly player: Player,
     private readonly inventory: Inventory,
-    private readonly entities: EntityManager,
     private readonly hooks: InteractionHooks,
   ) {}
 
@@ -135,17 +131,12 @@ export class Interaction {
     }
 
     // A mob or player in front of the block takes the hit instead of the block.
-    const mobHit = this.entities.raycastMob(this.eye, this.dir, PLAYER_ATTACK_RANGE);
-    const playerHit = this.raycastPlayers();
+    const combatHit = this.raycastTargets();
     const blockDist = this.target ? this.eye.distanceTo(this.targetCentre(this.target)) : Infinity;
-    const mobDist = mobHit?.distance ?? Infinity;
-    const playerDist = playerHit?.distance ?? Infinity;
-    const nearestCombat = Math.min(mobDist, playerDist);
-    const combatInFront = nearestCombat < blockDist;
+    const combatInFront = (combatHit?.distance ?? Infinity) < blockDist;
 
     if (input.mining && combatInFront) {
-      if (playerDist <= mobDist && playerHit) this.attackPlayer(playerHit.target);
-      else if (mobHit) this.attack(mobHit.mob);
+      this.attackTarget(combatHit!.target);
       this.resetMining();
     } else if (input.mining && this.target) {
       this.tickMining(dt, this.target);
@@ -159,8 +150,7 @@ export class Interaction {
     const wantUse = input.useTaps > 0 || (input.using && nowMs >= this.nextUseAt);
     if (wantUse) {
       if (combatInFront && input.useTaps > 0) {
-        if (playerDist <= mobDist && playerHit) this.attackPlayer(playerHit.target);
-        else if (mobHit) this.attack(mobHit.mob);
+        this.attackTarget(combatHit!.target);
       } else if (this.tryUse()) {
         this.nextUseAt = nowMs + PLACE_REPEAT_MS;
       }
@@ -199,8 +189,8 @@ export class Interaction {
     this.bowCharge = 0;
   }
 
-  /** Nearest remote player under the crosshair, within melee reach. */
-  private raycastPlayers(): { target: CombatTarget; distance: number } | null {
+  /** Nearest mob or player under the crosshair, within melee reach. */
+  private raycastTargets(): { target: CombatTarget; distance: number } | null {
     let best: { target: CombatTarget; distance: number } | null = null;
     for (const target of this.hooks.combatTargets()) {
       const t = rayHitsBox(this.eye, this.dir, target, PLAYER_ATTACK_RANGE);
@@ -209,14 +199,14 @@ export class Interaction {
     return best;
   }
 
-  private attackPlayer(target: CombatTarget): void {
+  private attackTarget(target: CombatTarget): void {
     if (this.attackCooldown > 0) return;
     const stack = this.inventory.selectedStack;
     const attack = stack ? getItem(stack.id)?.attack : undefined;
     const damage = attack?.damage ?? FIST_DAMAGE;
     this.attackCooldown = attack?.cooldown ?? FIST_COOLDOWN_S;
 
-    this.hooks.onHitPlayer(target.id, damage);
+    this.hooks.onHitTarget(target.id, damage);
     if (stack && getItem(stack.id)?.tool) {
       if (this.inventory.damageSelected()) this.hooks.toast('Your weapon broke!');
     }
@@ -254,29 +244,13 @@ export class Interaction {
     if (!this.world.setBlock(hit.x, hit.y, hit.z, Block.Air)) return;
 
     if (def.drop && canHarvest(def, stack)) {
-      this.entities.spawnDrop(def.drop, def.dropCount, hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
+      this.hooks.spawnDrop(def.drop, def.dropCount, hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
     }
     // Tools only wear out on blocks that actually needed them.
     if (stack && getItem(stack.id)?.tool && def.hardness > 0) {
       if (this.inventory.damageSelected()) this.hooks.toast('Your tool broke!');
     }
     this.hooks.onBreakBlock(def);
-  }
-
-  private attack(mob: Mob): void {
-    if (this.attackCooldown > 0) return;
-
-    const stack = this.inventory.selectedStack;
-    const attack = stack ? getItem(stack.id)?.attack : undefined;
-    const damage = attack?.damage ?? FIST_DAMAGE;
-    this.attackCooldown = attack?.cooldown ?? FIST_COOLDOWN_S;
-
-    mob.lastAttackerId = this.hooks.localPlayerId();
-    mob.takeDamage(damage, this.player.position.x, this.player.position.z);
-    if (stack && getItem(stack.id)?.tool) {
-      if (this.inventory.damageSelected()) this.hooks.toast('Your weapon broke!');
-    }
-    this.hooks.onAttack();
   }
 
   /** Right-click / tap: use a station, eat, or place the held block. */

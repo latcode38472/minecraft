@@ -11,6 +11,8 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { RoomSimulation } from '../src/shared/roomsim.ts';
+import { ServerWorld } from './world.ts';
 import {
   CLIENT_TIMEOUT_MS,
   EDITS_PER_MESSAGE,
@@ -20,7 +22,11 @@ import {
   PROTOCOL_VERSION,
   RATE_LIMIT_EDITS_PER_SEC,
   MAX_ATTACK_RANGE,
+  MAX_DROP_RANGE,
+  MAX_DROPS_PER_MESSAGE,
   MAX_MOBS_PER_MESSAGE,
+  SIM_HZ,
+  MOB_SYNC_HZ,
   RATE_LIMIT_COMBAT_PER_SEC,
   RATE_LIMIT_OTHER_PER_SEC,
   RATE_LIMIT_STATE_PER_SEC,
@@ -34,9 +40,8 @@ import {
   isValidChunkKey,
   normalizeRoomCode,
   sanitizeDamage,
+  sanitizeDropRequest,
   sanitizeEquipment,
-  sanitizeLoot,
-  sanitizeMobState,
   sanitizeName,
   sanitizePlayerState,
   type ChunkEditEntry,
@@ -91,6 +96,9 @@ interface Room {
   edits: Map<string, Map<number, number>>;
   editCount: number;
   emptySince: number | null;
+  /** Authoritative mobs, drops and day/night for this room. */
+  sim: RoomSimulation;
+  lastSnapshotAt: number;
 }
 
 const rooms = new Map<string, Room>();
@@ -296,15 +304,45 @@ function handleMessage(client: Client, raw: string): void {
       // One room per connection: a client cannot spawn rooms in a loop.
       if (client.room) leaveRoom(client);
 
+      const edits = new Map<string, Map<number, number>>();
+      const world = makeWorldInfo();
       const room: Room = {
         code: makeRoomCode(),
         hostId: client.id,
         clients: new Map(),
-        world: makeWorldInfo(),
-        edits: new Map(),
+        world,
+        edits,
         editCount: 0,
         emptySince: null,
+        sim: null as unknown as RoomSimulation,
+        lastSnapshotAt: 0,
       };
+      // The simulation owns mobs, drops and time for the life of the room.
+      room.sim = new RoomSimulation(new ServerWorld(world.seed, edits), {
+        damagePlayer: (playerId, amount, fromX, fromZ) => {
+          const victim = room.clients.get(playerId);
+          if (!victim || victim.dead) return;
+          victim.health = Math.max(0, victim.health - amount);
+          if (victim.health <= 0) victim.dead = true;
+          broadcast(room, {
+            t: 'player_hurt',
+            id: victim.id,
+            damage: amount,
+            by: 'mob',
+            health: victim.health,
+            dead: victim.dead,
+          });
+          send(victim, { t: 'knockback', fromX, fromZ });
+        },
+        giveItems: (playerId, itemId, count) => {
+          const target = room.clients.get(playerId);
+          if (!target) return count;
+          // The server does not model inventories; the client re-drops
+          // anything that does not fit, which closes the loop honestly.
+          send(target, { t: 'loot_grant', items: [{ id: itemId, count }] });
+          return 0;
+        },
+      });
       client.name = sanitizeName(msg.name);
       client.isHost = true;
       client.colorIndex = 0;
@@ -412,6 +450,7 @@ function handleMessage(client: Client, raw: string): void {
         send(client, { t: 'error', message: 'This world has too many changes.' });
         return;
       }
+      room.sim.world.applyEdit?.(bx, by, bz, id);
       broadcast(room, { t: 'block_update', x: bx, y: by, z: bz, id, by: client.id }, client.id);
       return;
     }
@@ -490,73 +529,50 @@ function handleMessage(client: Client, raw: string): void {
       return;
     }
 
-    case 'loot_grant': {
-      // Only the host awards loot, and only to a player in its room.
-      const room = client.room;
-      if (!room || !client.isHost) return;
-      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
-      const items = sanitizeLoot(msg.items);
-      const target = typeof msg.to === 'string' ? room.clients.get(msg.to) : undefined;
-      if (!items || !target || target.id === client.id) return;
-      send(target, { t: 'loot_grant', items });
-      return;
-    }
-
-    case 'mob_state': {
-      // Only the host simulates mobs; everyone else's snapshots are ignored.
-      const room = client.room;
-      if (!room || !client.isHost) return;
-      if (!allow(client.buckets.state, RATE_LIMIT_STATE_PER_SEC)) return;
-      if (!Array.isArray(msg.mobs)) return;
-      const mobs = msg.mobs
-        .slice(0, MAX_MOBS_PER_MESSAGE)
-        .map(sanitizeMobState)
-        .filter((m): m is NonNullable<typeof m> => m !== null);
-      broadcast(room, { t: 'mob_state', mobs }, client.id);
-      return;
-    }
-
-    case 'mob_removed': {
-      const room = client.room;
-      if (!room || !client.isHost) return;
-      if (!allow(client.buckets.state, RATE_LIMIT_STATE_PER_SEC)) return;
-      if (!Array.isArray(msg.ids)) return;
-      const ids = msg.ids.filter(Number.isInteger).slice(0, MAX_MOBS_PER_MESSAGE);
-      if (ids.length > 0) broadcast(room, { t: 'mob_removed', ids }, client.id);
-      return;
-    }
-
     case 'attack_mob': {
-      // A guest hit a mob: forward to the host, which owns mob health.
+      // A player swung at a mob; the server owns mob health and arbitrates.
       const room = client.room;
       if (!room || client.dead) return;
       if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
       const damage = sanitizeDamage(msg.damage);
       if (damage === null || !Number.isInteger(msg.mob)) return;
-      const host = room.clients.get(room.hostId);
-      if (!host || host.id === client.id) return;
-      send(host, { t: 'attack_mob', mob: msg.mob as number, damage, by: client.id });
+      const mob = room.sim.mobs.get(msg.mob as number);
+      if (!mob) return;
+      // Reach check against the attacker's last reported position.
+      const dist = Math.hypot(
+        mob.position.x - client.pos.x,
+        mob.position.y - client.pos.y,
+        mob.position.z - client.pos.z,
+      );
+      if (dist > MAX_ATTACK_RANGE) return;
+      room.sim.damageMob(msg.mob as number, damage, client.id, client.pos);
       return;
     }
 
-    case 'arrow_spawn': {
+    case 'drop_item': {
+      // Two callers: vanilla's Q (thrown from the player, so it carries an
+      // owner and cannot be re-grabbed for a moment), and the drop from a block
+      // the sender just mined (positioned, and free for anyone to collect).
       const room = client.room;
-      if (!room || client.dead) return;
+      if (!room) return;
       if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
-      const { x, y, z, dx, dy, dz, speed } = msg as Record<string, unknown>;
-      for (const v of [x, y, z, dx, dy, dz, speed]) if (!isFiniteNumber(v)) return;
-      broadcast(
-        room,
-        {
-          t: 'arrow_spawn',
-          by: client.id,
-          x: x as number, y: y as number, z: z as number,
-          dx: dx as number, dy: dy as number, dz: dz as number,
-          speed: Math.min(200, Math.max(0, speed as number)),
-          sentAt: Date.now(),
-        },
-        client.id,
-      );
+      const request = sanitizeDropRequest(msg);
+      if (!request) return;
+      if (!request.p) {
+        room.sim.spawnDrop(
+          request.item, request.count,
+          client.pos.x, client.pos.y + 1.2, client.pos.z,
+          client.id,
+        );
+        return;
+      }
+      // A positioned drop must be within arm's reach of where the sender says
+      // they are, so nobody can conjure items on the far side of the world.
+      const [dx, dy, dz] = request.p;
+      if (Math.hypot(dx - client.pos.x, dy - client.pos.y, dz - client.pos.z) > MAX_DROP_RANGE) {
+        return;
+      }
+      room.sim.spawnDrop(request.item, request.count, dx, dy, dz);
       return;
     }
 
@@ -635,6 +651,37 @@ wss.on('connection', (socket: WebSocket) => {
     client.lastSeen = Date.now();
   });
 });
+
+// --- Authoritative simulation loop ---
+// Every room steps at SIM_HZ and publishes a world snapshot at MOB_SYNC_HZ.
+// Clients render what arrives and never simulate mobs themselves.
+let lastSimAt = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const dt = Math.min(0.25, (now - lastSimAt) / 1000);
+  lastSimAt = now;
+
+  for (const room of rooms.values()) {
+    const players = [...room.clients.values()].map((c) => ({
+      id: c.id,
+      position: c.pos,
+      dead: c.dead,
+    }));
+    room.sim.update(dt, players);
+
+    if (now - room.lastSnapshotAt < 1000 / MOB_SYNC_HZ) continue;
+    room.lastSnapshotAt = now;
+    broadcast(room, {
+      t: 'world_state',
+      time: Math.round(room.sim.timeOfDay * 10000) / 10000,
+      mobs: room.sim.mobSnapshot().slice(0, MAX_MOBS_PER_MESSAGE),
+      drops: room.sim.dropSnapshot().slice(0, MAX_DROPS_PER_MESSAGE),
+      removedMobs: room.sim.removedMobs.splice(0),
+      removedDrops: room.sim.removedDrops.splice(0),
+      mobDeaths: room.sim.mobDeaths.splice(0),
+    });
+  }
+}, 1000 / SIM_HZ);
 
 // Drop silent connections (backgrounded mobile tabs that never came back) and
 // sweep rooms that have sat empty.

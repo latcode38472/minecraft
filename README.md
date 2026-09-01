@@ -33,9 +33,30 @@ npm run dev          # game client, port 5173
 | `npm run dev:all` | both, with the LAN URL printed for phones |
 | `npm run build` | typecheck + production build |
 | `npm run preview` | serve the production build |
+| `npm test` | simulation, protocol and multiplayer tests |
+| `npm run test:browser` | end-to-end tests in real browser tabs |
 
 Production build: `npm run build`, serve with `npm run preview`. The server has
 no build step — Node runs the TypeScript directly.
+
+### Tests
+
+`npm test` needs nothing running: it drives the shared simulation headlessly and
+spawns its own multiplayer server on port 8899 for the integration tests.
+
+`npm run test:browser` drives real Chromium tabs — including a simulated phone —
+through singleplayer and a full three-player room, so it needs the built client
+and a server first:
+
+```sh
+npm run build
+npm run server &     # port 8787
+npm run preview &    # port 4173
+npm run test:browser
+```
+
+It needs Playwright (`npm i -D playwright && npx playwright install chromium`);
+without it the suite says so and exits successfully rather than failing.
 
 ## Controls
 
@@ -52,6 +73,8 @@ no build step — Node runs the TypeScript directly.
 | Right click | place block, eat food, use a crafting table or furnace |
 | E | inventory & crafting |
 | 1–9 / mouse wheel | select hotbar slot |
+| Q | drop one of the held item |
+| Ctrl+Q | drop the whole stack |
 | Right click (bow) | hold to draw, release to fire |
 | Right click (shield) | hold to block |
 | `[` / `]` | decrease / increase view distance |
@@ -74,6 +97,7 @@ landscape):
 | ▲ button | jump / swim up (hold) |
 | ▼ button | sneak / swim down (toggle) |
 | Tap hotbar | select item |
+| Hold hotbar slot | drop that stack (hand it to another player) |
 | ☰ button | inventory & crafting |
 | ❚❚ button | pause / show menu |
 
@@ -131,21 +155,35 @@ and player counts for monitoring.
 | Synchronised | Not synchronised |
 | --- | --- |
 | Player position, yaw, pitch, movement/jump/sneak flags | Inventory and hotbar contents |
-| Joins, leaves, display names, room roster | Time of day |
-| Block breaks and placements (server-authoritative) | Block-break drops (each player collects their own) |
+| Joins, leaves, display names, room roster | |
+| Block breaks and placements (server-authoritative) | |
 | Player health, hunger and death (server-authoritative) | |
 | Worn armour, drawn on other players' bodies | |
 | PvP damage from melee and arrows | |
-| Mobs, including position, health and death | |
+| Mobs — position, health, death (server-authoritative) | |
+| Dropped items, including who is allowed to pick one up | |
 | Mob loot, awarded to whoever landed the killing blow | |
+| Time of day: the server owns the clock | |
 | Arrows fired by any player, latency-compensated | |
 
-**Combat authority.** The server arbitrates player-vs-player damage: it knows
-every player's last reported position and rejects a hit thrown from beyond
-melee/arrow range, so a modified client cannot snipe across the map. Mobs are
-simulated by the **host** — one simulation means everyone agrees who is alive —
-and relayed through the server at 10 snapshots a second, which guests
-interpolate. A guest's hit on a mob is forwarded to the host, which applies it.
+**Authority.** The server owns the world. It runs the same `RoomSimulation` the
+singleplayer client runs, over the same `TerrainGenerator`, so it knows what the
+ground looks like and can collide mobs against it. Mobs, dropped items and the
+day/night clock all live there and are broadcast as one `world_state` snapshot
+ten times a second, which clients interpolate. No client — host included —
+simulates a mob in a room, so nothing depends on one player's browser tab
+staying awake, and everyone sees the same creatures in the same places.
+
+The server arbitrates damage too: it knows every player's last reported position
+and rejects a hit thrown from beyond melee/arrow range, so a modified client
+cannot snipe across the map. Damage values are clamped, not trusted.
+
+**Item handoff.** There is no trade window, exactly as in vanilla: you throw the
+item on the ground with **Q** (**Ctrl+Q** for the whole stack; hold a hotbar slot
+on touch) and the other player walks over it. The drop is a real entity in the
+shared world. The server decides who collects it, so two players reaching for the
+same stack can never both get it, and a thrown item is out of its thrower's reach
+for two seconds so it does not snap straight back.
 
 ## What's in the game
 
@@ -194,7 +232,6 @@ src/
   constants.ts       all tunables (chunk size, gravity, reach, combat, hunger...)
   blocks.ts          block registry: tiles, hardness, tool + tier, drops
   textures.ts        procedural atlas: block tiles + pixel-art item icons
-  physics.ts         shared AABB-vs-voxel collision (player and mobs)
   input.ts           keyboard/wheel state, discrete press queue
   raycast.ts         Amanatides & Woo voxel DDA
   audio.ts           WebAudio generated sound effects
@@ -204,25 +241,32 @@ src/
     items.ts         item registry: blocks, materials, food, tools, weapons
     inventory.ts     slots, stacking, durability, serialisation
     crafting.ts      recipes and stations (hand / table / furnace)
+  shared/            runs identically in the browser and in Node
+    voxel.ts         AABB-vs-voxel collision and ray/box tests, no THREE
+    mobsim.ts        mob behaviour (chase/attack, wander/flee) + item drops
+    roomsim.ts       the world simulation: mobs, drops, loot, day/night clock
   entities/
-    entity.ts        Entity + Mob base: gravity, knockback, hurt state
-    arrow.ts         swept projectile: block, mob and player hits
+    entity.ts        Entity base: gravity, buoyancy, voxel collision
+    arrow.ts         swept projectile: reports block, mob and player hits
     models.ts        merged box geometry per mob type (one draw call each)
-    zombie.ts        hostile AI: chase, attack, wander
-    pig.ts           passive AI: wander, flee when hit
-    itemdrop.ts      dropped items: spin, bob, pickup
-    manager.ts       lifecycle, spawning/despawning, ray-vs-mob queries
+    manager.ts       lifecycle for client-side entities (arrows)
   game/
     interaction.ts   mining progress, placing, attacking, eating, stations
+    worldview.ts     renders mobs and drops from simulation snapshots
   net/
     protocol.ts      wire types, limits and validators (shared with the server)
     config.ts        WebSocket URL resolution (query > env > same-host)
     client.ts        socket lifecycle, reconnect backoff, ping/RTT
     session.ts       roster, state throttling, applying remote edits
     remoteplayers.ts remote bodies, name labels, snapshot interpolation
-    remotemobs.ts    guest-side view of the host's mobs, interpolated
 server/
-  index.ts           authoritative room server (rooms, cap, edits, relay)
+  index.ts           authoritative room server (rooms, cap, edits, simulation)
+  world.ts           server-side terrain + chunk cache with eviction
+tests/
+  simulation.test.ts headless: terrain, mobs, loot, drops, memory bounds
+  protocol.test.ts   every sanitiser, from an attacker's point of view
+  multiplayer.test.ts a real server driven by real WebSocket clients
+  browser.mjs        real Chromium tabs, including a simulated phone
   world/
     chunk.ts         flat Uint8Array voxel storage per 16x72x16 column
     noise.ts         seeded value noise + fBm
@@ -267,12 +311,31 @@ ray. Every voxel on the ray is visited exactly once (no skipped corners), and
 the axis of the last step gives the hit face's normal — which is where a
 placed block goes.
 
-**Physics.** Bodies are AABBs moved one axis at a time (`physics.ts`, shared by
-the player and every mob); after each axis move, any overlapped solid voxel
-clamps the position back to the voxel face and zeroes that velocity component.
-Movement is integrated in substeps small enough that no step exceeds 0.4 blocks,
-which rules out tunnelling at any frame rate. Unloaded chunks read as solid so
-nothing falls through terrain that hasn't streamed in yet.
+**Physics.** Bodies are AABBs moved one axis at a time (`shared/voxel.ts`);
+after each axis move, any overlapped solid voxel clamps the position back to the
+voxel face and zeroes that velocity component. Movement is integrated in
+substeps small enough that no step exceeds 0.4 blocks, which rules out
+tunnelling at any frame rate. Unloaded chunks read as solid so nothing falls
+through terrain that hasn't streamed in yet.
+
+That module is deliberately free of THREE and the DOM: positions are plain
+`{x, y, z}`, which `THREE.Vector3` structurally satisfies, so the browser passes
+its vectors straight in and Node runs the identical code. That is what lets the
+server simulate mobs against real terrain rather than trusting a client to.
+
+**One simulation, two homes.** `shared/roomsim.ts` is the only implementation of
+mob and item behaviour. The multiplayer server constructs one per room over a
+`ServerWorld`; a singleplayer client constructs one over its own streaming
+`World`. Both satisfy the same small `SimWorld` interface (block lookups plus a
+surface probe), and `game/worldview.ts` draws the result either way —
+interpolating snapshots in multiplayer, rendering directly in singleplayer.
+Singleplayer is therefore not a separate code path that can drift; it is the
+same game with the network hop removed.
+
+**Bounded server memory.** `ServerWorld` generates chunks on demand around the
+players and evicts them behind (4-chunk keep radius, 400-chunk hard cap), so a
+room's footprint stays flat however far anyone walks — a test walks 2,400 blocks
+and asserts the cache never grows past the cap.
 
 **Caves.** Two independent 3D noise fields are each thresholded into a thin
 shell (`|noise - 0.5| < t`); a voxel is carved only where *both* shells overlap,
@@ -330,18 +393,20 @@ protocol is identical on both platforms.
 - No per-voxel light propagation — lighting is sun + ambient + baked AO, so
   caves aren't dark inside and torches don't exist yet. Hostile spawning is
   gated on time of day rather than light level for the same reason.
-- Mobs are not saved; they despawn past 72 blocks and respawn naturally. Only
-  the seed, player state, inventory and block edits persist.
-  TODO hook: serialise `EntityManager.entities` alongside `SaveMeta`.
+- Mobs and dropped items are not saved; they despawn past 72 blocks (drops after
+  5 minutes) and respawn naturally. Only the seed, player state, inventory and
+  block edits persist. TODO hook: serialise `RoomSimulation.mobSnapshot()` and
+  `dropSnapshot()` alongside `SaveMeta`.
 - Mob AI has no pathfinding — zombies walk straight at you and hop one-block
-  ledges, so they get stuck on complex terrain. Hook: `Zombie.update`.
+  ledges, so they get stuck on complex terrain. Hook: `MobSim.update`.
 - Culled meshing, not greedy merging; fine at default view distance.
   TODO hook: `buildChunkGeometry` in `world/mesher.ts`.
 - Chunk generation/meshing runs on the main thread under a time budget.
   TODO hook: move `buildChunkGeometry` + `TerrainGenerator.generate` behind a
   worker boundary (both are already pure functions of chunk data).
-- Inventory is click-to-pick-up/click-to-place rather than true drag-and-drop,
-  and there is no drop-item-from-inventory action.
+- Inventory is click-to-pick-up/click-to-place rather than true drag-and-drop.
+  Dropping works from the hotbar (Q / Ctrl+Q, or hold a slot on touch) but not
+  from a backpack slot while the inventory screen is open.
 - Dying keeps your inventory (deliberate for now). No shovels yet — `ToolKind`
   already includes `'shovel'` as the extension point.
 - Only the shooter's client reports arrow hits, so damage is never
@@ -349,11 +414,11 @@ protocol is identical on both platforms.
   replayed, so they appear where they actually are rather than trailing the
   shot — but a hit still registers on the shooter's view of the world, so at
   high latency a very near-miss can differ between screens.
-- **Multiplayer:** mobs are *host*-authoritative rather than server-authoritative
-  — the server cannot simulate them because it does not generate terrain. If
-  the host's tab is backgrounded, mob updates slow for everyone.
-- **Multiplayer:** inventory is per-client, so you cannot hand someone an item
-  or trade. Health, hunger and worn armour are shared.
+- **Multiplayer:** inventories live on each client. The server owns the *world*
+  (mobs, drops, blocks, clock, damage) but not what is in your bag, so a
+  modified client could give itself items. Handing items over works — Q drops a
+  real entity the server arbitrates — but there is no trade window, exactly as
+  in vanilla.
 - **Multiplayer:** worlds are not saved. A room's edits live in server memory
   and are gone when the host leaves. Hook: persist `Room.edits` in
   `server/index.ts`.
@@ -371,11 +436,16 @@ protocol is identical on both platforms.
    Hook: add a light array to `Chunk`, sample it in `emitFace`.
 2. **Web worker meshing/generation** — moves the remaining frame hitches off
    the main thread; `mesher.ts`/`terrain.ts` are already pure functions.
-3. **Armour, bows and a real damage model** — item slots for armour with damage
-   reduction, plus a projectile entity. `ItemDef` and `Entity` are the hooks.
+3. **Chests and server-side containers** — a storage block whose contents live
+   in `RoomSimulation` rather than any client, which is how vanilla lets players
+   pool items in bulk and the natural place to start moving inventories
+   server-side. Hook: a new block in `blocks.ts` plus a container map on the
+   room, addressed the same way block edits already are.
 4. **Biomes and structures** — swap the single terrain function for a biome
    table (desert, forest, snow) and scatter simple structures; the chunk
    pipeline already supports it via `TerrainGenerator.generate`.
-5. **Multiplayer persistence and shared loot** — save a room's edits on the
-   server so worlds survive the host leaving, and sync item drops so a guest
-   collects what it kills.
+5. **Multiplayer persistence and host migration** — save a room's edits on the
+   server so a world survives the host leaving, and promote a guest instead of
+   closing the room. The simulation already lives on the server, so nothing
+   about the world itself depends on the host any more; only the room's
+   lifecycle does. Hook: `Room.edits` and `leaveRoom` in `server/index.ts`.

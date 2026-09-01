@@ -1,5 +1,7 @@
-import * as THREE from 'three';
-import { CHUNK_SIZE, WORLD_HEIGHT } from '../constants';
+// Type-only: the multiplayer server imports this file and must not pull
+// three.js into Node just to know a chunk can hold meshes.
+import type * as THREE from 'three';
+import { CHUNK_SIZE, WORLD_HEIGHT } from '../constants.ts';
 
 /**
  * One 16 x WORLD_HEIGHT x 16 column of voxels. Block ids are stored in a flat

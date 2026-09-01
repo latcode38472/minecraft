@@ -2,10 +2,10 @@
 // Everything is a pure function of (seed, coordinates) so any chunk can be
 // regenerated independently and trees stay consistent across chunk borders.
 
-import { Block } from '../blocks';
-import { CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT } from '../constants';
-import { Chunk } from './chunk';
-import { coordRandom, fbm2, fbm3, smoothstep } from './noise';
+import { Block } from '../blocks.ts';
+import { CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT } from '../constants.ts';
+import { Chunk } from './chunk.ts';
+import { coordRandom, fbm2, fbm3, smoothstep } from './noise.ts';
 
 const TREE_SALT = 0x7ee5;
 const TREE_CHANCE = 0.007;
@@ -19,7 +19,14 @@ const TREE_MARGIN = 2; // how far outside a chunk a tree centre can still reach 
 const CAVE_THRESHOLD = 0.0414;
 
 export class TerrainGenerator {
-  constructor(readonly seed: number) {}
+  // Written out longhand rather than as a constructor parameter property:
+  // the multiplayer server imports this file and Node's type stripping
+  // cannot erase parameter properties.
+  readonly seed: number;
+
+  constructor(seed: number) {
+    this.seed = seed;
+  }
 
   /** Ground height: terrain occupies y in [0, height). */
   heightAt(wx: number, wz: number): number {

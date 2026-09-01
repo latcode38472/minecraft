@@ -96,13 +96,43 @@ export interface MobStateData {
 
 export const MOB_KIND_ZOMBIE = 0;
 export const MOB_KIND_PIG = 1;
-/** Host mob-snapshot rate; guests interpolate between these. */
+/** Server world-snapshot rate; clients interpolate between these. */
 export const MOB_SYNC_HZ = 10;
+/** How often the server steps its authoritative simulation. */
+export const SIM_HZ = 20;
+export const MAX_DROPS_PER_MESSAGE = 80;
+
+/** A dropped item lying in the world, owned by the server. */
+export interface DropStateData {
+  i: number;
+  item: string;
+  n: number;
+  x: number;
+  y: number;
+  z: number;
+}
+/** One authoritative tick of everything the world owns but players don't. */
+export interface WorldStateData {
+  /** Day/night phase, 0..1. The server owns the clock. */
+  time: number;
+  mobs: MobStateData[];
+  drops: DropStateData[];
+  removedMobs: number[];
+  removedDrops: number[];
+  /** Where mobs died this tick, so clients can play the sound. */
+  mobDeaths: { x: number; y: number; z: number }[];
+}
+
 export const MAX_MOBS_PER_MESSAGE = 40;
 /** Server-side sanity bound on a single damage packet. */
 export const MAX_DAMAGE_PER_HIT = 40;
 /** Melee/arrow hits are rejected beyond this range from the attacker. */
 export const MAX_ATTACK_RANGE = 24;
+/**
+ * A positioned drop (from a mined block) must land within this far of the
+ * sender. Reach is 5 blocks; the slack absorbs a stale position report.
+ */
+export const MAX_DROP_RANGE = 9;
 export const RATE_LIMIT_COMBAT_PER_SEC = 20;
 
 export interface PlayerStateData {
@@ -137,12 +167,11 @@ export type ClientMessage =
   | { t: 'attack_player'; target: string; damage: number }
   | { t: 'player_vitals'; health: number; hunger: number; dead: boolean }
   | { t: 'equipment'; gear: number[] }
-  | { t: 'loot_grant'; to: string; items: { id: string; count: number }[] }
   | { t: 'respawn' }
-  // Host-authoritative mobs
-  | { t: 'mob_state'; mobs: MobStateData[] }
-  | { t: 'mob_removed'; ids: number[] }
+  // Server-authoritative world
   | { t: 'attack_mob'; mob: number; damage: number }
+  /** Throw an item into the world (vanilla's Q), for handing items to others. */
+  | { t: 'drop_item'; item: string; count: number; p?: [number, number, number] }
   | {
       t: 'arrow_spawn';
       x: number; y: number; z: number;
@@ -170,10 +199,10 @@ export type ServerMessage =
   | { t: 'loot_grant'; items: { id: string; count: number }[] }
   | { t: 'player_vitals'; vitals: PlayerVitals[] }
   | { t: 'player_respawned'; id: string }
-  // Host-authoritative mobs
-  | { t: 'mob_state'; mobs: MobStateData[] }
-  | { t: 'mob_removed'; ids: number[] }
-  | { t: 'attack_mob'; mob: number; damage: number; by: string }
+  /** A mob hit you: shove the local player away from it. */
+  | { t: 'knockback'; fromX: number; fromZ: number }
+  // Server-authoritative world: one snapshot carries time, mobs and drops.
+  | ({ t: 'world_state' } & WorldStateData)
   | {
       t: 'arrow_spawn';
       by: string;
@@ -269,26 +298,6 @@ export function normalizeRoomCode(raw: unknown): string | null {
   return code;
 }
 
-/** Validate and clamp a mob snapshot from the host. */
-export function sanitizeMobState(raw: unknown): MobStateData | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const m = raw as Record<string, unknown>;
-  if (!Number.isInteger(m.i) || !Number.isInteger(m.k)) return null;
-  if (!isFiniteNumber(m.x) || !isFiniteNumber(m.y) || !isFiniteNumber(m.z)) return null;
-  if (!isFiniteNumber(m.yaw) || !isFiniteNumber(m.hp)) return null;
-  if (Math.abs(m.x) > MAX_HORIZONTAL_COORD || Math.abs(m.z) > MAX_HORIZONTAL_COORD) return null;
-  if (m.y < -64 || m.y > WORLD_HEIGHT_LIMIT + 64) return null;
-  return {
-    i: m.i as number,
-    k: (m.k as number) === MOB_KIND_PIG ? MOB_KIND_PIG : MOB_KIND_ZOMBIE,
-    x: m.x,
-    y: m.y,
-    z: m.z,
-    yaw: wrapAngle(m.yaw),
-    hp: Math.max(0, Math.min(200, m.hp)),
-  };
-}
-
 /** Armour tiers arrive as four small ints; anything else is discarded. */
 export function sanitizeEquipment(raw: unknown): number[] | null {
   if (!Array.isArray(raw) || raw.length !== ARMOR_SLOTS_ON_WIRE) return null;
@@ -300,18 +309,26 @@ export function sanitizeEquipment(raw: unknown): number[] | null {
   return out;
 }
 
-/** Mob loot forwarded to the player who landed the killing blow. */
-export function sanitizeLoot(raw: unknown): { id: string; count: number }[] | null {
-  if (!Array.isArray(raw) || raw.length > 8) return null;
-  const out: { id: string; count: number }[] = [];
-  for (const entry of raw) {
-    if (typeof entry !== 'object' || entry === null) return null;
-    const e = entry as Record<string, unknown>;
-    if (typeof e.id !== 'string' || e.id.length > 40) return null;
-    if (!Number.isInteger(e.count) || (e.count as number) < 1 || (e.count as number) > 64) return null;
-    out.push({ id: e.id, count: e.count as number });
+/**
+ * A thrown item, or the drop from a block the sender just mined. The id is
+ * checked against the registry by the receiver, and `p` — present only for
+ * block drops — is range-checked against the sender's own position, so it can
+ * never place items across the map.
+ */
+export function sanitizeDropRequest(
+  raw: Record<string, unknown>,
+): { item: string; count: number; p: [number, number, number] | null } | null {
+  if (typeof raw.item !== 'string' || raw.item.length > 40) return null;
+  if (!Number.isInteger(raw.count) || (raw.count as number) < 1 || (raw.count as number) > 64) {
+    return null;
   }
-  return out;
+  let p: [number, number, number] | null = null;
+  if (raw.p !== undefined) {
+    if (!Array.isArray(raw.p) || raw.p.length !== 3) return null;
+    for (const v of raw.p) if (!Number.isFinite(v)) return null;
+    p = [raw.p[0] as number, raw.p[1] as number, raw.p[2] as number];
+  }
+  return { item: raw.item, count: raw.count as number, p };
 }
 
 /** Damage values are clamped, never trusted verbatim. */

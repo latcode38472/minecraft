@@ -1,45 +1,22 @@
-// Entity foundation: everything that moves through the world and isn't the
-// player. Mobs share the player's voxel collision (physics.ts) so they walk,
-// fall and get stuck on exactly the same geometry.
+// Entity foundation for client-side effects that move through the world.
+//
+// Since mobs and dropped items became server-authoritative (see
+// shared/roomsim.ts), the only thing left here is the base class arrows use:
+// gravity, buoyancy and the shared voxel collision, so a projectile falls and
+// stops on exactly the same geometry the player walks on.
 
 import * as THREE from 'three';
 import { Block } from '../blocks';
-import { GRAVITY, KNOCKBACK_LIFT, KNOCKBACK_SPEED, TERMINAL_VELOCITY } from '../constants';
-import { moveWithCollision, type BodyShape } from '../physics';
+import { GRAVITY, TERMINAL_VELOCITY } from '../constants';
+import { moveWithCollision, type BodyShape } from '../shared/voxel';
 import type { World } from '../world/world';
-import { getMobHurtMaterial, getMobMaterial } from './models';
 
-/** A player a mob can chase and hit — the local one, or a remote one. */
-export interface PlayerTarget {
-  id: string;
-  position: THREE.Vector3;
-  halfWidth: number;
-  height: number;
-}
-
-/** Everything a mob needs to know about the world on a given tick. */
+/** Everything a client entity needs to know about the world on a given tick. */
 export interface EntityContext {
   world: World;
   dt: number;
-  /** Local player feet position (spawning and despawning are centred on it). */
+  /** Local player feet position; entities retire once they get far from it. */
   playerPos: THREE.Vector3;
-  /** Every player a mob may target: the local player plus any remotes. */
-  players: PlayerTarget[];
-  /** Id used for the local player in `players`. */
-  localPlayerId: string;
-  /**
-   * Set while a dead mob's loot is being spawned, to the player who killed it.
-   * Lets the host hand loot to a guest instead of dropping it out of reach.
-   */
-  lootRecipientId: string | null;
-  /** Live entity list, so projectiles can test hits. */
-  entities: readonly Entity[];
-  isNight: boolean;
-  damagePlayer(id: string, amount: number, fromX: number, fromZ: number): void;
-  spawnDrop(id: string, count: number, x: number, y: number, z: number): void;
-  /** Try to put an item in the player's inventory; returns the leftover count. */
-  collectItem(id: string, count: number, damage?: number): number;
-  onMobDeath(): void;
 }
 
 export abstract class Entity {
@@ -65,7 +42,7 @@ export abstract class Entity {
         Math.floor(this.position.z),
       ) === Block.Water;
     if (inWater) {
-      // Gentle buoyancy keeps mobs bobbing at the surface instead of sinking.
+      // Gentle buoyancy keeps entities bobbing at the surface instead of sinking.
       this.velocity.y = Math.min(this.velocity.y + GRAVITY * 0.25 * ctx.dt, 2);
       this.velocity.x *= 0.8;
       this.velocity.z *= 0.8;
@@ -73,100 +50,5 @@ export abstract class Entity {
       this.velocity.y = Math.max(this.velocity.y - GRAVITY * ctx.dt, -TERMINAL_VELOCITY);
     }
     this.onGround = moveWithCollision(ctx.world, this.position, this.velocity, this.shape, ctx.dt);
-  }
-}
-
-export abstract class Mob extends Entity {
-  health: number;
-  readonly maxHealth: number;
-  /** Seconds of red hurt-flash remaining; also acts as damage cooldown. */
-  hurtTime = 0;
-  attackCooldown = 0;
-  /** Facing angle, applied to the model each frame. */
-  yaw = 0;
-  /** Network id of whoever last damaged this mob; decides who gets the loot. */
-  lastAttackerId: string | null = null;
-  readonly mesh: THREE.Mesh;
-
-  constructor(geometry: THREE.BufferGeometry, maxHealth: number) {
-    super();
-    this.maxHealth = maxHealth;
-    this.health = maxHealth;
-    this.mesh = new THREE.Mesh(geometry, getMobMaterial());
-  }
-
-  get object(): THREE.Object3D {
-    return this.mesh;
-  }
-
-  /** Loot table, rolled once on death. */
-  protected abstract loot(): { id: string; count: number }[];
-
-  takeDamage(amount: number, fromX: number, fromZ: number): void {
-    if (this.hurtTime > 0 || this.dead) return;
-    this.health -= amount;
-    this.hurtTime = 0.4;
-    const dx = this.position.x - fromX;
-    const dz = this.position.z - fromZ;
-    const len = Math.hypot(dx, dz) || 1;
-    this.velocity.x = (dx / len) * KNOCKBACK_SPEED;
-    this.velocity.z = (dz / len) * KNOCKBACK_SPEED;
-    this.velocity.y = Math.max(this.velocity.y, KNOCKBACK_LIFT);
-    if (this.health <= 0) this.dead = true;
-  }
-
-  /** Call at the end of each subclass update to sync the visual state. */
-  protected syncObject(ctx: EntityContext): void {
-    this.hurtTime = Math.max(0, this.hurtTime - ctx.dt);
-    this.attackCooldown = Math.max(0, this.attackCooldown - ctx.dt);
-    this.mesh.position.copy(this.position);
-    this.mesh.rotation.y = this.yaw;
-    this.mesh.material = this.hurtTime > 0 ? getMobHurtMaterial() : getMobMaterial();
-  }
-
-  /** Spawn this mob's loot where it died, or hand it to a remote killer. */
-  dropLoot(ctx: EntityContext): void {
-    ctx.lootRecipientId = this.lastAttackerId;
-    try {
-      for (const entry of this.loot()) {
-        if (entry.count > 0) {
-          ctx.spawnDrop(
-            entry.id, entry.count,
-            this.position.x, this.position.y + 0.4, this.position.z,
-          );
-        }
-      }
-    } finally {
-      ctx.lootRecipientId = null;
-    }
-  }
-
-  /**
-   * Walk toward a horizontal direction, hopping over one-block obstacles the
-   * way Minecraft mobs do (no pathfinding — enough to follow a player over
-   * uneven ground).
-   */
-  protected walkToward(ctx: EntityContext, dirX: number, dirZ: number, speed: number): void {
-    const len = Math.hypot(dirX, dirZ);
-    if (len < 1e-4) {
-      this.velocity.x = 0;
-      this.velocity.z = 0;
-      return;
-    }
-    const nx = dirX / len;
-    const nz = dirZ / len;
-    this.velocity.x = nx * speed;
-    this.velocity.z = nz * speed;
-    this.yaw = Math.atan2(nx, nz);
-
-    if (this.onGround) {
-      // Look one step ahead: solid at foot level but clear above means hop up.
-      const ax = Math.floor(this.position.x + nx * (this.shape.halfWidth + 0.35));
-      const az = Math.floor(this.position.z + nz * (this.shape.halfWidth + 0.35));
-      const footY = Math.floor(this.position.y + 0.1);
-      const blockedAtFoot = ctx.world.isSolidAt(ax, footY, az);
-      const clearAbove = !ctx.world.isSolidAt(ax, footY + 1, az);
-      if (blockedAtFoot && clearAbove) this.velocity.y = 7.2;
-    }
   }
 }

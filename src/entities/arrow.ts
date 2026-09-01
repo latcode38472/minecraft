@@ -1,14 +1,16 @@
 // Arrow projectile: ballistic flight, block collision, and a hit test against
-// mobs and (in multiplayer) other players.
+// mobs and other players.
 //
 // Arrows are stepped in small increments and swept against the voxel grid, so
-// a fast arrow cannot tunnel through a one-block wall.
+// a fast arrow cannot tunnel through a one-block wall. Hits are only *reported*
+// — the simulation that owns the target (the server, or the local one in
+// singleplayer) decides what the damage actually does.
 
 import * as THREE from 'three';
 import { isSolid } from '../blocks';
 import { ARROW_GRAVITY, ARROW_LIFETIME_S, WORLD_HEIGHT } from '../constants';
-import type { BodyShape } from '../physics';
-import { Entity, Mob, type EntityContext } from './entity';
+import type { BodyShape } from '../shared/voxel';
+import { Entity, type EntityContext } from './entity';
 import { buildBoxGeometry, getMobMaterial } from './models';
 
 const SHAFT = 0.06;
@@ -30,9 +32,9 @@ function getArrowGeometry(): THREE.BufferGeometry {
   return arrowGeometry;
 }
 
-/** Something an arrow can hit that isn't a block. */
+/** Something an arrow can hit that isn't a block: a mob or another player. */
 export interface ArrowTarget {
-  /** Stable id; for players this is the network player id. */
+  /** Stable id: a network player id, or "mob:<n>" for a simulated mob. */
   id: string;
   position: THREE.Vector3;
   halfWidth: number;
@@ -40,9 +42,9 @@ export interface ArrowTarget {
 }
 
 export interface ArrowHooks {
-  /** Remote players an arrow may hit (empty in singleplayer). */
+  /** Mobs and remote players an arrow may hit. */
   targets(): ArrowTarget[];
-  /** Called when an arrow hits a networked target. */
+  /** Called when an arrow hits one of them. */
   onHitTarget(id: string, damage: number, fromX: number, fromZ: number): void;
 }
 
@@ -103,7 +105,7 @@ export class Arrow extends Entity {
 
     for (let i = 0; i < steps && !this.dead && !this.stuck; i++) {
       this.position.addScaledVector(this.velocity, stepDt);
-      if (this.checkEntityHit(ctx)) return;
+      if (this.checkEntityHit()) return;
       this.checkBlockHit(ctx);
     }
 
@@ -118,22 +120,8 @@ export class Arrow extends Entity {
     );
   }
 
-  /** Mobs first, then networked targets. Returns true if the arrow was consumed. */
-  private checkEntityHit(ctx: EntityContext): boolean {
-    for (const entity of ctx.entities) {
-      if (!(entity instanceof Mob) || entity.dead) continue;
-      if (!this.insideBox(entity.position, entity.shape.halfWidth, entity.shape.height)) continue;
-      // Credit the shooter so a kill's loot reaches them, not the ground.
-      entity.lastAttackerId = this.ownerId;
-      entity.takeDamage(
-        this.damage,
-        this.position.x - this.velocity.x,
-        this.position.z - this.velocity.z,
-      );
-      this.dead = true;
-      return true;
-    }
-
+  /** Report the first target the arrow entered. True if it was consumed. */
+  private checkEntityHit(): boolean {
     for (const target of this.hooks?.targets() ?? []) {
       if (target.id === this.ownerId) continue;
       if (!this.insideBox(target.position, target.halfWidth, target.height)) continue;

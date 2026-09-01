@@ -292,6 +292,22 @@ export class World {
     chunk.waterMesh = null;
   }
 
+  /**
+   * Standing height for a column, or null when it is water, blocked, or in a
+   * chunk that has not streamed in. Part of the SimWorld contract, so the
+   * shared room simulation can spawn mobs against the client's world too.
+   */
+  surfaceAt(x: number, z: number): number | null {
+    const generated = this.terrain.heightAt(x, z);
+    for (let y = generated + 6; y >= Math.max(1, generated - 8); y--) {
+      if (!this.isSolidAt(x, y, z)) continue;
+      if (this.getBlock(x, y + 1, z) !== Block.Air) return null;
+      if (this.getBlock(x, y + 2, z) !== Block.Air) return null;
+      return y + 1;
+    }
+    return null;
+  }
+
   get pendingMeshCount(): number {
     return this.dirtyQueue.size;
   }

@@ -1,55 +1,61 @@
 // Block registry. Tile numbers index into the procedural texture atlas
 // (textures.ts); drop ids reference the item registry (items/items.ts).
+//
+// Block and Tile are plain const objects rather than `const enum` because the
+// multiplayer server imports this file and runs it through Node's native type
+// stripping, which cannot erase an enum. They behave identically at call sites.
 
-export const enum Block {
-  Air = 0,
-  Grass = 1,
-  Dirt = 2,
-  Stone = 3,
-  Sand = 4,
-  Bedrock = 5,
-  Water = 6,
-  Log = 7,
-  Leaves = 8,
-  Planks = 9,
-  Cobblestone = 10,
-  Gravel = 11,
-  CoalOre = 12,
-  IronOre = 13,
-  GoldOre = 14,
-  DiamondOre = 15,
-  Bricks = 16,
-  Glass = 17,
-  CraftingTable = 18,
-  Furnace = 19,
-}
+export const Block = {
+  Air: 0,
+  Grass: 1,
+  Dirt: 2,
+  Stone: 3,
+  Sand: 4,
+  Bedrock: 5,
+  Water: 6,
+  Log: 7,
+  Leaves: 8,
+  Planks: 9,
+  Cobblestone: 10,
+  Gravel: 11,
+  CoalOre: 12,
+  IronOre: 13,
+  GoldOre: 14,
+  DiamondOre: 15,
+  Bricks: 16,
+  Glass: 17,
+  CraftingTable: 18,
+  Furnace: 19,
+} as const;
+export type Block = (typeof Block)[keyof typeof Block];
 
-export const enum Tile {
-  GrassTop = 0,
-  GrassSide = 1,
-  Dirt = 2,
-  Stone = 3,
-  Sand = 4,
-  Bedrock = 5,
-  Water = 6,
-  LogSide = 7,
-  LogTop = 8,
-  Leaves = 9,
-  Planks = 10,
-  Cobblestone = 11,
-  Gravel = 12,
-  CoalOre = 13,
-  IronOre = 14,
-  GoldOre = 15,
-  DiamondOre = 16,
-  Bricks = 17,
-  Glass = 18,
-  CraftingTableTop = 19,
-  CraftingTableSide = 20,
-  FurnaceFront = 21,
-  FurnaceSide = 22,
-  FurnaceTop = 23,
-}
+export const Tile = {
+  GrassTop: 0,
+  GrassSide: 1,
+  Dirt: 2,
+  Stone: 3,
+  Sand: 4,
+  Bedrock: 5,
+  Water: 6,
+  LogSide: 7,
+  LogTop: 8,
+  Leaves: 9,
+  Planks: 10,
+  Cobblestone: 11,
+  Gravel: 12,
+  CoalOre: 13,
+  IronOre: 14,
+  GoldOre: 15,
+  DiamondOre: 16,
+  Bricks: 17,
+  Glass: 18,
+  CraftingTableTop: 19,
+  CraftingTableSide: 20,
+  FurnaceFront: 21,
+  FurnaceSide: 22,
+  FurnaceTop: 23,
+} as const;
+export type Tile = (typeof Tile)[keyof typeof Tile];
 
 export type SoundKind = 'soft' | 'hard' | 'wood' | 'sand' | 'liquid' | 'glass';
 

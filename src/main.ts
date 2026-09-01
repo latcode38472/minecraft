@@ -22,6 +22,7 @@ import {
   MAX_HEALTH,
   MAX_HUNGER,
   MAX_TIMESTEP,
+  MOB_DESPAWN_DISTANCE,
   MAX_VIEW_DISTANCE,
   MIN_VIEW_DISTANCE,
   RESPAWN_SEARCH_RADIUS,
@@ -33,7 +34,10 @@ import {
 } from './constants';
 import { BLOCKS } from './blocks';
 import type { EntityContext } from './entities/entity';
-import { EntityManager, isNightTime } from './entities/manager';
+import { EntityManager } from './entities/manager';
+import { RoomSimulation } from './shared/roomsim';
+import { isNightTime, type SimPlayer } from './shared/mobsim';
+import { WorldView } from './game/worldview';
 import { Arrow } from './entities/arrow';
 import type { CombatTarget } from './game/interaction';
 import { ARROW_SPEED, BLOCK_SLOWDOWN, PLAYER_HALF_WIDTH, PLAYER_HEIGHT } from './constants';
@@ -139,7 +143,12 @@ async function boot(choice: StartChoice): Promise<void> {
   const look = new MouseLook(camera, renderer.domElement);
   const player = new Player(world);
   const inventory = new Inventory();
-  const entities = new EntityManager(scene, world);
+  // Arrows still live in the client entity manager; mobs and dropped items are
+  // simulation-owned and rendered from snapshots.
+  const entities = new EntityManager(scene);
+  const worldView = new WorldView(scene);
+  /** Singleplayer runs the SAME simulation class the server runs. */
+  let localSim: RoomSimulation | null = null;
 
   const survival = new Survival({
     onHurt: () => playHurt(),
@@ -168,7 +177,15 @@ async function boot(choice: StartChoice): Promise<void> {
     },
   });
 
-  const hud = new Hud(inventory, (index) => inventory.selectSlot(index));
+  const hud = new Hud(
+    inventory,
+    (index) => inventory.selectSlot(index),
+    // Long-press on touch throws the stack: the phone's Ctrl+Q.
+    (index) => {
+      inventory.selectSlot(index);
+      dropHeldItem(true);
+    },
+  );
   const statusUi = new StatusUi(() => respawn());
   const inventoryUi = new InventoryUi(inventory, () => hud.refresh());
 
@@ -196,6 +213,27 @@ async function boot(choice: StartChoice): Promise<void> {
     player.position.set(spawn.x + ox + 0.5, spawn.y + 2, spawn.z + oz + 0.5);
     spawnPoint.copy(player.position);
   }
+  if (!multiplayer) {
+    // Singleplayer: the client is its own authority, running the same code.
+    localSim = new RoomSimulation(world, {
+      damagePlayer: (_id, amount, fromX, fromZ) => {
+        if (!isPlaying()) return;
+        survival.damage(amount);
+        knockbackPlayer(fromX, fromZ);
+      },
+      giveItems: (_id, itemId, count) => {
+        const leftover = inventory.add(itemId, count);
+        if (leftover < count) {
+          playPickup();
+          hud.refresh();
+        }
+        return leftover;
+      },
+    });
+    localSim.timeOfDay = sky.timeOfDay;
+    worldView.direct = true;
+  }
+
   hud.refresh();
 
   // Targeted-block outline.
@@ -206,7 +244,7 @@ async function boot(choice: StartChoice): Promise<void> {
   highlight.visible = false;
   scene.add(highlight);
 
-  const interaction = new Interaction(world, player, inventory, entities, {
+  const interaction = new Interaction(world, player, inventory, {
     onBreakBlock: (def) => playBreak(def.sound),
     onPlaceBlock: (def) => playPlace(def.sound),
     onAttack: () => playAttack(),
@@ -217,9 +255,9 @@ async function boot(choice: StartChoice): Promise<void> {
     },
     onOpenStation: (station) => openInventory(station),
     toast: (msg) => hud.toast(msg),
-    combatTargets: () => (session ? networkedTargets(session) : []),
-    onHitPlayer: (id, damage) => hitNetworkedTarget(id, damage),
-    localPlayerId: () => selfNetId(),
+    combatTargets: () => combatTargets(),
+    onHitTarget: (id, damage) => hitTarget(id, damage),
+    spawnDrop: (id, count, x, y, z) => spawnDrop(id, count, x, y, z),
     fireArrow: (origin, dir, charge) => {
       const speed = ARROW_SPEED * (0.35 + charge * 0.65);
       const damage = Math.max(1, Math.round(2 + charge * 7));
@@ -234,38 +272,65 @@ async function boot(choice: StartChoice): Promise<void> {
   }
 
   /**
-   * Everything networked the local player can hit: live remote players, plus
-   * (on a guest) the host's mobs. Mob entries carry a "mob:" id prefix so a
-   * single target list drives both melee and arrows.
+   * Everything the local player can hit: every simulated mob, plus any live
+   * remote players. Mob entries carry a "mob:" id prefix so a single target
+   * list drives both melee and arrows in either mode.
    */
-  function networkedTargets(active: MultiplayerSession): CombatTarget[] {
-    const targets: CombatTarget[] = active.remotePlayers.all
+  function combatTargets(): CombatTarget[] {
+    const targets: CombatTarget[] = [];
+    for (const mob of worldView.allMobs) {
+      if (!mob.mesh.visible) continue;
+      targets.push({
+        id: `mob:${mob.id}`,
+        position: mob.position,
+        halfWidth: mob.halfWidth,
+        height: mob.height,
+      });
+    }
+    if (!session) return targets;
+    for (const p of session.remotePlayers.all) {
       // `visible` is only set once a snapshot has arrived; without it the body
       // still sits at the origin and could be "hit" by aiming at 0,0,0.
-      .filter((p) => p.group.visible && !active.vitals.get(p.info.id)?.dead)
-      .map((p) => ({
+      if (!p.group.visible || session.vitals.get(p.info.id)?.dead) continue;
+      targets.push({
         id: p.info.id,
         position: p.position,
         halfWidth: PLAYER_HALF_WIDTH,
         height: PLAYER_HEIGHT,
-      }));
-    if (!active.isHost) {
-      for (const mob of active.remoteMobs.all) {
-        targets.push({
-          id: `mob:${mob.id}`,
-          position: mob.position,
-          halfWidth: mob.halfWidth,
-          height: mob.height,
-        });
-      }
+      });
     }
     return targets;
   }
 
-  /** Route a hit to the right server message based on the target id. */
-  function hitNetworkedTarget(id: string, damage: number): void {
-    if (id.startsWith('mob:')) session?.attackMob(Number(id.slice(4)), damage);
-    else session?.attackPlayer(id, damage);
+  /** Route a hit to whichever simulation owns the target. */
+  function hitTarget(id: string, damage: number): void {
+    if (id.startsWith('mob:')) {
+      const mobId = Number(id.slice(4));
+      if (localSim) localSim.damageMob(mobId, damage, selfNetId(), player.position);
+      else session?.attackMob(mobId, damage);
+      return;
+    }
+    session?.attackPlayer(id, damage);
+  }
+
+  /** Put an item into the world, wherever the authoritative simulation lives. */
+  function spawnDrop(id: string, count: number, x: number, y: number, z: number): void {
+    if (localSim) localSim.spawnDrop(id, count, x, y, z);
+    else session?.spawnDrop(id, count, x, y, z);
+  }
+
+  /** Play the death sound for any mob that died within earshot. */
+  function playMobDeaths(deaths: { x: number; y: number; z: number }[]): void {
+    const earshotSq = MOB_DESPAWN_DISTANCE * MOB_DESPAWN_DISTANCE;
+    for (const at of deaths) {
+      const dx = at.x - player.position.x;
+      const dy = at.y - player.position.y;
+      const dz = at.z - player.position.z;
+      if (dx * dx + dy * dy + dz * dz <= earshotSq) {
+        playMobDeath();
+        return; // one sound per tick, however many died
+      }
+    }
   }
 
   function spawnArrow(
@@ -277,8 +342,8 @@ async function boot(choice: StartChoice): Promise<void> {
   ): Arrow {
     const arrow = new Arrow(origin, dir, speed, damage, ownerId, {
       // The shooter's own id is filtered inside Arrow; include everyone else.
-      targets: () => (session ? networkedTargets(session) : []),
-      onHitTarget: (id, dmg) => hitNetworkedTarget(id, dmg),
+      targets: () => combatTargets(),
+      onHitTarget: (id, dmg) => hitTarget(id, dmg),
     });
     // Start slightly ahead of the eye so it doesn't clip the shooter.
     arrow.position.addScaledVector(dir, 0.4);
@@ -363,7 +428,7 @@ async function boot(choice: StartChoice): Promise<void> {
   function onPlayerDied(): void {
     inventoryUi.close();
     menu.style.display = 'none';
-    statusUi.showDeath(entities.mobCount > 0 ? 'The night was not kind.' : 'Better luck next time.');
+    statusUi.showDeath(worldView.mobCount > 0 ? 'The night was not kind.' : 'Better luck next time.');
     if (!touchDevice && look.locked) document.exitPointerLock();
     refreshPlayingClass();
     flushSave();
@@ -420,6 +485,8 @@ async function boot(choice: StartChoice): Promise<void> {
           inventory.selectSlot(n - 1);
           hud.refresh();
         }
+      } else if (code === 'KeyQ') {
+        dropHeldItem(input.isDown('ControlLeft') || input.isDown('ControlRight'));
       } else if (code === 'KeyE') {
         toggleInventory();
       } else if (code === 'F3') {
@@ -442,6 +509,34 @@ async function boot(choice: StartChoice): Promise<void> {
     }
   }
 
+  /**
+   * Throw the held item into the world — vanilla's Q, and the way you hand
+   * something to another player. `wholeStack` mirrors Ctrl+Q.
+   */
+  function dropHeldItem(wholeStack: boolean): void {
+    if (!isPlaying()) return;
+    const stack = inventory.selectedStack;
+    if (!stack) return;
+    const count = wholeStack ? stack.count : 1;
+    const itemId = stack.id;
+
+    stack.count -= count;
+    if (stack.count <= 0) inventory.slots[inventory.selected] = null;
+    inventory.version++;
+    hud.refresh();
+
+    if (session) {
+      session.dropItem(itemId, count);
+    } else if (localSim) {
+      localSim.spawnDrop(
+        itemId, count,
+        player.position.x, player.position.y + 1.2, player.position.z,
+        selfNetId(),
+      );
+    }
+    hud.toast(`Dropped ${count} ${getItem(itemId)?.name ?? itemId}`);
+  }
+
   /** Shove the player away from a damage source. */
   function knockbackPlayer(fromX: number, fromZ: number): void {
     const dx = player.position.x - fromX;
@@ -456,40 +551,6 @@ async function boot(choice: StartChoice): Promise<void> {
     world,
     dt: 0,
     playerPos: player.position,
-    players: [],
-    localPlayerId: 'local',
-    lootRecipientId: null,
-    entities: entities.entities,
-    isNight: false,
-    damagePlayer: (id, amount, fromX, fromZ) => {
-      if (id === entityContext.localPlayerId) {
-        if (!isPlaying()) return;
-        survival.damage(amount);
-        knockbackPlayer(fromX, fromZ);
-      } else {
-        // A mob hit a remote player: the host reports it to the server.
-        session?.attackPlayer(id, amount);
-      }
-    },
-    spawnDrop: (id, count, x, y, z) => {
-      // A guest that landed the killing blow gets the loot directly; dropping
-      // it in the host's world would leave it unreachable for them.
-      const killer = entityContext.lootRecipientId;
-      if (killer && session && killer !== entityContext.localPlayerId) {
-        session.grantLoot(killer, [{ id, count }]);
-        return;
-      }
-      entities.spawnDrop(id, count, x, y, z);
-    },
-    collectItem: (id, count, damage) => {
-      const leftover = inventory.add(id, count, damage);
-      if (leftover < count) {
-        playPickup();
-        hud.refresh();
-      }
-      return leftover;
-    },
-    onMobDeath: () => playMobDeath(),
   };
 
   // --- Persistence ---
@@ -573,16 +634,20 @@ async function boot(choice: StartChoice): Promise<void> {
           survival.damage(amount);
           mpHud.notice(`${byName} hit you.`);
         },
-        onMobAttacked: (mobId, damage, byId) => {
-          // Host side: a guest hit one of our mobs.
-          const mob = entities.mobById(mobId);
-          if (!mob) return;
-          const attacker = session?.remotePlayers.all.find((p) => p.info.id === byId);
-          const from = attacker?.position ?? player.position;
-          mob.hurtTime = 0; // the guest's client already paced the swing
-          mob.lastAttackerId = byId; // so the loot goes to whoever lands the kill
-          mob.takeDamage(damage, from.x, from.z);
+        onWorldState: (state) => {
+          // The server owns mobs, dropped items and the clock.
+          const now = Date.now();
+          sky.timeOfDay = state.time;
+          worldView.applyMobs(state.mobs, now);
+          worldView.applyDrops(state.drops, now);
+          worldView.removeMobs(state.removedMobs);
+          worldView.removeDrops(state.removedDrops);
+          // Anything absent from a full snapshot is gone.
+          worldView.retainMobs(new Set(state.mobs.map((m) => m.i)));
+          worldView.retainDrops(new Set(state.drops.map((d) => d.i)));
+          playMobDeaths(state.mobDeaths);
         },
+        onKnockback: (fromX, fromZ) => knockbackPlayer(fromX, fromZ),
         onRemoteArrow: (x, y, z, dx, dy, dz, speed, ownerId, ageMs) => {
           const origin = new THREE.Vector3(x, y, z);
           const dir = new THREE.Vector3(dx, dy, dz);
@@ -594,7 +659,12 @@ async function boot(choice: StartChoice): Promise<void> {
           arrow.fastForward(ageMs / 1000, entityContext);
         },
         onLootGranted: (items) => {
-          for (const entry of items) inventory.add(entry.id, entry.count);
+          for (const entry of items) {
+            const leftover = inventory.add(entry.id, entry.count);
+            // The server does not model inventories; anything that will not fit
+            // goes straight back on the ground rather than vanishing.
+            if (leftover > 0) session?.dropItem(entry.id, leftover);
+          }
           hud.refresh();
           playPickup();
           const names = items.map((e) => `${e.count} ${getItem(e.id)?.name ?? e.id}`);
@@ -624,6 +694,9 @@ async function boot(choice: StartChoice): Promise<void> {
     inventoryUi,
     respawn,
     getSession: () => session,
+    getWorldView: () => worldView,
+    getLocalSim: () => localSim,
+    dropHeldItem,
     getViewDistance: () => viewDistance,
     // Thin wrappers over the real rules, so automated tests exercise the same
     // code paths the game does rather than reimplementing them.
@@ -702,51 +775,46 @@ async function boot(choice: StartChoice): Promise<void> {
       touchDevice ? TOUCH_MAX_CHUNK_GENS_PER_FRAME : undefined,
       touchDevice ? TOUCH_MESH_BUDGET_MS : undefined,
     );
-    sky.update(dt);
+    // In multiplayer the server owns the clock; sky.update only advances it
+    // locally when there is no session to take it from.
+    sky.update(session ? 0 : dt);
     if (playing) autoQuality?.update(dt);
 
-    // Entities keep simulating while paused would be surprising; freeze them.
-    // In multiplayer only the HOST simulates mobs; guests render its snapshots,
-    // so there is exactly one simulation and everyone agrees who is alive.
-    const simulateMobs = playing && (!session || session.isHost);
+    // Build the player list the simulation reasons about (local + remotes).
+    const simPlayers: SimPlayer[] = [
+      { id: selfNetId(), position: player.position, dead: survival.dead },
+      ...(session?.remotePlayers.all ?? [])
+        .filter((p) => p.group.visible)
+        .map((p) => ({
+          id: p.info.id,
+          position: p.position,
+          dead: session!.vitals.get(p.info.id)?.dead ?? false,
+        })),
+    ];
+
+    // Singleplayer drives the shared simulation locally; multiplayer receives
+    // authoritative snapshots instead and never simulates mobs itself.
+    if (playing && localSim) {
+      localSim.update(dt, simPlayers);
+      sky.timeOfDay = localSim.timeOfDay;
+      worldView.applyMobs(localSim.mobSnapshot(), nowMs);
+      worldView.applyDrops(localSim.dropSnapshot(), nowMs);
+      worldView.removeMobs(localSim.removedMobs.splice(0));
+      worldView.removeDrops(localSim.removedDrops.splice(0));
+      playMobDeaths(localSim.mobDeaths.splice(0));
+    }
+    worldView.update(nowMs, dt);
+
+    // Arrows still tick locally; their hits are reported, never applied here.
     if (playing) {
       entityContext.dt = dt;
-      entityContext.isNight = isNightTime(sky.timeOfDay);
-      entityContext.localPlayerId = selfNetId();
-      // Mobs chase the nearest player, local or remote.
-      entityContext.players = [
-        {
-          id: entityContext.localPlayerId,
-          position: player.position,
-          halfWidth: PLAYER_HALF_WIDTH,
-          height: PLAYER_HEIGHT,
-        },
-        ...(session?.remotePlayers.all ?? [])
-          .filter((p) => p.group.visible && !session!.vitals.get(p.info.id)?.dead)
-          .map((p) => ({
-            id: p.info.id,
-            position: p.position,
-            halfWidth: PLAYER_HALF_WIDTH,
-            height: PLAYER_HEIGHT,
-          })),
-      ];
-      if (simulateMobs) {
-        entities.update(entityContext, sky.timeOfDay);
-      } else {
-        // Guests still tick projectiles and item drops, just not mobs.
-        for (const entity of [...entities.entities]) entity.update(entityContext);
-        entities.reapDead(entityContext);
-      }
+      entities.update(entityContext);
     }
 
     if (session) {
       // Camera yaw/pitch is the shared abstraction: keyboard+mouse and touch
       // both feed it, so both platforms emit identical network state.
       session.update(nowMs, dt, look.yaw, look.pitch, playing);
-      if (session.isHost) {
-        for (const id of entities.removedMobIds.splice(0)) session.noteMobRemoved(id);
-        session.syncMobs(nowMs, entities.mobSnapshot());
-      }
       session.sendVitals(nowMs, survival.health, survival.hunger, survival.dead);
       session.sendEquipment(inventory.equipmentTiers());
       mpHud.setPing(session.ping, session.status === 'connected' ? 'Ping: —' : session.status);
@@ -791,7 +859,7 @@ async function boot(choice: StartChoice): Promise<void> {
         `pos ${player.position.x.toFixed(1)} ${player.position.y.toFixed(1)} ${player.position.z.toFixed(1)}`,
         `chunk ${Math.floor(player.position.x / CHUNK_SIZE)},${Math.floor(player.position.z / CHUNK_SIZE)}`,
         `chunks ${world.chunks.size} (pending mesh ${world.pendingMeshCount})`,
-        `entities ${entities.entities.length} (mobs ${entities.mobCount})`,
+        `entities ${entities.entities.length}  mobs ${worldView.mobCount}  drops ${worldView.dropCount}`,
         `hp ${survival.health.toFixed(0)}  food ${survival.hunger.toFixed(1)}`,
         `draw calls ${renderer.info.render.calls}  tris ${renderer.info.render.triangles}`,
         `seed ${seed}  time ${(sky.timeOfDay * 24).toFixed(1)}h ${isNightTime(sky.timeOfDay) ? '(night)' : '(day)'}`,

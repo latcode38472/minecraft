@@ -17,21 +17,16 @@ import {
   FLAG_SNEAKING,
   MAX_BLOCK_ID,
   MAX_CHUNK_REQUEST,
-  MAX_MOBS_PER_MESSAGE,
-  MOB_KIND_PIG,
-  MOB_KIND_ZOMBIE,
-  MOB_SYNC_HZ,
   PROTOCOL_VERSION,
   STATE_SEND_HZ,
   WORLD_HEIGHT_LIMIT,
-  type MobStateData,
   type PlayerInfo,
   type PlayerVitals,
   type ServerMessage,
   type WorldInfo,
+  type WorldStateData,
 } from './protocol';
 import { RemotePlayerManager, separateFromRemotePlayers } from './remoteplayers';
-import { RemoteMobManager } from './remotemobs';
 
 const STATE_INTERVAL_MS = 1000 / STATE_SEND_HZ;
 /** Skip a state send when nothing meaningful moved. */
@@ -47,8 +42,10 @@ export interface SessionEvents {
   onNotice(message: string): void;
   /** Another player hit us: apply the damage locally. */
   onDamaged(amount: number, byName: string): void;
-  /** The host is told a guest hit one of its mobs. */
-  onMobAttacked(mobId: number, damage: number, byId: string): void;
+  /** An authoritative world snapshot: time, mobs and dropped items. */
+  onWorldState(state: WorldStateData): void;
+  /** A mob hit us; shove the local player away from it. */
+  onKnockback(fromX: number, fromZ: number): void;
   /**
    * Someone else fired an arrow; spawn a copy locally. `ageMs` is how long ago
    * the server saw it, so the receiver can fast-forward out the latency.
@@ -64,8 +61,6 @@ export interface SessionEvents {
 
 export class MultiplayerSession {
   readonly remotePlayers: RemotePlayerManager;
-  /** Host-simulated mobs, rendered on guests only. */
-  readonly remoteMobs: RemoteMobManager;
   /** Server-tracked health for every player, for name-plate health bars. */
   vitals = new Map<string, PlayerVitals>();
   readonly world: WorldInfo;
@@ -76,9 +71,7 @@ export class MultiplayerSession {
   ended = false;
 
   private lastStateSentAt = 0;
-  private lastMobSyncAt = 0;
   private lastVitalsSentAt = 0;
-  private pendingMobRemovals: number[] = [];
   private lastEquipmentSent = '';
   private readonly lastSent = { x: NaN, y: NaN, z: NaN, yaw: NaN, pitch: NaN, flags: -1 };
   /** Chunks we've already asked the server about, so we ask at most once each. */
@@ -98,7 +91,6 @@ export class MultiplayerSession {
     private readonly events: SessionEvents,
   ) {
     this.remotePlayers = new RemotePlayerManager(scene);
-    this.remoteMobs = new RemoteMobManager(scene);
     this.code = code;
     this.self = self;
     this.world = world;
@@ -151,8 +143,6 @@ export class MultiplayerSession {
   update(now: number, dt: number, yaw: number, pitch: number, playing: boolean): void {
     this.maybeSendState(now, yaw, pitch);
     this.remotePlayers.update(now, dt);
-    // Guests render the host's mobs; the host renders its own real ones.
-    if (!this.isHost) this.remoteMobs.update(now);
     // Only nudge the local player apart while they are actually in control;
     // shoving a paused or dead player around would be surprising.
     if (playing) {
@@ -171,7 +161,6 @@ export class MultiplayerSession {
     this.gameWorld.onChunkCreated = null;
     this.gameWorld.persistEdits = true;
     this.remotePlayers.clear();
-    this.remoteMobs.clear();
     clearTimeout(this.chunkRequestTimer);
     this.net.onMessage = null;
   }
@@ -219,29 +208,19 @@ export class MultiplayerSession {
     });
   }
 
-  /** Host only: publish a snapshot of every live mob at MOB_SYNC_HZ. */
-  syncMobs(now: number, mobs: { id: number; kind: 'zombie' | 'pig'; x: number; y: number; z: number; yaw: number; hp: number }[]): void {
-    if (!this.isHost || !this.net.isOpen) return;
-    if (this.pendingMobRemovals.length > 0) {
-      this.net.send({ t: 'mob_removed', ids: this.pendingMobRemovals.splice(0, MAX_MOBS_PER_MESSAGE) });
-    }
-    if (now - this.lastMobSyncAt < 1000 / MOB_SYNC_HZ) return;
-    this.lastMobSyncAt = now;
-    const payload: MobStateData[] = mobs.slice(0, MAX_MOBS_PER_MESSAGE).map((m) => ({
-      i: m.id,
-      k: m.kind === 'pig' ? MOB_KIND_PIG : MOB_KIND_ZOMBIE,
-      x: round(m.x, 2),
-      y: round(m.y, 2),
-      z: round(m.z, 2),
-      yaw: round(m.yaw, 2),
-      hp: Math.max(0, Math.round(m.hp)),
-    }));
-    this.net.send({ t: 'mob_state', mobs: payload });
+  /** Throw an item into the world so another player can pick it up (vanilla's Q). */
+  dropItem(itemId: string, count: number): void {
+    this.net.send({ t: 'drop_item', item: itemId, count });
   }
 
-  /** Host only: tell guests a mob is gone (died or despawned). */
-  noteMobRemoved(id: number): void {
-    if (this.isHost) this.pendingMobRemovals.push(id);
+  /** Put a mined block's drop into the world at the block's position. */
+  spawnDrop(itemId: string, count: number, x: number, y: number, z: number): void {
+    this.net.send({
+      t: 'drop_item',
+      item: itemId,
+      count,
+      p: [round(x, 2), round(y, 2), round(z, 2)],
+    });
   }
 
   /** Melee or arrow hit on another player; the server arbitrates. */
@@ -249,7 +228,7 @@ export class MultiplayerSession {
     this.net.send({ t: 'attack_player', target: targetId, damage });
   }
 
-  /** Guest hit one of the host's mobs; relayed to the host to apply. */
+  /** Hit a mob; the server owns mob health and arbitrates the swing. */
   attackMob(mobId: number, damage: number): void {
     this.net.send({ t: 'attack_mob', mob: mobId, damage });
   }
@@ -281,12 +260,6 @@ export class MultiplayerSession {
     if (key === this.lastEquipmentSent) return;
     this.lastEquipmentSent = key;
     this.net.send({ t: 'equipment', gear });
-  }
-
-  /** Host only: hand a dead mob's loot to the guest that killed it. */
-  grantLoot(toId: string, items: { id: string; count: number }[]): void {
-    if (!this.isHost || items.length === 0) return;
-    this.net.send({ t: 'loot_grant', to: toId, items });
   }
 
   sendRespawn(): void {
@@ -416,17 +389,14 @@ export class MultiplayerSession {
         this.remotePlayers.applyHealth(msg.id, 20);
         return;
       }
-      case 'mob_state': {
-        if (!this.isHost) this.remoteMobs.applySnapshot(msg.mobs, Date.now());
+      case 'world_state': {
+        // The server owns mobs, dropped items and the clock.
+        const { t: _t, ...state } = msg;
+        this.events.onWorldState(state);
         return;
       }
-      case 'mob_removed': {
-        if (!this.isHost) this.remoteMobs.remove(msg.ids);
-        return;
-      }
-      case 'attack_mob': {
-        // Host applies a guest's hit to the real mob it owns.
-        if (this.isHost) this.events.onMobAttacked(msg.mob, msg.damage, msg.by);
+      case 'knockback': {
+        this.events.onKnockback(msg.fromX, msg.fromZ);
         return;
       }
       case 'arrow_spawn': {

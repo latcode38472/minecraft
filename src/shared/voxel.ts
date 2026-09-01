@@ -1,35 +1,46 @@
-// Shared AABB-vs-voxel collision, used by the player and every mob.
+// Headless voxel physics, shared by the browser client and the Node server.
 //
-// The body is moved one axis at a time; after each axis move, any solid voxel
-// overlapping the box pushes the body back to that voxel's face and zeroes the
-// corresponding velocity component. Motion is split into substeps small enough
-// that no step exceeds MAX_MOVE_PER_SUBSTEP, which rules out tunnelling at any
-// frame rate.
+// Nothing here touches THREE or the DOM: positions are plain {x,y,z} objects,
+// which THREE.Vector3 structurally satisfies, so the client passes its vectors
+// straight in. The server runs the very same code, which is what lets mob
+// movement be authoritative without the two sides drifting apart.
 
-import type * as THREE from 'three';
-import { MAX_MOVE_PER_SUBSTEP } from './constants';
-import type { World } from './world/world';
+import { MAX_MOVE_PER_SUBSTEP } from '../constants.ts';
 
-const EPSILON = 0.001;
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
+}
 
 export interface BodyShape {
   halfWidth: number;
   height: number;
 }
 
-/** Moves `position` by `velocity * dt` with collision. Returns true if grounded. */
+/** The only thing physics needs from a world: what is solid where. */
+export interface BlockQuery {
+  getBlock(x: number, y: number, z: number): number;
+  isSolidAt(x: number, y: number, z: number): boolean;
+}
+
+const EPSILON = 0.001;
+
+/**
+ * Move `position` by `velocity * dt` with collision, one axis at a time.
+ * Motion is split into substeps small enough that no step exceeds
+ * MAX_MOVE_PER_SUBSTEP, which rules out tunnelling at any frame rate.
+ * Returns true when the body ended up standing on something.
+ */
 export function moveWithCollision(
-  world: World,
-  position: THREE.Vector3,
-  velocity: THREE.Vector3,
+  world: BlockQuery,
+  position: Vec3,
+  velocity: Vec3,
   shape: BodyShape,
   dt: number,
 ): boolean {
-  const maxDelta = Math.max(
-    Math.abs(velocity.x),
-    Math.abs(velocity.y),
-    Math.abs(velocity.z),
-  ) * dt;
+  const maxDelta =
+    Math.max(Math.abs(velocity.x), Math.abs(velocity.y), Math.abs(velocity.z)) * dt;
   const steps = Math.max(1, Math.ceil(maxDelta / MAX_MOVE_PER_SUBSTEP));
   const stepDt = dt / steps;
   let onGround = false;
@@ -46,9 +57,9 @@ export function moveWithCollision(
 
 /** Returns true if the move was blocked on this axis. */
 function moveAxis(
-  world: World,
-  pos: THREE.Vector3,
-  vel: THREE.Vector3,
+  world: BlockQuery,
+  pos: Vec3,
+  vel: Vec3,
   shape: BodyShape,
   axis: 0 | 1 | 2,
   delta: number,
@@ -88,7 +99,7 @@ function moveAxis(
 
 /** Does an axis-aligned body at `pos` overlap the voxel at (bx, by, bz)? */
 export function bodyOverlapsBlock(
-  pos: THREE.Vector3,
+  pos: Vec3,
   shape: BodyShape,
   bx: number,
   by: number,
@@ -102,4 +113,37 @@ export function bodyOverlapsBlock(
     bz + 1 > pos.z - shape.halfWidth &&
     bz < pos.z + shape.halfWidth
   );
+}
+
+/**
+ * Slab-method ray/AABB test. Returns the entry distance, or null on a miss.
+ * Used for melee targeting, arrows, and server-side hit validation.
+ */
+export function rayBoxDistance(
+  origin: Vec3,
+  dir: Vec3,
+  boxMin: Vec3,
+  boxMax: Vec3,
+  maxDist: number,
+): number | null {
+  const o = [origin.x, origin.y, origin.z];
+  const d = [dir.x, dir.y, dir.z];
+  const min = [boxMin.x, boxMin.y, boxMin.z];
+  const max = [boxMax.x, boxMax.y, boxMax.z];
+  let tMin = 0;
+  let tMax = maxDist;
+  for (let axis = 0; axis < 3; axis++) {
+    if (Math.abs(d[axis]) < 1e-8) {
+      if (o[axis] < min[axis] || o[axis] > max[axis]) return null;
+      continue;
+    }
+    const inv = 1 / d[axis];
+    let t1 = (min[axis] - o[axis]) * inv;
+    let t2 = (max[axis] - o[axis]) * inv;
+    if (t1 > t2) [t1, t2] = [t2, t1];
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+    if (tMin > tMax) return null;
+  }
+  return tMin;
 }

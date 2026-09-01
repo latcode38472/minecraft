@@ -7,6 +7,8 @@ import { getItem } from '../items/items';
 import { drawTileTo } from '../textures';
 
 const ICON_PX = 32;
+/** How long a hotbar slot must be held before it throws its stack. */
+const SLOT_HOLD_MS = 500;
 
 export class Hud {
   private readonly slots: HTMLElement[] = [];
@@ -28,6 +30,8 @@ export class Hud {
   constructor(
     private readonly inventory: Inventory,
     onSlotPicked: (index: number) => void,
+    /** Long-press a slot to throw its stack — the touch equivalent of Ctrl+Q. */
+    onSlotHeld?: (index: number) => void,
   ) {
     const hotbar = document.getElementById('hotbar')!;
     for (let i = 0; i < HOTBAR_SIZE; i++) {
@@ -49,10 +53,29 @@ export class Hud {
       durability.className = 'durability';
 
       slot.append(icon, key, count, durability);
+
+      // Tap selects; holding throws the stack, so a phone can hand items over
+      // without a keyboard. The timer is cancelled by any lift or drag.
+      let holdTimer = 0;
+      const cancelHold = (): void => {
+        if (holdTimer) {
+          clearTimeout(holdTimer);
+          holdTimer = 0;
+        }
+      };
       slot.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         onSlotPicked(i);
+        if (!onSlotHeld) return;
+        cancelHold();
+        holdTimer = window.setTimeout(() => {
+          holdTimer = 0;
+          onSlotHeld(i);
+        }, SLOT_HOLD_MS);
       });
+      for (const event of ['pointerup', 'pointerleave', 'pointercancel']) {
+        slot.addEventListener(event, cancelHold);
+      }
       hotbar.append(slot);
 
       this.slots.push(slot);
