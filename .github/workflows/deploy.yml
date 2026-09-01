@@ -60,13 +60,18 @@ jobs:
         env:
           VITE_MULTIPLAYER_URL: ${{ vars.MULTIPLAYER_URL }}
         run: npm run build
-      # enablement turns Pages on for the repo if it is off, so a fresh clone
-      # deploys without anyone first visiting Settings -> Pages. It needs the
-      # repo to be eligible for Pages at all: public, or private on a paid
-      # plan. On a private free repo this step fails with "Not Found".
+      # Pages must be switched on by hand once, at
+      # Settings -> Pages -> Source: GitHub Actions.
+      #
+      # This step cannot do it for you: `enablement: true` asks the API to
+      # create the Pages site and the default GITHUB_TOKEN is refused with
+      # "Resource not accessible by integration", whatever permissions the
+      # workflow requests. Creating a Pages site counts as administering the
+      # repository, which a workflow token is not allowed to do.
+      #
+      # If this step fails with a bare "Not Found", Pages is not enabled — or
+      # the repo is private on a free plan, where Pages is unavailable at all.
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
