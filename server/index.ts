@@ -609,6 +609,45 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     );
     return;
   }
+  // Opening the server's own address in a browser is a natural thing to try,
+  // and a bare 404 makes a perfectly healthy server look broken. Say what this
+  // is, where the game is, and whether the server is currently up.
+  if (req.url === '/' || req.url === '') {
+    const players = [...rooms.values()].reduce((n, r) => n + r.clients.size, 0);
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voxelcraft server</title>
+<style>
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+         background:#1c2126; color:#e8e8e8;
+         font:16px/1.6 ui-monospace,"Courier New",monospace; padding:24px; }
+  main { max-width:34rem }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; letter-spacing:2px }
+  .ok { color:#7ddc7d }
+  .muted { color:#98a2ac }
+  a { color:#8ec7ff }
+  code { background:#272e35; padding:2px 6px; border-radius:4px }
+</style>
+<main>
+  <h1>VOXELCRAFT</h1>
+  <p class="ok">&#9679; Multiplayer server is running.</p>
+  <p class="muted">
+    ${rooms.size} room${rooms.size === 1 ? '' : 's'},
+    ${players} player${players === 1 ? '' : 's'} online.
+  </p>
+  <p>
+    This address is the <em>server</em> — there is no game to play here. It is
+    the value you give the game client as its server, over
+    <code>wss://</code>.
+  </p>
+  <p class="muted">
+    Machine-readable status: <a href="/health">/health</a>
+  </p>
+</main>`);
+    return;
+  }
   res.writeHead(404).end('Voxelcraft multiplayer server');
 });
 
