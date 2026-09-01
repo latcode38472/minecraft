@@ -1,0 +1,328 @@
+// Glue between the network client and the running game.
+//
+// Owns: the roster, remote player visuals, outbound state throttling, and
+// applying inbound block edits to the world. Created only in multiplayer, so
+// singleplayer never touches any of this.
+
+import type * as THREE from 'three';
+import { BLOCKS } from '../blocks';
+import { WORLD_HEIGHT } from '../constants';
+import type { Player } from '../player/player';
+import type { World } from '../world/world';
+import { NetClient, type ConnectionStatus } from './client';
+import {
+  FLAG_GROUNDED,
+  FLAG_JUMPING,
+  FLAG_MOVING,
+  FLAG_SNEAKING,
+  MAX_BLOCK_ID,
+  MAX_CHUNK_REQUEST,
+  PROTOCOL_VERSION,
+  STATE_SEND_HZ,
+  WORLD_HEIGHT_LIMIT,
+  type PlayerInfo,
+  type ServerMessage,
+  type WorldInfo,
+} from './protocol';
+import { RemotePlayerManager, separateFromRemotePlayers } from './remoteplayers';
+
+const STATE_INTERVAL_MS = 1000 / STATE_SEND_HZ;
+/** Skip a state send when nothing meaningful moved. */
+const POSITION_EPSILON = 0.01;
+const ANGLE_EPSILON = 0.01;
+/** Chunk-edit requests are batched over this window to avoid a burst per chunk. */
+const CHUNK_REQUEST_FLUSH_MS = 120;
+
+export interface SessionEvents {
+  onRosterChange(players: PlayerInfo[]): void;
+  onRoomClosed(message: string): void;
+  onStatusChange(status: ConnectionStatus): void;
+  onNotice(message: string): void;
+}
+
+export class MultiplayerSession {
+  readonly remotePlayers: RemotePlayerManager;
+  readonly world: WorldInfo;
+  readonly code: string;
+  self: PlayerInfo;
+  players: PlayerInfo[] = [];
+  /** Set once the host leaves or the server shuts the room down. */
+  ended = false;
+
+  private lastStateSentAt = 0;
+  private readonly lastSent = { x: NaN, y: NaN, z: NaN, yaw: NaN, pitch: NaN, flags: -1 };
+  /** Chunks we've already asked the server about, so we ask at most once each. */
+  private readonly requestedChunks = new Set<string>();
+  private pendingChunkRequests: string[] = [];
+  private chunkRequestTimer = 0;
+
+  constructor(
+    private readonly net: NetClient,
+    private readonly gameWorld: World,
+    private readonly player: Player,
+    scene: THREE.Scene,
+    code: string,
+    self: PlayerInfo,
+    world: WorldInfo,
+    players: PlayerInfo[],
+    private readonly events: SessionEvents,
+  ) {
+    this.remotePlayers = new RemotePlayerManager(scene);
+    this.code = code;
+    this.self = self;
+    this.world = world;
+    this.players = players;
+
+    assertProtocolMatchesGame();
+
+    this.remotePlayers.sync(players, self.id);
+    this.events.onRosterChange(players);
+
+    // Local edits go out; remote edits come back in through onMessage.
+    this.gameWorld.persistEdits = false; // server is authoritative for this world
+    this.gameWorld.onLocalEdit = (x, y, z, id) => this.sendEdit(x, y, z, id);
+    this.gameWorld.onChunkCreated = (key) => this.requestChunkEdits(key);
+
+    this.net.onMessage = (msg) => this.handle(msg);
+    this.net.onStatusChange = (status) => {
+      // A socket that comes back after a drop is still outside the room: the
+      // server has no memory of us, so re-issue the join before reporting up.
+      if (status === 'connected' && !this.ended) this.rejoin();
+      this.events.onStatusChange(status);
+    };
+
+    // Chunks streamed in before the session existed still need their edits.
+    for (const key of this.gameWorld.chunks.keys()) this.requestChunkEdits(key);
+  }
+
+  get ping(): number | null {
+    return this.net.ping;
+  }
+
+  get status(): ConnectionStatus {
+    return this.net.status;
+  }
+
+  get playerCount(): number {
+    return this.players.length;
+  }
+
+  get isHost(): boolean {
+    return this.self.isHost;
+  }
+
+  /**
+   * Per-frame: throttle our state upward, interpolate everyone else.
+   * Yaw/pitch come from the camera, which is the same for keyboard and touch —
+   * that is what makes the two control schemes produce identical network state.
+   */
+  update(now: number, dt: number, yaw: number, pitch: number, playing: boolean): void {
+    this.maybeSendState(now, yaw, pitch);
+    this.remotePlayers.update(now, dt);
+    // Only nudge the local player apart while they are actually in control;
+    // shoving a paused or dead player around would be surprising.
+    if (playing) {
+      separateFromRemotePlayers(this.player.position, this.remotePlayers.all, dt);
+    }
+  }
+
+  leave(): void {
+    this.detach();
+    this.net.close();
+  }
+
+  /** Unhook from the game world so a later singleplayer session is unaffected. */
+  private detach(): void {
+    this.gameWorld.onLocalEdit = null;
+    this.gameWorld.onChunkCreated = null;
+    this.gameWorld.persistEdits = true;
+    this.remotePlayers.clear();
+    clearTimeout(this.chunkRequestTimer);
+    this.net.onMessage = null;
+  }
+
+  private maybeSendState(now: number, yaw: number, pitch: number): void {
+    if (now - this.lastStateSentAt < STATE_INTERVAL_MS) return;
+    if (!this.net.isOpen) return;
+
+    const p = this.player.position;
+    let flags = 0;
+    if (Math.hypot(this.player.velocity.x, this.player.velocity.z) > 0.5) flags |= FLAG_MOVING;
+    if (!this.player.onGround) flags |= FLAG_JUMPING;
+    if (this.player.onGround) flags |= FLAG_GROUNDED;
+    if (this.player.sneaking) flags |= FLAG_SNEAKING;
+
+    // Idle players cost nothing: skip the packet when nothing changed.
+    const moved =
+      Math.abs(p.x - this.lastSent.x) > POSITION_EPSILON ||
+      Math.abs(p.y - this.lastSent.y) > POSITION_EPSILON ||
+      Math.abs(p.z - this.lastSent.z) > POSITION_EPSILON ||
+      Math.abs(yaw - this.lastSent.yaw) > ANGLE_EPSILON ||
+      Math.abs(pitch - this.lastSent.pitch) > ANGLE_EPSILON ||
+      flags !== this.lastSent.flags;
+    if (!moved) return;
+
+    this.lastStateSentAt = now;
+    this.lastSent.x = p.x;
+    this.lastSent.y = p.y;
+    this.lastSent.z = p.z;
+    this.lastSent.yaw = yaw;
+    this.lastSent.pitch = pitch;
+    this.lastSent.flags = flags;
+
+    // Round to centimetres/milliradians: same visual result, smaller packets.
+    this.net.send({
+      t: 'player_state',
+      s: {
+        x: round(p.x, 2),
+        y: round(p.y, 2),
+        z: round(p.z, 2),
+        yaw: round(yaw, 3),
+        pitch: round(pitch, 3),
+        flags,
+      },
+    });
+  }
+
+  private sendEdit(x: number, y: number, z: number, id: number): void {
+    if (!this.net.isOpen) return;
+    if (id === 0) this.net.send({ t: 'block_break', x, y, z });
+    else this.net.send({ t: 'block_place', x, y, z, id });
+  }
+
+  /** Ask once per chunk; requests are coalesced into batched messages. */
+  private requestChunkEdits(key: string): void {
+    if (this.requestedChunks.has(key)) return;
+    this.requestedChunks.add(key);
+    this.pendingChunkRequests.push(key);
+    this.scheduleChunkRequestFlush();
+  }
+
+  private scheduleChunkRequestFlush(): void {
+    if (this.chunkRequestTimer) return;
+    this.chunkRequestTimer = window.setTimeout(() => {
+      this.chunkRequestTimer = 0;
+      const keys = this.pendingChunkRequests.splice(0, MAX_CHUNK_REQUEST);
+      // Anything above the per-message cap stays queued for the next flush.
+      if (this.pendingChunkRequests.length > 0) this.scheduleChunkRequestFlush();
+      if (keys.length > 0 && this.net.isOpen) {
+        this.net.send({ t: 'chunk_edits_request', keys });
+      }
+    }, CHUNK_REQUEST_FLUSH_MS);
+  }
+
+  /** Re-enter the room after the socket dropped and came back. */
+  private rejoin(): void {
+    // The session only exists after a successful join, and NetClient does not
+    // re-fire an unchanged status, so any 'connected' seen here is a reconnect.
+    if (this.ended || !this.net.isOpen) return;
+    this.net.send({
+      t: 'join_room',
+      code: this.code,
+      name: this.self.name,
+      version: PROTOCOL_VERSION,
+    });
+  }
+
+  private handle(msg: ServerMessage): void {
+    switch (msg.t) {
+      case 'join_success': {
+        // Reconnected: we get a fresh player id, and may have missed edits
+        // while offline, so forget what we've requested and ask again.
+        this.self = msg.self;
+        this.players = msg.players;
+        this.remotePlayers.sync(msg.players, this.self.id);
+        this.events.onRosterChange(msg.players);
+        this.requestedChunks.clear();
+        this.pendingChunkRequests.length = 0;
+        for (const key of this.gameWorld.chunks.keys()) this.requestChunkEdits(key);
+        this.events.onNotice('Reconnected.');
+        return;
+      }
+      case 'join_error': {
+        // The room filled up or ended while we were away.
+        this.ended = true;
+        this.detach();
+        this.net.close();
+        this.events.onRoomClosed(msg.message);
+        return;
+      }
+      case 'player_joined': {
+        this.players = msg.players;
+        this.remotePlayers.sync(msg.players, this.self.id);
+        this.events.onRosterChange(msg.players);
+        this.events.onNotice(`${msg.player.name} joined the world.`);
+        return;
+      }
+      case 'player_left': {
+        const who = this.players.find((p) => p.id === msg.id);
+        this.players = msg.players;
+        this.remotePlayers.sync(msg.players, this.self.id);
+        this.events.onRosterChange(msg.players);
+        if (who) this.events.onNotice(`${who.name} left the world.`);
+        return;
+      }
+      case 'player_state': {
+        // Ignore state for anyone not on the roster (stale or spoofed id).
+        this.remotePlayers.applyState(msg.id, msg.s, Date.now());
+        return;
+      }
+      case 'block_update': {
+        if (!isSaneEdit(msg.x, msg.y, msg.z, msg.id)) return;
+        this.gameWorld.applyRemoteEdit(msg.x, msg.y, msg.z, msg.id);
+        return;
+      }
+      case 'chunk_edits': {
+        for (const entry of msg.entries) {
+          if (!Array.isArray(entry.data)) continue;
+          this.gameWorld.applyChunkEdits(entry.key, entry.data);
+        }
+        return;
+      }
+      case 'room_closed': {
+        // Close the socket too, or the reconnect loop would resurrect it and
+        // overwrite this notice with a misleading "Connected".
+        this.ended = true;
+        this.detach();
+        this.net.close();
+        this.events.onRoomClosed(msg.message);
+        return;
+      }
+      case 'error': {
+        this.events.onNotice(msg.message);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+}
+
+function round(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+
+/** Defence in depth: the server validates too, but never trust the wire. */
+function isSaneEdit(x: number, y: number, z: number, id: number): boolean {
+  if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) return false;
+  if (y < 0 || y >= WORLD_HEIGHT) return false;
+  return Number.isInteger(id) && id >= 0 && id < BLOCKS.length;
+}
+
+/**
+ * The protocol hardcodes world limits so the server never imports game code.
+ * Warn loudly if the game outgrows them, since edits would then be rejected.
+ */
+function assertProtocolMatchesGame(): void {
+  if (WORLD_HEIGHT !== WORLD_HEIGHT_LIMIT) {
+    console.warn(
+      `[net] WORLD_HEIGHT (${WORLD_HEIGHT}) != protocol WORLD_HEIGHT_LIMIT (${WORLD_HEIGHT_LIMIT}); update protocol.ts`,
+    );
+  }
+  if (BLOCKS.length - 1 !== MAX_BLOCK_ID) {
+    console.warn(
+      `[net] block count (${BLOCKS.length - 1}) != protocol MAX_BLOCK_ID (${MAX_BLOCK_ID}); update protocol.ts`,
+    );
+  }
+}

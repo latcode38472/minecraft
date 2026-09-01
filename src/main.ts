@@ -41,6 +41,10 @@ import { Input } from './input';
 import { MouseLook } from './player/camera';
 import { Player, type MoveInput } from './player/player';
 import { Survival } from './player/survival';
+import type { MultiplayerSession } from './net/session';
+import { MultiplayerSession as Session } from './net/session';
+import type { StartChoice } from './ui/multiplayerui';
+import { MultiplayerHud, showModeMenu } from './ui/multiplayerui';
 import { SaveStore, type SaveMeta } from './save';
 import { Sky } from './sky';
 import { Hud } from './ui/hud';
@@ -51,14 +55,17 @@ import { World } from './world/world';
 
 const STEP_INTERVAL_BLOCKS = 2.2;
 
-async function boot(): Promise<void> {
+async function boot(choice: StartChoice): Promise<void> {
   const params = new URLSearchParams(location.search);
+  const multiplayer = choice.mode === 'multiplayer' ? choice : null;
   const store = await SaveStore.open();
   if (params.has('reset')) await store.clearAll();
 
-  let meta = await store.loadMeta();
-  const paramSeed = params.get('seed');
-  let seed = meta?.seed ?? (Math.random() * 0xffffffff) >>> 0;
+  // Multiplayer worlds come from the server and are never mixed with the local
+  // singleplayer save, so joining a room can't overwrite a solo world.
+  let meta = multiplayer ? undefined : await store.loadMeta();
+  const paramSeed = multiplayer ? null : params.get('seed');
+  let seed = multiplayer ? multiplayer.world.seed : (meta?.seed ?? (Math.random() * 0xffffffff) >>> 0);
   if (paramSeed !== null) {
     const requested = Number(paramSeed) >>> 0;
     if (requested !== meta?.seed) {
@@ -153,8 +160,14 @@ async function boot(): Promise<void> {
     if (s) spawnPoint.set(s.x, s.y, s.z);
     else spawnPoint.copy(player.position);
   } else {
+    // findSpawnColumn is deterministic from the seed, so every client in a room
+    // resolves the same spawn. Each player gets a small offset so nobody starts
+    // inside another player's collision box.
     const spawn = world.terrain.findSpawnColumn();
-    player.position.set(spawn.x + 0.5, spawn.y + 2, spawn.z + 0.5);
+    const slot = multiplayer ? multiplayer.self.colorIndex : 0;
+    const offsets: [number, number][] = [[0, 0], [2, 0], [0, 2]];
+    const [ox, oz] = offsets[slot % offsets.length];
+    player.position.set(spawn.x + ox + 0.5, spawn.y + 2, spawn.z + oz + 0.5);
     spawnPoint.copy(player.position);
   }
   hud.refresh();
@@ -369,6 +382,9 @@ async function boot(): Promise<void> {
 
   // --- Persistence ---
   function flushSave(): void {
+    // Multiplayer worlds live on the server; writing them here would clobber
+    // the player's singleplayer save.
+    if (multiplayer) return;
     // Saving mid-death would reload the player, still dead, where they fell.
     // Persist the post-respawn state instead so the world reopens playable.
     const dead = survival.dead;
@@ -401,6 +417,53 @@ async function boot(): Promise<void> {
     if (document.visibilityState === 'hidden') flushSave();
   });
 
+  // --- Multiplayer ---
+  let session: MultiplayerSession | null = null;
+
+  function leaveMultiplayer(): void {
+    session?.leave();
+    session = null;
+    // Reloading is the cleanest way back to the start menu: it disposes the
+    // whole scene and rebuilds from scratch with no leftover room state.
+    location.reload();
+  }
+
+  const mpHud = new MultiplayerHud(leaveMultiplayer);
+
+  if (multiplayer) {
+    session = new Session(
+      multiplayer.net,
+      world,
+      player,
+      scene,
+      multiplayer.code,
+      multiplayer.self,
+      multiplayer.world,
+      multiplayer.players,
+      {
+        onRosterChange: (players) => mpHud.setRoster(players),
+        onRoomClosed: (message) => {
+          mpHud.notice(message);
+          hud.toast(message);
+          // Give the player a moment to read it, then drop back to the menu.
+          setTimeout(() => location.reload(), 3500);
+        },
+        onStatusChange: (status) => {
+          // Stay quiet once the room has ended, so a closing notice is not
+          // overwritten by connection chatter.
+          if (session?.ended) return;
+          if (status === 'reconnecting') mpHud.notice('Connection lost — reconnecting…');
+        },
+        onNotice: (message) => mpHud.notice(message),
+      },
+    );
+    mpHud.show(multiplayer.code);
+    mpHud.setRoster(multiplayer.players);
+    // Mobs are single-player only for now: they are not synchronised, so each
+    // client would simulate its own and they would disagree.
+    entities.clear();
+  }
+
   // --- Debug hook for automated smoke tests ---
   (window as unknown as Record<string, unknown>).__voxel = {
     world,
@@ -415,6 +478,7 @@ async function boot(): Promise<void> {
     interaction,
     inventoryUi,
     respawn,
+    getSession: () => session,
     getViewDistance: () => viewDistance,
     // Thin wrappers over the real rules, so automated tests exercise the same
     // code paths the game does rather than reimplementing them.
@@ -472,10 +536,18 @@ async function boot(): Promise<void> {
     if (playing) autoQuality?.update(dt);
 
     // Entities keep simulating while paused would be surprising; freeze them.
-    if (playing) {
+    // Mobs are disabled in multiplayer until they are server-authoritative.
+    if (playing && !multiplayer) {
       entityContext.dt = dt;
       entityContext.isNight = isNightTime(sky.timeOfDay);
       entities.update(entityContext, sky.timeOfDay);
+    }
+
+    if (session) {
+      // Camera yaw/pitch is the shared abstraction: keyboard+mouse and touch
+      // both feed it, so both platforms emit identical network state.
+      session.update(nowMs, dt, look.yaw, look.pitch, playing);
+      mpHud.setPing(session.ping, session.status === 'connected' ? 'Ping: —' : session.status);
     }
 
     if (player.stepAccumulator > STEP_INTERVAL_BLOCKS) {
@@ -525,4 +597,9 @@ async function boot(): Promise<void> {
   });
 }
 
-void boot();
+async function main(): Promise<void> {
+  const choice = await showModeMenu();
+  await boot(choice);
+}
+
+void main();

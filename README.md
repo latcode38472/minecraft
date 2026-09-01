@@ -5,12 +5,37 @@ Vite, no image or audio assets — textures and sounds are generated at runtime.
 
 ## Run it
 
+**Singleplayer only** — one command:
+
 ```sh
 npm install
-npm run dev      # then open the printed URL (default http://localhost:5173)
+npm run dev          # game client, http://localhost:5173
 ```
 
-Production build: `npm run build`, serve with `npm run preview`.
+**With multiplayer** — the game client and the multiplayer server are two
+processes. Either run both at once:
+
+```sh
+npm run dev:all      # starts both, and prints the address to open on a phone
+```
+
+…or run them in separate terminals:
+
+```sh
+npm run server       # multiplayer WebSocket server, port 8787
+npm run dev          # game client, port 5173
+```
+
+| Command | What it starts |
+| --- | --- |
+| `npm run dev` | the game client (Vite), bound to all interfaces |
+| `npm run server` | the multiplayer server (Node, port 8787) |
+| `npm run dev:all` | both, with the LAN URL printed for phones |
+| `npm run build` | typecheck + production build |
+| `npm run preview` | serve the production build |
+
+Production build: `npm run build`, serve with `npm run preview`. The server has
+no build step — Node runs the TypeScript directly.
 
 ## Controls
 
@@ -61,8 +86,50 @@ use smaller per-frame chunk generation/meshing budgets so world streaming
 never causes visible hitches. A device without WebGL 2 gets a clear message
 instead of a black screen.
 
-URL parameters: `?seed=12345` starts a specific world (a new seed wipes saved
-edits), `?reset` wipes the save entirely, `?touch=1` forces touch controls.
+URL parameters: `?seed=12345` starts a specific singleplayer world (a new seed
+wipes saved edits), `?reset` wipes the save entirely, `?touch=1` forces touch
+controls, `?server=host:port` points multiplayer at a specific server.
+
+## Multiplayer
+
+Up to **3 players** per room — one host and two guests — with full PC/mobile
+cross-play. Pick **Multiplayer** on the start screen, enter a name, then either
+**Create Multiplayer World** (you get a 6-character code like `F7K2Q9` to share)
+or type a friend's code and **Join**.
+
+### Playing from your phone
+
+1. Start both processes on your computer: `npm run dev:all`
+2. It prints a LAN address, e.g. `http://192.168.1.20:5173`
+3. Open that address in your phone's browser, on the same Wi-Fi
+
+The phone finds the multiplayer server automatically: the client defaults to
+`ws://<the host you loaded the page from>:8787`, so nothing is hardcoded to
+localhost. To point at a different server without rebuilding, append
+`?server=192.168.1.20:8787`.
+
+### Deploying for internet play
+
+Set `VITE_MULTIPLAYER_URL` at build time and host the server anywhere with a
+public address:
+
+```sh
+VITE_MULTIPLAYER_URL=wss://voxel.example.com npm run build
+PORT=8787 node server/index.ts       # behind a TLS-terminating proxy
+```
+
+Serve the page over HTTPS and the socket over `wss://` — browsers block
+plaintext `ws://` from an HTTPS page. `GET /health` on the server returns room
+and player counts for monitoring.
+
+### What is synchronised
+
+| Synchronised | Not synchronised |
+| --- | --- |
+| Player position, yaw, pitch, movement/jump/sneak flags | Mobs (disabled in multiplayer) |
+| Joins, leaves, display names, room roster | Inventory and hotbar contents |
+| Block breaks and placements (server-authoritative) | Health, hunger, damage |
+| World seed and spawn | Time of day |
 
 ## What's in the game
 
@@ -119,6 +186,14 @@ src/
     manager.ts       lifecycle, spawning/despawning, ray-vs-mob queries
   game/
     interaction.ts   mining progress, placing, attacking, eating, stations
+  net/
+    protocol.ts      wire types, limits and validators (shared with the server)
+    config.ts        WebSocket URL resolution (query > env > same-host)
+    client.ts        socket lifecycle, reconnect backoff, ping/RTT
+    session.ts       roster, state throttling, applying remote edits
+    remoteplayers.ts remote bodies, name labels, snapshot interpolation
+server/
+  index.ts           authoritative room server (rooms, cap, edits, relay)
   world/
     chunk.ts         flat Uint8Array voxel storage per 16x72x16 column
     noise.ts         seeded value noise + fBm
@@ -133,6 +208,7 @@ src/
     hud.ts           hotbar bound to the inventory, FPS, debug, toasts
     statusui.ts      hearts, hunger, mining progress, death screen
     inventoryui.ts   inventory grid and recipe list
+    multiplayerui.ts start menu, create/join, lobby, in-game MP HUD
     touch.ts         virtual joystick, look/tap/hold gestures, buttons
   main.ts            bootstrapping and the frame loop
 ```
@@ -190,6 +266,34 @@ and all instances of a type share one buffer. AI is a per-frame `update` on a
 and flee. Attacks use a slab-method ray/AABB test against mob boxes, and a mob
 in front of the targeted block takes the hit instead of the block.
 
+**Multiplayer.** A Node WebSocket server is authoritative: it owns room
+membership, the world seed, and the canonical set of block edits. Clients never
+talk to each other, so there is no port forwarding, no NAT traversal, and no
+browser tab acting as a server — a phone on cellular and a PC on Wi-Fi both just
+dial the same host. The 3-player cap is enforced server-side on every join, so a
+crafted packet cannot squeeze a fourth player in.
+
+*World state* rides on the existing `World.edits` map, which was already
+`Map<chunkKey, Map<voxelIndex, blockId>>` — exactly the shape the network needs.
+The server keeps the same structure, so terrain is never transmitted: clients
+generate it from the shared seed and receive only the diffs. A joining client
+gets the room's existing edits in batched `chunk_edits` messages, and requests
+edits per chunk as it streams new terrain in, so chunk unloading and the
+effectively unbounded world both survive multiplayer untouched. Remote edits are
+applied through `World.applyRemoteEdit`, which records the diff even for chunks
+that are not loaded — `createChunk` replays it if the player ever walks there.
+
+*Players* send state at 15 Hz, and only when something actually changed. Remote
+players are rendered ~120 ms in the past and interpolated between the two
+snapshots straddling that moment, so movement stays smooth at 60+ FPS and never
+teleports between packets. Your own movement is applied locally the instant you
+press a key or touch the joystick — nothing waits for a round trip.
+
+*Cross-play* falls out of the input design: both control schemes already funnel
+into the same camera yaw/pitch and the same `MoveInput`, so the network layer
+reads that shared state and never touches a keyboard, mouse or touch API. The
+protocol is identical on both platforms.
+
 ## Current limitations
 
 - Water is static (no flow simulation); placing/removing blocks doesn't make
@@ -211,6 +315,19 @@ in front of the targeted block takes the hit instead of the block.
   and there is no drop-item-from-inventory action.
 - Dying keeps your inventory (deliberate for now); no armour, no bow, no
   shovels — `ToolKind` already includes `'shovel'` as the extension point.
+- **Multiplayer:** mobs are disabled in rooms, because each client would
+  simulate its own and they would disagree. Hook: make `EntityManager`
+  host-authoritative and relay mob state.
+- **Multiplayer:** inventory, health and hunger are per-client, so you cannot
+  hand someone an item or see their health.
+- **Multiplayer:** worlds are not saved. A room's edits live in server memory
+  and are gone when the host leaves. Hook: persist `Room.edits` in
+  `server/index.ts`.
+- **Multiplayer:** no host migration — the room closes when the host leaves,
+  and remaining players are told so.
+- **Multiplayer:** block edits are applied locally first and relayed; the
+  server validates coordinates, ids and rates, but does not re-check reach or
+  tool rules, so a modified client could place blocks it should not own.
 
 ## Next 5 features (priority order)
 
@@ -225,5 +342,6 @@ in front of the targeted block takes the hit instead of the block.
 4. **Biomes and structures** — swap the single terrain function for a biome
    table (desert, forest, snow) and scatter simple structures; the chunk
    pipeline already supports it via `TerrainGenerator.generate`.
-5. **Greedy meshing** — merge coplanar same-texture quads; cuts triangle count
-   several-fold and unlocks much larger view distances.
+5. **Server-authoritative mobs and multiplayer persistence** — move mob
+   simulation and room world-saving onto the server so rooms have shared
+   creatures and survive a host leaving.

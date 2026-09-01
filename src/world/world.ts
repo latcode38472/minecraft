@@ -31,6 +31,15 @@ export class World {
   private readonly dirtyQueue = new Set<Chunk>();
   private frame = 0;
 
+  /**
+   * Multiplayer hooks. Both are null in singleplayer, so that path is
+   * byte-for-byte the behaviour it had before multiplayer existed.
+   */
+  onLocalEdit: ((wx: number, wy: number, wz: number, id: number) => void) | null = null;
+  onChunkCreated: ((key: string) => void) | null = null;
+  /** Multiplayer worlds are server-authoritative and are not written to IndexedDB. */
+  persistEdits = true;
+
   constructor(seed: number, scene: THREE.Scene, savedEdits?: Map<string, ChunkEdits>) {
     this.terrain = new TerrainGenerator(seed);
     this.scene = scene;
@@ -78,22 +87,86 @@ export class World {
     const lz = wz - cz * CHUNK_SIZE;
     chunk.set(lx, wy, lz, id);
 
-    const key = Chunk.key(cx, cz);
+    this.recordEdit(Chunk.key(cx, cz), Chunk.index(lx, wy, lz), id);
+    this.markDirty(chunk);
+    this.markNeighborsDirty(cx, cz, lx, lz);
+    this.onLocalEdit?.(wx, wy, wz, id);
+    return true;
+  }
+
+  /** Store an edit in the sparse diff map (and queue it for saving if enabled). */
+  private recordEdit(key: string, index: number, id: number): void {
     let edits = this.edits.get(key);
     if (!edits) {
       edits = new Map();
       this.edits.set(key, edits);
     }
-    edits.set(Chunk.index(lx, wy, lz), id);
-    this.unsavedEditKeys.add(key);
+    edits.set(index, id);
+    if (this.persistEdits) this.unsavedEditKeys.add(key);
+  }
 
-    this.markDirty(chunk);
-    // A border edit changes face culling/AO in the adjacent chunk too.
+  /** A border edit changes face culling/AO in the adjacent chunk too. */
+  private markNeighborsDirty(cx: number, cz: number, lx: number, lz: number): void {
     if (lx === 0) this.markDirtyAt(cx - 1, cz);
     if (lx === CHUNK_SIZE - 1) this.markDirtyAt(cx + 1, cz);
     if (lz === 0) this.markDirtyAt(cx, cz - 1);
     if (lz === CHUNK_SIZE - 1) this.markDirtyAt(cx, cz + 1);
-    return true;
+  }
+
+  /**
+   * Apply an edit that came from another player. Unlike setBlock this succeeds
+   * even when the chunk is not loaded: the edit lands in the diff map, and
+   * createChunk replays it if and when the player walks over there.
+   * Never re-broadcasts (no onLocalEdit), so edits cannot echo around the room.
+   */
+  applyRemoteEdit(wx: number, wy: number, wz: number, id: number): void {
+    if (wy < 0 || wy >= WORLD_HEIGHT) return;
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const lx = wx - cx * CHUNK_SIZE;
+    const lz = wz - cz * CHUNK_SIZE;
+    this.recordEdit(Chunk.key(cx, cz), Chunk.index(lx, wy, lz), id);
+
+    const chunk = this.chunks.get(Chunk.key(cx, cz));
+    if (!chunk) return; // will be replayed on load
+    chunk.set(lx, wy, lz, id);
+    this.markDirty(chunk);
+    this.markNeighborsDirty(cx, cz, lx, lz);
+  }
+
+  /**
+   * Bulk-apply one chunk's edits from the server, as flat [index, id] pairs.
+   * Used for the backlog a late joiner receives.
+   */
+  applyChunkEdits(key: string, pairs: number[]): void {
+    const [cxRaw, czRaw] = key.split(',');
+    const cx = Number(cxRaw);
+    const cz = Number(czRaw);
+    if (!Number.isInteger(cx) || !Number.isInteger(cz)) return;
+
+    let edits = this.edits.get(key);
+    if (!edits) {
+      edits = new Map();
+      this.edits.set(key, edits);
+    }
+    const chunk = this.chunks.get(key);
+    const voxels = CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT;
+    for (let i = 0; i + 1 < pairs.length; i += 2) {
+      const index = pairs[i];
+      const id = pairs[i + 1];
+      if (!Number.isInteger(index) || index < 0 || index >= voxels) continue;
+      edits.set(index, id);
+      if (chunk) chunk.data[index] = id;
+    }
+    if (this.persistEdits) this.unsavedEditKeys.add(key);
+    if (chunk) {
+      this.markDirty(chunk);
+      // A bulk apply can touch any border, so refresh all four neighbours once.
+      this.markDirtyAt(cx - 1, cz);
+      this.markDirtyAt(cx + 1, cz);
+      this.markDirtyAt(cx, cz - 1);
+      this.markDirtyAt(cx, cz + 1);
+    }
   }
 
   private chunkAtWorld(wx: number, wz: number): Chunk | undefined {
@@ -150,6 +223,8 @@ export class World {
       for (const [idx, id] of edits) chunk.data[idx] = id;
     }
     this.chunks.set(key, chunk);
+    // Multiplayer: ask the server for any edits this chunk has that we missed.
+    this.onChunkCreated?.(key);
     this.markDirty(chunk);
     // Neighbours were meshed assuming this space was air; rebuild their borders.
     this.markDirtyAt(cx - 1, cz);

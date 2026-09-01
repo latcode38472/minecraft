@@ -36,6 +36,8 @@ export class Player {
   onGround = false;
   feetInWater = false;
   eyeInWater = false;
+  /** Last frame's sneak intent, mirrored for multiplayer state packets. */
+  sneaking = false;
   /** Horizontal distance walked while grounded, consumed for footstep sounds. */
   stepAccumulator = 0;
 
@@ -65,6 +67,7 @@ export class Player {
 
   update(dt: number, move: MoveInput, yaw: number): void {
     this.updateWaterState();
+    this.sneaking = move.sneak;
 
     // Wish direction in the horizontal plane, relative to camera yaw. Analog
     // magnitudes below 1 scale the speed; diagonals get normalised.
