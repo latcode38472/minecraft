@@ -1,0 +1,68 @@
+# Build the game client and publish it to GitHub Pages.
+#
+# This produces the URL you share with friends. The multiplayer *server* is a
+# separate long-running process and cannot live on Pages — see render.yaml.
+#
+# Set a repository variable named MULTIPLAYER_URL to your server's wss:// URL
+# (Settings -> Secrets and variables -> Actions -> Variables) and the deployed
+# client will find it automatically. Without it the page still works for
+# singleplayer, and multiplayer can be pointed at a server per-visit with
+# ?server=wss://your-server.example.com
+
+name: Deploy game
+
+on:
+  push:
+    branches: [main, master]
+  # Lets you redeploy by hand after changing MULTIPLAYER_URL, without a commit.
+  workflow_dispatch:
+
+# Allow the deploy job to publish Pages, but nothing more.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; queue instead of cancelling a live one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # Simulation, protocol and multiplayer tests. Needs no browser and starts
+      # its own server, so a broken build never reaches Pages.
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build
+        env:
+          VITE_MULTIPLAYER_URL: ${{ vars.MULTIPLAYER_URL }}
+        run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

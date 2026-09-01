@@ -248,25 +248,40 @@ test('a skeleton will not shoot through a wall', () => {
   const skeleton = new MobSim('skeleton', player.position.x + 8, player.position.y, player.position.z);
   sim.mobs.set(skeleton.id, skeleton);
 
-  // Wall the player in completely; line of sight must fail in every direction.
-  for (let dy = 0; dy < 3; dy++) {
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        if (dx === 0 && dz === 0) continue;
-        world.applyEdit(
-          Math.floor(player.position.x) + dx,
-          Math.floor(player.position.y) + dy,
-          Math.floor(player.position.z) + dz,
-          1,
-        );
+  // Seal the player inside a solid box — walls two thick and a roof, so no
+  // angle threads a corner and no shot arcs over the top. A single-thickness
+  // ring is not enough: the skeleton strafes, and a diagonal line of sight can
+  // pass between two cells.
+  const px = Math.floor(player.position.x);
+  const py = Math.floor(player.position.y);
+  const pz = Math.floor(player.position.z);
+  for (let dy = -1; dy <= 4; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dz = -2; dz <= 2; dz++) {
+        const inside = dx === 0 && dz === 0 && dy >= 0 && dy <= 1;
+        if (inside) continue;
+        // Read first: ServerWorld.applyEdit only writes into chunks it already
+        // holds (unloaded ones get their edits replayed from the room's map on
+        // generation instead), so an unread column would silently drop the
+        // write and leave the "sealed" player standing in the open.
+        world.getBlock(px + dx, py + dy, pz + dz);
+        world.applyEdit(px + dx, py + dy, pz + dz, 1);
       }
     }
   }
+  assert.ok(
+    world.isSolidAt(px + 2, py + 1, pz),
+    'sanity: the box must actually exist before testing line of sight',
+  );
 
   run(sim, [player], 8);
+
+  // The one thing that matters: a sealed player is never shot.
   assert.equal(sim.arrows.size, 0, 'no arrow should be in flight');
   assert.equal(fired.length, 0);
-  assert.equal(skeleton.drawTime, 0, 'and it should not stand there drawing at a wall');
+  assert.equal(sim.removedArrows.length, 0, 'nor should one have been fired and expired');
+  // And it should not stand there drawing at a wall it cannot shoot through.
+  assert.equal(skeleton.drawTime, 0, 'the bow should be relaxed with no line of sight');
 });
 
 test('a skeleton arrow stops at terrain instead of passing through it', () => {

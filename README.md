@@ -36,6 +36,9 @@ npm run dev          # game client, port 5173
 | `npm test` | simulation, protocol and multiplayer tests |
 | `npm run test:browser` | end-to-end tests in real browser tabs |
 
+To put the game online for friends, see
+[Playing with a friend who isn't on your Wi-Fi](#playing-with-a-friend-who-isnt-on-your-wi-fi).
+
 Production build: `npm run build`, serve with `npm run preview`. The server has
 no build step — Node runs the TypeScript directly.
 
@@ -155,19 +158,60 @@ The phone finds the multiplayer server automatically: the client defaults to
 localhost. To point at a different server without rebuilding, append
 `?server=192.168.1.20:8787`.
 
-### Deploying for internet play
+### Playing with a friend who isn't on your Wi-Fi
 
-Set `VITE_MULTIPLAYER_URL` at build time and host the server anywhere with a
-public address:
+The game is two things: a **static site** (the client) and a **long-running
+WebSocket process** (the multiplayer server). A friend across the internet needs
+both reachable. Three ways, fastest first.
+
+**1. A tunnel — a couple of minutes, no accounts.** Run both locally, then
+expose the two ports:
 
 ```sh
-VITE_MULTIPLAYER_URL=wss://voxel.example.com npm run build
-PORT=8787 node server/index.ts       # behind a TLS-terminating proxy
+npm run dev:all                                   # client :5173, server :8787
+cloudflared tunnel --url http://localhost:8787    # prints https://<a>.trycloudflare.com
+cloudflared tunnel --url http://localhost:5173    # prints https://<b>.trycloudflare.com
 ```
 
-Serve the page over HTTPS and the socket over `wss://` — browsers block
-plaintext `ws://` from an HTTPS page. `GET /health` on the server returns room
-and player counts for monitoring.
+Send your friend `https://<b>.trycloudflare.com/?server=wss://<a>.trycloudflare.com`.
+Both links die when you close the terminal, and the game only runs while your
+machine is on — fine for one evening.
+
+**2. A permanent link.** The repo ships the config for this:
+
+| File | What it does |
+| --- | --- |
+| `.github/workflows/deploy.yml` | tests, builds and publishes the client to GitHub Pages |
+| `Dockerfile` | runs the multiplayer server (no build step — Node runs the TS) |
+| `render.yaml` | one-click Render blueprint for that server, free tier |
+
+1. **Server** — on [render.com](https://render.com): New → Blueprint → pick this
+   repo. It reads `render.yaml` and gives you `https://voxelcraft-server-xxxx.onrender.com`.
+2. **Client** — in the repo: Settings → Pages → Source: **GitHub Actions**. Then
+   Settings → Secrets and variables → Actions → Variables → New variable named
+   `MULTIPLAYER_URL`, set to your server's URL with `https` swapped for `wss`
+   (`wss://voxelcraft-server-xxxx.onrender.com`).
+3. Push to `main` (or run the workflow by hand). Your link is
+   `https://<your-username>.github.io/minecraft/`.
+
+Share that one link. Multiplayer is baked in, so nobody needs a `?server=`
+parameter.
+
+**3. Any other host.** The server is a plain Node process that reads `PORT` and
+`HOST`, so anything that runs a container works — Fly.io, Railway, a VPS. Point
+the client at it with `VITE_MULTIPLAYER_URL` at build time, or per-visit with
+`?server=wss://host`.
+
+Two things that will bite you:
+
+- **`wss://`, not `ws://`.** A page served over HTTPS cannot open a plaintext
+  WebSocket; browsers block it silently-ish and the game just says it cannot
+  reach the server. Any host that terminates TLS for you (Render, Fly) gives you
+  `wss://` for free.
+- **Free tiers sleep.** Render's free instance idles out after ~15 minutes and
+  takes a few seconds to wake, so the first join after a quiet spell may fail.
+  Try again and it connects. `GET /health` returns room and player counts, and
+  is also what wakes it.
 
 ### What is synchronised
 

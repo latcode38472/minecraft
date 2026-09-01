@@ -1,0 +1,22 @@
+# One-click deploy of the multiplayer server to Render.
+#
+# Render's free tier terminates TLS for you, which matters: the game client is
+# served over HTTPS from GitHub Pages, and browsers refuse a plaintext ws://
+# socket from an HTTPS page. Render gives you a wss:// URL for free.
+#
+# Free instances sleep after ~15 minutes idle and take a few seconds to wake.
+# A sleeping server means "Could not reach the server" on the first try —
+# reconnect and it comes up.
+
+services:
+  - type: web
+    name: voxelcraft-server
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    # The server answers this with room and player counts.
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
