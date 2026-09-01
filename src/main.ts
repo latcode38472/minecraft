@@ -6,6 +6,7 @@ import {
   initAudio,
   playAttack,
   playBreak,
+  playBubble,
   playEat,
   playHurt,
   playMobDeath,
@@ -32,7 +33,7 @@ import {
   TOUCH_MAX_CHUNK_GENS_PER_FRAME,
   TOUCH_MESH_BUDGET_MS,
 } from './constants';
-import { BLOCKS } from './blocks';
+import { Block, BLOCKS } from './blocks';
 import type { EntityContext } from './entities/entity';
 import { EntityManager } from './entities/manager';
 import { RoomSimulation } from './shared/roomsim';
@@ -165,6 +166,7 @@ async function boot(choice: StartChoice): Promise<void> {
   const survival = new Survival({
     onHurt: () => playHurt(),
     onDeath: () => onPlayerDied(),
+    onBubblePop: (remaining) => playBubble(remaining),
     armorPoints: () => inventory.armorPoints(),
     // `interaction` is created below; guard for the first frames.
     isBlocking: () => interaction?.blocking === true,
@@ -260,7 +262,7 @@ async function boot(choice: StartChoice): Promise<void> {
     onBreakBlock: (def) => playBreak(def.sound),
     onPlaceBlock: (def) => playPlace(def.sound),
     onAttack: () => playAttack(),
-    onSwing: () => viewmodel.swing(),
+    onSwing: (kind) => viewmodel.swing(kind),
     tryEat: (hunger) => {
       if (!survival.eat(hunger)) return false;
       playEat();
@@ -457,10 +459,24 @@ async function boot(choice: StartChoice): Promise<void> {
   function onPlayerDied(): void {
     inventoryUi.close();
     menu.style.display = 'none';
-    statusUi.showDeath(worldView.mobCount > 0 ? 'The night was not kind.' : 'Better luck next time.');
+    statusUi.showDeath(deathMessage());
     if (!touchDevice && look.locked) document.exitPointerLock();
     refreshPlayingClass();
     flushSave();
+  }
+
+  /** Name what killed you, the way vanilla's death screen does. */
+  function deathMessage(): string {
+    switch (survival.lastCause) {
+      case 'drown':
+        return 'You drowned.';
+      case 'fall':
+        return 'You hit the ground too hard.';
+      case 'starve':
+        return 'You starved to death.';
+      default:
+        return worldView.mobCount > 0 ? 'The night was not kind.' : 'Better luck next time.';
+    }
   }
 
   function respawn(): void {
@@ -717,6 +733,8 @@ async function boot(choice: StartChoice): Promise<void> {
 
   // --- Debug hook for automated smoke tests ---
   (window as unknown as Record<string, unknown>).__voxel = {
+    /** The block id table, so tests can name blocks instead of numbering them. */
+    Block,
     world,
     player,
     sky,
@@ -913,6 +931,8 @@ async function boot(choice: StartChoice): Promise<void> {
       dt,
       held: inventory.selectedStack,
       speed: Math.hypot(player.velocity.x, player.velocity.z),
+      velocityY: player.velocity.y,
+      onGround: player.onGround,
       bowCharge: playing ? interaction.bowCharge : 0,
       blocking: playing && interaction.blocking,
     });

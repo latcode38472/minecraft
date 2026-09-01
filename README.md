@@ -270,7 +270,11 @@ for two seconds so it does not snap straight back.
 - 20 health, 20 hunger; hunger drains with time and distance, regenerates health
   when full, and starves you when empty
 - Fall damage, mob damage with knockback and invulnerability frames
-- Death screen and respawn at your world spawn point
+- **Drowning**: fifteen seconds of air underwater, shown as ten bubbles above
+  the food bar that burst one at a time. When they run out you lose a heart a
+  second until you surface or die — armour and shields do not help. Coming up
+  refills the bar about four times faster than it drained
+- Death screen and respawn at your world spawn point, naming what killed you
 - Passive pigs, hostile zombies and skeletons; all take damage, die and drop loot
 - **Zombies** chase the nearest player and swing in melee
 - **Skeletons** are archers: they hold you at 5–11 blocks, strafe rather than
@@ -292,8 +296,20 @@ for two seconds so it does not snap straight back.
 
 **Animation**
 - **First-person hand**: the held tool, block or bare hand is drawn in front of
-  the camera, sways as you walk, arcs through a swing when you mine or attack,
-  draws back as a bow charges, and comes up to guard when a shield is raised
+  the camera, sways as you walk, breathes when you stand still, lags behind a
+  jump and dips when you land, draws back as a bow charges, and comes up to
+  guard when a shield is raised
+- **Strokes**: what you are doing decides how the hand moves. Mining winds the
+  tool up over your shoulder and drives it down into the block, with a shudder
+  at the moment of contact, looping seamlessly for as long as you hold the
+  button. A sword sweeps across the view and rolls over as it goes; a pickaxe
+  or axe chops; a fist, a block or an apple goes straight out. Placing a block
+  is a shorter shove, and eating brings the food up to your mouth and wobbles
+  it there. Every swing is asymmetric — out fast, back slowly — because a
+  symmetrical one reads as a wave rather than a blow
+- **Item swap**: changing what you hold lowers the old item out of frame and
+  raises the new one back in, with the model exchanged at the bottom of the dip
+  so the change itself is never seen
 - **Block cracks**: ten damage stages spread across the block you are mining,
   chosen from the same 0..1 progress the HUD bar uses
 - **Walking**: players and mobs have jointed limbs. Arms and legs counter-swing,
@@ -346,7 +362,8 @@ src/
   game/
     interaction.ts   mining progress, placing, attacking, eating, stations
     worldview.ts     renders mobs and drops from simulation snapshots
-    viewmodel.ts     the held item in front of the camera: sway, swing, draw
+    handpose.ts      pure pose maths for the hand: strike curves, sway, swap
+    viewmodel.ts     builds the held model and applies the pose to it
     breakoverlay.ts  the crack stages on the block being mined
   net/
     protocol.ts      wire types, limits and validators (shared with the server)
@@ -360,7 +377,8 @@ server/
 tests/
   simulation.test.ts headless: terrain, mobs, loot, drops, memory bounds
   protocol.test.ts   every sanitiser, from an attacker's point of view
-  animation.test.ts  rigs, gait, swings, crack stages, the snapshot clock
+  animation.test.ts  rigs, gait, hand strokes, crack stages, the snapshot clock
+  survival.test.ts   health, breath, drowning, and what the death screen says
   multiplayer.test.ts a real server driven by real WebSocket clients
   browser.mjs        real Chromium tabs, including a simulated phone
   world/
@@ -372,10 +390,10 @@ tests/
   player/
     camera.ts        pointer-lock yaw/pitch
     player.ts        movement intent, water state, fall tracking
-    survival.ts      health, hunger, regen, starvation, death
+    survival.ts      health, hunger, breath, regen, starvation, drowning, death
   ui/
     hud.ts           hotbar bound to the inventory, FPS, debug, toasts
-    statusui.ts      hearts, hunger, mining progress, death screen
+    statusui.ts      hearts, hunger, air bubbles, mining progress, death screen
     inventoryui.ts   inventory grid and recipe list
     multiplayerui.ts start menu, create/join, lobby, in-game MP HUD
     touch.ts         virtual joystick, look/tap/hold gestures, buttons

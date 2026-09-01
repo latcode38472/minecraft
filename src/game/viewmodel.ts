@@ -14,23 +14,8 @@ import { buildBoxGeometry, getMobMaterial } from '../entities/models';
 import type { ItemStack } from '../items/inventory';
 import { getItem } from '../items/items';
 import { getAtlasTexture, tileUVRect } from '../textures';
+import { HandAnimator, type HoldKind, type StrikeKind, type SwingStyle } from './handpose';
 
-/**
- * Where the model rests when idle, in view space (right, down, forward).
- * Tuned so the item sits in the lower-right quadrant with its bottom edge
- * running off screen, the way a held tool does — without covering the
- * crosshair or the hotbar.
- */
-const REST = new THREE.Vector3(0.33, -0.30, -0.62);
-/** Blocks are held further out, so a full cube does not dominate the view. */
-const REST_BLOCK = new THREE.Vector3(0.40, -0.36, -0.78);
-/**
- * An empty hand sits further out and lower, angled so the forearm runs off the
- * bottom-right corner. Seen end-on at the item pose it reads as a floating
- * plank instead of an arm, which is why it gets its own rest.
- */
-const REST_HAND = new THREE.Vector3(0.46, -0.5, -0.72);
-const SWING_S = 0.28;
 const SKIN = 0xd8b18a;
 const ITEM_SIZE = 0.36;
 const BLOCK_SIZE = 0.3;
@@ -42,6 +27,9 @@ export interface ViewmodelState {
   held: ItemStack | null;
   /** Horizontal speed in blocks/second, for the walking sway. */
   speed: number;
+  /** Vertical velocity, for the jump and landing bob. */
+  velocityY: number;
+  onGround: boolean;
   /** Bow draw, 0..1. */
   bowCharge: number;
   /** Shield raised. */
@@ -141,11 +129,11 @@ export class Viewmodel {
   /** Item id currently modelled. `null` means "not built yet", which is
    * distinct from '' meaning "an empty hand". */
   private heldKey: string | null = null;
-  private isHand = false;
-  private isBlock = false;
-  private swingTimer = 0;
-  private swayPhase = 0;
-  private sway = 0;
+  /** The item the swap dip is on its way to showing, once it bottoms out. */
+  private pendingKey: string | null = null;
+  private hold: HoldKind = 'hand';
+  private style: SwingStyle = 'jab';
+  private readonly anim = new HandAnimator();
 
   constructor(fov: number) {
     this.camera = new THREE.PerspectiveCamera(fov, 1, 0.01, 4);
@@ -155,13 +143,16 @@ export class Viewmodel {
     this.scene.add(light, new THREE.AmbientLight(0xffffff, 0.85), this.holder);
   }
 
-  /** Start an attack/mining stroke. Re-triggering restarts it. */
-  swing(): void {
-    this.swingTimer = SWING_S;
+  /**
+   * Start a stroke. Re-triggering restarts it, so holding the mouse down while
+   * mining reads as one continuous action rather than a single frozen frame.
+   */
+  swing(kind: StrikeKind = 'attack'): void {
+    this.anim.strike(kind);
   }
 
   get swinging(): boolean {
-    return this.swingTimer > 0;
+    return this.anim.swinging;
   }
 
   setAspect(aspect: number): void {
@@ -170,74 +161,29 @@ export class Viewmodel {
   }
 
   update(state: ViewmodelState): void {
-    // The swing clock runs even when the model is hidden: other players read
-    // `swinging` off it to animate our arm on their screens, so switching the
+    // Queue the swap first: the model is rebuilt part-way through `pose`, at
+    // the bottom of the dip, so the change is never seen on screen.
+    this.queueHeld(state.held);
+
+    const pose = this.anim.pose({
+      dt: state.dt,
+      hold: this.hold,
+      style: this.style,
+      speed: state.speed,
+      velocityY: state.velocityY,
+      onGround: state.onGround,
+      bowCharge: state.bowCharge,
+      blocking: state.blocking,
+    });
+
+    if (this.anim.takeSwap()) this.buildHeld();
+    // The clocks above run even when the model is hidden: other players read
+    // `swinging` off them to animate our arm on their screens, so switching the
     // viewmodel off for performance must not make us look motionless to them.
-    this.swingTimer = Math.max(0, this.swingTimer - state.dt);
-    if (!this.enabled) return;
-    this.setHeld(state.held);
+    if (!this.enabled || !this.mesh) return;
 
-    // Sway follows distance walked, not time, so it stays in step with the
-    // legs at any speed and stops dead when you do.
-    this.swayPhase += state.speed * state.dt * 3.6;
-    const target = Math.min(1, state.speed / 4.5);
-    // Ease the amplitude so starting and stopping does not snap.
-    this.sway += (target - this.sway) * Math.min(1, state.dt * 8);
-
-    if (!this.mesh) return;
-    const rest = this.isBlock ? REST_BLOCK : this.isHand ? REST_HAND : REST;
-    const swing = this.swingTimer / SWING_S;
-
-    // --- Base pose -----------------------------------------------------
-    let x = rest.x;
-    let y = rest.y;
-    let z = rest.z;
-    // Three poses: a block is held out as a cube, a tool is angled across the
-    // view, and a bare arm points away from the camera down its own length.
-    let rotX = this.isBlock ? -0.15 : this.isHand ? -0.35 : -0.5;
-    let rotY = this.isBlock ? 0.6 : this.isHand ? -0.5 : -0.35;
-    let rotZ = this.isBlock ? 0 : this.isHand ? 0.12 : 0.9;
-
-    // --- Walking sway --------------------------------------------------
-    x += Math.cos(this.swayPhase) * 0.045 * this.sway;
-    y += Math.abs(Math.sin(this.swayPhase)) * -0.035 * this.sway;
-    rotZ += Math.cos(this.swayPhase) * 0.06 * this.sway;
-
-    // --- Swing ---------------------------------------------------------
-    if (swing > 0) {
-      // Up and over: rises fast, falls through, settles back to rest.
-      const arc = Math.sin(Math.PI * swing);
-      y += arc * 0.34;
-      z += arc * 0.18;
-      x -= arc * 0.12;
-      rotX -= arc * 1.5;
-      rotZ -= arc * 0.5;
-    }
-
-    // --- Bow draw ------------------------------------------------------
-    if (state.bowCharge > 0) {
-      // Pull the bow back toward the eye and level it with the crosshair.
-      x = rest.x - 0.18 * state.bowCharge;
-      y = rest.y + 0.12 * state.bowCharge;
-      z = rest.z + 0.22 * state.bowCharge;
-      rotY = -0.35 + 0.35 * state.bowCharge;
-      rotZ = 0.9 - 0.75 * state.bowCharge;
-      // A slight shake at full draw, the way a held bow trembles.
-      if (state.bowCharge > 0.95) x += Math.sin(this.swayPhase * 40) * 0.004;
-    }
-
-    // --- Shield --------------------------------------------------------
-    if (state.blocking) {
-      x = 0.16;
-      y = -0.3;
-      z = -0.55;
-      rotY = 0.5;
-      rotZ = 0;
-      rotX = 0;
-    }
-
-    this.holder.position.set(x, y, z);
-    this.holder.rotation.set(rotX, rotY, rotZ);
+    this.holder.position.set(pose.x, pose.y, pose.z);
+    this.holder.rotation.set(pose.rotX, pose.rotY, pose.rotZ);
   }
 
   render(renderer: THREE.WebGLRenderer): void {
@@ -249,10 +195,29 @@ export class Viewmodel {
     renderer.autoClear = true;
   }
 
-  /** Rebuild the held mesh only when the item actually changes. */
-  private setHeld(stack: ItemStack | null): void {
+  /**
+   * Note a change of held item, and start the dip that hides the swap.
+   *
+   * The very first item appears without one — there is nothing to swap from,
+   * and an opening dip just looks like the hand falling into frame. So does a
+   * change made while the model is hidden, which nobody can see anyway.
+   */
+  private queueHeld(stack: ItemStack | null): void {
     const def = stack ? getItem(stack.id) : undefined;
     const key = def ? def.id : '';
+    if (key === this.pendingKey) return;
+    this.pendingKey = key;
+
+    if (this.heldKey === null || !this.enabled) {
+      this.buildHeld();
+      return;
+    }
+    this.anim.equip();
+  }
+
+  /** Swap in the model for `pendingKey`. Called at the bottom of the dip. */
+  private buildHeld(): void {
+    const key = this.pendingKey ?? '';
     if (key === this.heldKey) return;
     this.heldKey = key;
 
@@ -261,10 +226,14 @@ export class Viewmodel {
       this.mesh = null;
     }
 
-    // Which of the three poses applies is decided here, once per item change,
-    // rather than re-derived every frame.
-    this.isBlock = def?.block !== undefined;
-    this.isHand = !def;
+    const def = key ? getItem(key) : undefined;
+    // Which rest pose and which strike style apply is decided here, once per
+    // item change, rather than re-derived every frame.
+    this.hold = !def ? 'hand' : def.block !== undefined ? 'block' : 'item';
+    // A sword has an edge and sweeps it across; every other tool is swung
+    // overhead and brought down; a bare fist, a block or an apple just goes out.
+    const tool = def?.tool?.kind;
+    this.style = tool === 'sword' ? 'sweep' : tool ? 'chop' : 'jab';
 
     if (!def) {
       this.mesh = new THREE.Mesh(getHandGeometry(), getMobMaterial());

@@ -65,11 +65,15 @@
       #status {
         left: 50%; bottom: 66px; transform: translateX(-50%);
         display: none; gap: 26px; width: 420px; max-width: 92vw;
-        justify-content: space-between;
+        justify-content: space-between; align-items: flex-end;
       }
       html.playing #status { display: flex; }
-      #health-bar, #hunger-bar { display: flex; gap: 1px; }
-      #hunger-bar { flex-direction: row-reverse; }
+      #health-bar, #hunger-bar, #air-bar { display: flex; gap: 1px; }
+      #hunger-bar, #air-bar { flex-direction: row-reverse; }
+      /* Bubbles stack above the food bar, as they do in Minecraft. */
+      #right-status { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+      #air-bar { display: none; }
+      #air-bar.visible { display: flex; }
       #status svg { width: 17px; height: 17px; filter: drop-shadow(1px 1px 0 rgba(0,0,0,0.9)); }
       #status svg path { stroke: #1a1a1a; stroke-width: 1.4; }
       .heart.full path { fill: #e33d3d; }
@@ -78,6 +82,10 @@
       .food.full path { fill: #d8913f; }
       .food.half path { fill: #a86e2f; }
       .food.empty path { fill: #4a4a4a; }
+      /* A spent bubble is gone, not greyed: the bar shortens as air runs out. */
+      .bubble path { fill: #b8e2ff; }
+      .bubble.half { transform: scale(0.6); opacity: 0.75; }
+      .bubble.empty { display: none; }
 
       /* --- Hotbar --- */
       #hotbar {
@@ -305,7 +313,10 @@
     <div id="held-name" class="hud"></div>
     <div id="status" class="hud">
       <div id="health-bar"></div>
-      <div id="hunger-bar"></div>
+      <div id="right-status">
+        <div id="air-bar"></div>
+        <div id="hunger-bar"></div>
+      </div>
     </div>
     <div id="hotbar" class="hud"></div>
 

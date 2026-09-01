@@ -106,3 +106,12 @@ export function playEat(): void {
 export function playMobDeath(): void {
   playTone(260, 90, 0.3, 0.14, 'triangle');
 }
+
+/**
+ * A bubble leaving your lungs: a short rising blip, pitched lower as the air
+ * runs out, so the last few bubbles sound like the warning they are.
+ */
+export function playBubble(remaining: number): void {
+  const base = 340 + remaining * 34;
+  playTone(base, base * 1.6, 0.11, 0.07, 'sine');
+}

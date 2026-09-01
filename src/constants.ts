@@ -49,6 +49,15 @@ export const FALL_DAMAGE_THRESHOLD = 3.5; // blocks of free fall before damage
 export const HURT_INVULN_S = 0.5;
 export const RESPAWN_SEARCH_RADIUS = 6;
 
+// Breath. Minecraft gives 300 ticks of air shown as ten bubbles, then one heart
+// a second until you surface or die; these are the same numbers in seconds.
+export const MAX_AIR = 15;
+export const AIR_BUBBLES = 10;
+/** Surfacing refills far faster than diving drains — a gulp, not a recharge. */
+export const AIR_REFILL_PER_S = 4;
+export const DROWN_DAMAGE = 2;
+export const DROWN_INTERVAL_S = 1;
+
 // Combat
 export const PLAYER_ATTACK_RANGE = 3.5;
 export const FIST_DAMAGE = 1;

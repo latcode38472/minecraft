@@ -263,15 +263,32 @@ try {
       const h = window.__voxel.viewmodel.holder;
       return { y: h.position.y, rotX: h.rotation.x };
     });
-    await page.evaluate(() => window.__voxel.viewmodel.swing());
-    await sleep(90); // mid-stroke
-    const mid = await page.evaluate(() => {
-      const h = window.__voxel.viewmodel.holder;
-      return { y: h.position.y, rotX: h.rotation.x, swinging: window.__voxel.viewmodel.swinging };
+
+    // Sample the whole stroke rather than one instant. Which way the hand
+    // travels depends on the item — a pickaxe chops down, a sword sweeps
+    // sideways — so a single mid-stroke reading of one axis is a coin flip.
+    const swung = await page.evaluate(async () => {
+      const v = window.__voxel;
+      v.viewmodel.swing('attack');
+      const seen = [];
+      while (v.viewmodel.swinging && seen.length < 240) {
+        await new Promise((r) => requestAnimationFrame(r));
+        const h = v.viewmodel.holder;
+        seen.push({ y: h.position.y, z: h.position.z, rotX: h.rotation.x });
+      }
+      return seen;
     });
-    assert.ok(mid.swinging, 'the swing should still be running');
-    assert.ok(mid.y > rest.y + 0.05, `the item should rise on a swing: ${rest.y} -> ${mid.y}`);
-    assert.ok(mid.rotX < rest.rotX - 0.3, 'and rotate through the stroke');
+    assert.ok(swung.length > 3, `the stroke should span several frames, saw ${swung.length}`);
+    const drop = rest.y - Math.min(...swung.map((p) => p.y));
+    const forward = Math.min(...swung.map((p) => p.z));
+    const rotated = rest.rotX - Math.min(...swung.map((p) => p.rotX));
+    // A pickaxe chops: down and into the target, with the wrist turning over.
+    // The exact shape of the curve is pinned by the unit tests, which sample it
+    // at a fixed rate; here the renderer's framerate decides which parts of the
+    // stroke a frame happens to land on, so only the gross motion is asserted.
+    assert.ok(drop > 0.1, `the tool should come down through the blow, only got -${drop}`);
+    assert.ok(forward < -0.7, `and drive forward, reached z=${forward}`);
+    assert.ok(rotated > 0.3, `and rotate through the stroke, got ${rotated}`);
 
     // Poll rather than assume a wall-clock duration: the stroke advances on
     // frame dt, which runs slower than real time on a struggling renderer.
@@ -279,6 +296,222 @@ try {
     await sleep(120);
     const after = await page.evaluate(() => window.__voxel.viewmodel.holder.position.y);
     assert.ok(Math.abs(after - rest.y) < 0.05, `the item must return to rest, got ${after}`);
+    await context.close();
+  });
+
+  await testCase('going under water drains the air bar and then drowns you', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    // Dig a pool around the player and fill it over their head. Doing it with
+    // the real setBlock means the real water rules apply.
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -2; dz <= 2; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, v.Block.Stone);
+          for (let dy = 0; dy < 5; dy++) {
+            v.world.setBlock(bx + dx, by + dy, bz + dz, v.Block.Water);
+          }
+        }
+      }
+      v.player.position.set(bx + 0.5, by + 0.5, bz + 0.5);
+    });
+
+    // The eyes have to actually be under the surface, or nothing else follows.
+    await until(page, () => window.__voxel.player.eyeInWater, 15000, 'the head to submerge');
+
+    const bar = () => page.evaluate(() => ({
+      air: window.__voxel.survival.air,
+      health: window.__voxel.survival.health,
+      bubblesShown: document.querySelectorAll('#air-bar svg:not(.empty)').length,
+      barVisible: document.getElementById('air-bar').classList.contains('visible'),
+    }));
+
+    // Air goes down, and the HUD follows it. Only a second or so of it is
+    // checked here — how fast it drains is settled in the unit tests, and the
+    // frame loop clamps dt, so game time runs slower than the wall clock on a
+    // software renderer.
+    await until(
+      page,
+      () => window.__voxel.survival.air < 14,
+      20000,
+      'air to start draining',
+    );
+    const mid = await bar();
+    assert.ok(mid.barVisible, 'the bubble bar must appear as soon as you go under');
+    assert.equal(mid.bubblesShown, 10, 'and start out full');
+    assert.equal(mid.health, 20, 'breath alone must not cost health');
+
+    // Then the bubbles burst one at a time, rather than the bar draining as
+    // one continuous slider.
+    const spent = await until(
+      page,
+      () => {
+        const n = document.querySelectorAll('#air-bar svg:not(.empty)').length;
+        return n < 10 ? n + 1 : 0;
+      },
+      20000,
+      'a bubble to burst',
+    ) - 1;
+    assert.ok(spent >= 0 && spent < 10, `expected a partly spent bar, saw ${spent} bubbles`);
+
+    // Skip to the end of the air rather than sitting through fifteen game
+    // seconds of it; what matters here is that running out actually hurts.
+    await page.evaluate(() => {
+      window.__voxel.survival.air = 0.2;
+    });
+    const hurt = await until(
+      page,
+      () => (window.__voxel.survival.health < 20 ? window.__voxel.survival.health : 0),
+      25000,
+      'drowning damage',
+    );
+    assert.ok(hurt < 20, `expected to be drowning, health was ${hurt}`);
+    const empty = await bar();
+    assert.equal(empty.bubblesShown, 0, 'every bubble should be gone by the time you drown');
+
+    // Surfacing has to stop it and give the air back.
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -2; dz <= 2; dz++) {
+          for (let dy = 0; dy < 6; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, v.Block.Air);
+        }
+      }
+    });
+    const healthAtSurface = (await bar()).health;
+    await until(
+      page,
+      () => window.__voxel.survival.air >= 15,
+      25000,
+      'the lungs to refill',
+    );
+    const after = await bar();
+    assert.ok(!after.barVisible, 'a full bar should disappear again');
+    // Not equal: a well-fed player regenerates. Only a further loss would mean
+    // the drowning was still running.
+    assert.ok(
+      after.health >= healthAtSurface,
+      `the drowning kept going after surfacing: ${healthAtSurface} -> ${after.health}`,
+    );
+    await context.close();
+  });
+
+  await testCase('drowning kills, and the death screen says so', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -2; dz <= 2; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, v.Block.Stone);
+          for (let dy = 0; dy < 5; dy++) {
+            v.world.setBlock(bx + dx, by + dy, bz + dz, v.Block.Water);
+          }
+        }
+      }
+      v.player.position.set(bx + 0.5, by + 0.5, bz + 0.5);
+    });
+    await until(page, () => window.__voxel.player.eyeInWater, 15000, 'the head to submerge');
+
+    // Start on one heart with the air already gone, so the test does not sit
+    // through fifteen seconds of breath and ten hearts of drowning.
+    await page.evaluate(() => {
+      window.__voxel.survival.air = 0;
+      window.__voxel.survival.health = 2;
+    });
+
+    await until(page, () => window.__voxel.survival.dead, 25000, 'the player to drown');
+    const message = await page.evaluate(() => document.getElementById('death-msg').textContent);
+    assert.match(message, /drown/i, `the death screen should name drowning, said "${message}"`);
+
+    // And respawning must hand the lungs back rather than dropping you in dead.
+    await page.evaluate(() => window.__voxel.respawn());
+    await sleep(500);
+    const revived = await page.evaluate(() => ({
+      air: window.__voxel.survival.air,
+      health: window.__voxel.survival.health,
+      dead: window.__voxel.survival.dead,
+    }));
+    assert.equal(revived.dead, false);
+    assert.equal(revived.health, 20);
+    assert.ok(revived.air > 14, `respawn should restore the air, got ${revived.air}`);
+    await context.close();
+  });
+
+  await testCase('switching items dips the hand and swaps at the bottom', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      // Software rendering here is slow enough that the quality ladder would
+      // switch the viewmodel off mid-test; this is about the animation, not
+      // about how the game copes with a struggling GPU.
+      v.autoQuality?.disable();
+      v.setAnimatedLimbs(true);
+      v.inventory.add('diamond_pickaxe', 1);
+      v.inventory.add('diamond_sword', 1);
+      v.inventory.selectSlot(v.inventory.slots.findIndex((s) => s && s.id === 'diamond_pickaxe'));
+    });
+
+    // Wait for the pickaxe's own draw-in to finish before measuring, rather
+    // than assuming a wall-clock duration: the dip advances on frame dt.
+    await until(
+      page,
+      () => window.__voxel.viewmodel.holder.position.y > -0.45,
+      15000,
+      'the pickaxe to settle',
+    );
+
+    // Watch the hand across the swap: it has to leave the frame and come back,
+    // and the model must change while it is out of sight rather than popping.
+    const swap = await page.evaluate(async () => {
+      const v = window.__voxel;
+      const rest = v.viewmodel.holder.position.y;
+      const swordSlot = v.inventory.slots.findIndex((s) => s && s.id === 'diamond_sword');
+      v.inventory.selectSlot(swordSlot);
+
+      const seen = [];
+      let geometryChangedAt = -1;
+      const startGeometry = v.viewmodel.mesh?.geometry.uuid;
+      for (let i = 0; i < 90; i++) {
+        await new Promise((r) => requestAnimationFrame(r));
+        seen.push(v.viewmodel.holder.position.y);
+        if (geometryChangedAt < 0 && v.viewmodel.mesh?.geometry.uuid !== startGeometry) {
+          geometryChangedAt = seen.length - 1;
+        }
+      }
+      return { rest, seen, geometryChangedAt, held: v.inventory.selectedStack?.id };
+    });
+
+    assert.equal(swap.held, 'diamond_sword', 'the sword should be selected');
+    const lowest = Math.min(...swap.seen);
+    assert.ok(
+      lowest < swap.rest - 0.3,
+      `the hand should drop out of frame to swap, only reached ${lowest} from ${swap.rest}`,
+    );
+    assert.ok(swap.geometryChangedAt >= 0, 'the model must actually change');
+    // The swap has to happen near the bottom of the dip, not on the way in or out.
+    const yAtSwap = swap.seen[swap.geometryChangedAt];
+    assert.ok(
+      yAtSwap < lowest + 0.15,
+      `the swap was visible: y=${yAtSwap} but the dip bottomed out at ${lowest}`,
+    );
+    // And it must come back up.
+    const settled = swap.seen[swap.seen.length - 1];
+    assert.ok(
+      Math.abs(settled - swap.rest) < 0.06,
+      `the new item should rise back to rest, ended at ${settled}`,
+    );
     await context.close();
   });
 
@@ -531,13 +764,24 @@ try {
       (a) => window.__voxel.spawnTestMob('skeleton', a.bx + 1.5, a.by, a.bz),
       at,
     );
-    await sleep(4000);
-    const distance = await page.evaluate((mobId) => {
-      const v = window.__voxel;
-      const mob = v.getLocalSim().mobs.get(mobId);
-      if (!mob) return -1;
-      return Math.hypot(mob.position.x - v.player.position.x, mob.position.z - v.player.position.z);
-    }, id);
+    // Poll rather than sleep: the frame loop clamps dt, so on a software
+    // renderer the simulation advances slower than the wall clock and a fixed
+    // wait can end before the skeleton has had time to move at all.
+    let distance = -1;
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      distance = await page.evaluate((mobId) => {
+        const v = window.__voxel;
+        const mob = v.getLocalSim().mobs.get(mobId);
+        if (!mob) return -1;
+        return Math.hypot(
+          mob.position.x - v.player.position.x,
+          mob.position.z - v.player.position.z,
+        );
+      }, id);
+      if (distance > 3 || distance < 0) break;
+      await sleep(250);
+    }
     assert.ok(distance > 3, `the archer closed to ${distance.toFixed(1)} blocks instead of backing off`);
     await context.close();
   });
@@ -683,11 +927,22 @@ try {
         window.__voxel.dropHeldItem(true);
       });
 
+      // The throw has to reach the world before it can reach anyone in it;
+      // checking separately says which half failed.
+      await until(
+        host.page,
+        () => window.__voxel.getWorldView().dropCount,
+        20000,
+        'the thrown stack to appear in the world',
+      );
+
       // The stack must reach the other player, not bounce back to the thrower.
+      // Generously timed: the frame loop clamps dt, so on a software renderer
+      // the pickup delay and the fall both take longer than their wall clock.
       const taken = await until(
         guest.page,
         () => window.__voxel.inventory.count('diamond'),
-        20000,
+        45000,
         'the item to change hands',
       );
       assert.ok(taken > beforeCount, 'the receiving player never got the item');

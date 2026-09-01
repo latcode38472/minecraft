@@ -17,9 +17,14 @@ import { getItem } from '../items/items';
 import type { Player } from '../player/player';
 import { raycastVoxel, type RayHit } from '../raycast';
 import type { World } from '../world/world';
+import { MINE_STRIKE_S, type StrikeKind } from './handpose';
 
-/** Seconds between arm swings while a block is being mined. */
-const SWING_INTERVAL_S = 0.3;
+/**
+ * Seconds between arm swings while a block is being mined. Matching the stroke
+ * length exactly means consecutive strokes join into one continuous swing
+ * instead of pausing between blows.
+ */
+const SWING_INTERVAL_S = MINE_STRIKE_S;
 
 /** Anything alive the local player can shoot or hit: a mob or another player. */
 export interface CombatTarget {
@@ -34,10 +39,11 @@ export interface InteractionHooks {
   onPlaceBlock(def: BlockDef): void;
   onAttack(): void;
   /**
-   * Start an arm-swing animation: once per landed hit, and repeatedly while
-   * mining. Separate from onAttack, which is the sound and fires only on hits.
+   * Start a hand animation: repeatedly while mining, once per landed hit, once
+   * per placed block, and once when food is eaten. Separate from onAttack,
+   * which is the sound and fires only on hits.
    */
-  onSwing(): void;
+  onSwing(kind: StrikeKind): void;
   /**
    * Everything that can be hit: simulated mobs plus any remote players. Mob
    * ids are prefixed "mob:" so one list serves both.
@@ -155,7 +161,7 @@ export class Interaction {
       // Keep swinging for as long as the block is being worked on.
       if (this.swingTimer === 0) {
         this.swingTimer = SWING_INTERVAL_S;
-        this.hooks.onSwing();
+        this.hooks.onSwing('mine');
       }
     } else {
       this.resetMining();
@@ -228,7 +234,7 @@ export class Interaction {
       if (this.inventory.damageSelected()) this.hooks.toast('Your weapon broke!');
     }
     this.hooks.onAttack();
-    this.hooks.onSwing();
+    this.hooks.onSwing('attack');
   }
 
   private targetCentre(hit: RayHit): THREE.Vector3 {
@@ -277,10 +283,12 @@ export class Interaction {
     if (this.target) {
       if (this.target.id === Block.CraftingTable) {
         this.hooks.onOpenStation('table');
+        this.hooks.onSwing('use');
         return true;
       }
       if (this.target.id === Block.Furnace) {
         this.hooks.onOpenStation('furnace');
+        this.hooks.onSwing('use');
         return true;
       }
     }
@@ -293,11 +301,14 @@ export class Interaction {
     if (def.food) {
       if (!this.hooks.tryEat(def.food.hunger)) return false;
       this.inventory.consumeSelected();
+      this.hooks.onSwing('eat');
       return true;
     }
 
     if (def.block === undefined || !this.target) return false;
-    return this.placeBlock(def.block);
+    if (!this.placeBlock(def.block)) return false;
+    this.hooks.onSwing('use');
+    return true;
   }
 
   private placeBlock(block: Block): boolean {

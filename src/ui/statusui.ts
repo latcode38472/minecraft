@@ -1,13 +1,16 @@
 // Survival HUD: hearts, hunger, mining progress, hurt flash and death screen.
 // Hearts and drumsticks are drawn as inline SVG so they stay crisp at any DPI.
 
-import { MAX_HEALTH, MAX_HUNGER } from '../constants';
+import { AIR_BUBBLES, MAX_AIR, MAX_HEALTH, MAX_HUNGER } from '../constants';
 import type { Survival } from '../player/survival';
 
 const HEART_PATH =
   'M8 14.5 1.8 8.4A3.9 3.9 0 0 1 8 3.6a3.9 3.9 0 0 1 6.2 4.8Z';
 const FOOD_PATH =
   'M4.2 2.2c1.6 0 2.4 1.2 2.4 2.8v3.4h1.1V5c0-1.6.9-2.8 2.4-2.8 1.7 0 2.6 1.4 2.6 3.2 0 2.6-1.9 4.3-4 4.9v2.5c0 .6-.5 1-1 1h-1c-.6 0-1-.4-1-1v-2.5c-2.1-.6-4-2.3-4-4.9 0-1.8.9-3.2 2.5-3.2Z';
+/** A bubble: a ring with the highlight bitten out of the upper left. */
+const BUBBLE_PATH =
+  'M8 2a6 6 0 1 1 0 12A6 6 0 0 1 8 2Zm-1.4 2.1a3.4 3.4 0 0 0-2.4 2.6 1 1 0 0 0 2 .3 1.5 1.5 0 0 1 1-1 1 1 0 0 0-.6-1.9Z';
 
 function icons(container: HTMLElement, count: number, path: string, cls: string): SVGElement[] {
   const out: SVGElement[] = [];
@@ -27,6 +30,8 @@ function icons(container: HTMLElement, count: number, path: string, cls: string)
 export class StatusUi {
   private readonly hearts: SVGElement[];
   private readonly foods: SVGElement[];
+  private readonly bubbles: SVGElement[];
+  private readonly airEl = document.getElementById('air-bar')!;
   private readonly flashEl = document.getElementById('hurt-flash')!;
   private readonly deathEl = document.getElementById('death')!;
   private readonly deathMsgEl = document.getElementById('death-msg')!;
@@ -40,6 +45,7 @@ export class StatusUi {
     // Half-units: each icon represents 2 health/hunger points.
     this.hearts = icons(document.getElementById('health-bar')!, MAX_HEALTH / 2, HEART_PATH, 'heart');
     this.foods = icons(document.getElementById('hunger-bar')!, MAX_HUNGER / 2, FOOD_PATH, 'food');
+    this.bubbles = icons(this.airEl, AIR_BUBBLES, BUBBLE_PATH, 'bubble');
     document.getElementById('respawn-btn')!.addEventListener('click', onRespawn);
   }
 
@@ -48,6 +54,10 @@ export class StatusUi {
       this.lastVersion = survival.version;
       setBar(this.hearts, survival.health);
       setBar(this.foods, survival.hunger);
+      // setBar counts in half-icons, so scale air onto the same footing.
+      setBar(this.bubbles, (survival.air / MAX_AIR) * AIR_BUBBLES * 2);
+      // The bar only exists while you are short of breath.
+      this.airEl.classList.toggle('visible', survival.air < MAX_AIR);
     }
 
     this.flashEl.style.opacity = String(Math.min(0.55, survival.hurtFlash * 1.4));
