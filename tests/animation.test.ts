@@ -10,6 +10,8 @@ import * as THREE from 'three';
 import {
   PIG_SEGMENTS,
   Rig,
+  SKELETON_BOW_SEGMENTS,
+  SKELETON_SEGMENTS,
   WALK_PHASE_PER_BLOCK,
   ZOMBIE_SEGMENTS,
   type RigSegment,
@@ -174,6 +176,51 @@ test('a pig walks on diagonal pairs, as four-legged animals do', () => {
   const a = rig.segments.get('legsA')!.rotation.x;
   const b = rig.segments.get('legsB')!.rotation.x;
   assert.ok(a * b < 0, 'the two diagonal pairs must alternate');
+});
+
+test('a skeleton is built with a bow arm that can be raised', () => {
+  const rig = new Rig('test-skeleton', SKELETON_SEGMENTS, true);
+  assert.ok(rig.segments.has('arms'), 'the bow arm must be posable');
+  assert.ok(rig.segments.has('body'));
+  assert.ok(
+    rig.group.children.length <= 4,
+    `a skeleton costs ${rig.group.children.length} draw calls; keep mobs at 4 or fewer`,
+  );
+
+  // The bow itself is a rig too, with a string that can be drawn back.
+  const bow = new Rig('test-bow', SKELETON_BOW_SEGMENTS, true);
+  assert.ok(bow.segments.has('arms'), 'the bowstring must be movable');
+});
+
+test('aiming raises the arms and holds them there', () => {
+  const rig = new Rig('aim', SKELETON_SEGMENTS, true);
+  rig.pose(0, 0, 0, 0, 0); // not aiming
+  const rest = rig.segments.get('arms')!.rotation.x;
+
+  rig.pose(0, 0, 0, 0, 0.5); // half drawn
+  const half = rig.segments.get('arms')!.rotation.x;
+  rig.pose(0, 0, 0, 0, 1); // full draw
+  const full = rig.segments.get('arms')!.rotation.x;
+
+  assert.ok(half < rest - 0.5, `arms should come up while aiming: ${rest} -> ${half}`);
+  // Level, not flailing: roughly a quarter turn and then steady.
+  assert.ok(Math.abs(full + Math.PI / 2) < 0.2, `full draw should hold level, got ${full}`);
+  assert.ok(Math.abs(full - half) < 0.4, 'the arms should settle, not keep rising');
+});
+
+test('an aiming skeleton still walks, but does not also swing', () => {
+  const rig = new Rig('aim-walk', SKELETON_SEGMENTS, true);
+  // Aiming while strafing: legs keep moving so it does not slide.
+  rig.pose(Math.PI / 2, 1, 0, 0, 1);
+  const legL = rig.segments.get('legL')!.rotation.x;
+  const legR = rig.segments.get('legR')!.rotation.x;
+  assert.ok(Math.abs(legL) > 0.1, 'an aiming skeleton that moves must still walk');
+  assert.ok(legL * legR < 0, 'and its legs must still alternate');
+
+  // A swing passed at the same time must not fight the aim.
+  rig.pose(0, 0, 1, 0, 1);
+  const arms = rig.segments.get('arms')!.rotation.x;
+  assert.ok(arms < -1, 'the aim must win over a swing, not blend with it');
 });
 
 test('crack stages step through the whole set as mining progresses', () => {

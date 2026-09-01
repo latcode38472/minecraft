@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ServerWorld } from '../server/world.ts';
 import { RoomSimulation } from '../src/shared/roomsim.ts';
-import { MobSim, isNightTime } from '../src/shared/mobsim.ts';
+import { ArrowSim, MobSim, isNightTime, solveArrowArc } from '../src/shared/mobsim.ts';
 import { moveWithCollision, rayBoxDistance } from '../src/shared/voxel.ts';
 import { Block } from '../src/blocks.ts';
 import { MAX_MOBS, NIGHT_START } from '../src/constants.ts';
@@ -86,7 +86,7 @@ test('mobs spawn at night, on the ground, and stay grounded', () => {
   assert.ok(sim.mobs.size > 0, 'night should populate the room with hostiles');
   const mobs = [...sim.mobs.values()];
   assert.ok(
-    mobs.every((m) => m.kind === 'zombie'),
+    mobs.every((m) => m.kind === 'zombie' || m.kind === 'skeleton'),
     'only hostiles spawn at night',
   );
   // Every mob must be resting on something solid, not floating or sunk.
@@ -104,6 +104,20 @@ test('mobs spawn at night, on the ground, and stay grounded', () => {
     assert.ok(below || mob.position.y > 0, `mob at ${JSON.stringify(mob.position)} lost the ground`);
     assert.ok(!insideGround, 'a mob must never end up inside a solid block');
   }
+});
+
+test('night brings both zombies and skeletons, not just one', () => {
+  // A night of only melee, or only archers, is a much less interesting night.
+  const kinds = new Set<string>();
+  for (let seed = 0; seed < 6 && kinds.size < 2; seed++) {
+    const { world, sim } = makeRoom(SEED + seed);
+    const player = spawnPlayer(world);
+    sim.timeOfDay = NIGHT_START + 0.01;
+    run(sim, [player], 120);
+    for (const mob of sim.mobs.values()) kinds.add(mob.kind);
+  }
+  assert.ok(kinds.has('zombie'), `no zombies spawned: ${[...kinds]}`);
+  assert.ok(kinds.has('skeleton'), `no skeletons spawned: ${[...kinds]}`);
 });
 
 test('daytime spawns passive mobs instead of hostiles', () => {
@@ -142,6 +156,180 @@ test('a zombie closes on the nearest player and hits them', () => {
   assert.equal(damage[0].id, 'p1', 'it must target the nearer player');
   assert.ok(damage[0].amount > 0);
   assert.ok(startDist < 4, 'sanity: the test placed it in range');
+});
+
+// --- Skeletons -------------------------------------------------------------
+
+test('a skeleton draws its bow before shooting, and the draw is visible', () => {
+  const { world, sim, damage } = makeRoom();
+  const player = spawnPlayer(world);
+  const skeleton = new MobSim(
+    'skeleton',
+    player.position.x + 8,
+    player.position.y,
+    player.position.z,
+  );
+  sim.mobs.set(skeleton.id, skeleton);
+
+  // Step until the first arrow exists, watching the draw build.
+  const draws: number[] = [];
+  let firstArrowAt = -1;
+  for (let i = 0; i < 200 && firstArrowAt < 0; i++) {
+    sim.update(1 / 20, [player]);
+    draws.push(skeleton.drawTime);
+    if (sim.arrows.size > 0) firstArrowAt = i;
+  }
+
+  assert.ok(firstArrowAt > 0, 'the skeleton never fired');
+  const peak = Math.max(...draws);
+  assert.ok(peak > 0.9, `the bow was barely drawn before firing: ${peak.toFixed(2)}s`);
+  // The draw is the player's warning, so it must last long enough to react to.
+  assert.ok(
+    draws.filter((d) => d > 0).length >= 15,
+    'the draw must be visible for a beat, not an instant',
+  );
+
+  // And the shot must eventually land.
+  run(sim, [player], 6);
+  assert.ok(damage.length > 0, 'arrows should hit a stationary player');
+  assert.equal(damage[0].id, 'p1');
+});
+
+test('the draw reaches clients as a 0..1 level on the mob snapshot', () => {
+  const { world, sim } = makeRoom();
+  const player = spawnPlayer(world);
+  const skeleton = new MobSim('skeleton', player.position.x + 8, player.position.y, player.position.z);
+  sim.mobs.set(skeleton.id, skeleton);
+
+  let sawDraw = false;
+  for (let i = 0; i < 60 && !sawDraw; i++) {
+    sim.update(1 / 20, [player]);
+    const snap = sim.mobSnapshot().find((m) => m.i === skeleton.id)!;
+    if (snap.d !== undefined) {
+      sawDraw = true;
+      assert.ok(snap.d > 0 && snap.d <= 1, `draw out of range: ${snap.d}`);
+      assert.equal(snap.k, 2, 'a skeleton is kind 2 on the wire');
+    }
+  }
+  assert.ok(sawDraw, 'clients were never told the bow was being drawn');
+
+  // Once it fires, the field disappears rather than sticking at 1.
+  run(sim, [player], 2);
+  const after = sim.mobSnapshot().find((m) => m.i === skeleton.id);
+  assert.ok(after, 'the skeleton should still exist');
+  assert.ok(after.d === undefined || after.d < 1, 'a loosed bow must not stay fully drawn');
+});
+
+test('a skeleton keeps its distance instead of walking into melee', () => {
+  const { world, sim } = makeRoom();
+  const player = spawnPlayer(world);
+  // Start it right on top of the player: it should back off, not close.
+  const skeleton = new MobSim('skeleton', player.position.x + 1.5, player.position.y, player.position.z);
+  sim.mobs.set(skeleton.id, skeleton);
+
+  run(sim, [player], 4);
+  const distance = Math.hypot(
+    skeleton.position.x - player.position.x,
+    skeleton.position.z - player.position.z,
+  );
+  assert.ok(distance > 3, `an archer should retreat, but it stayed at ${distance.toFixed(1)} blocks`);
+});
+
+test('a skeleton will not shoot through a wall', () => {
+  const world = new ServerWorld(SEED, new Map());
+  const fired: unknown[] = [];
+  const sim = new RoomSimulation(world, { damagePlayer: () => {}, giveItems: () => 0 });
+  const spawn = world.terrain.findSpawnColumn();
+  const player: SimPlayer = {
+    id: 'p1',
+    position: { x: spawn.x + 0.5, y: spawn.y, z: spawn.z + 0.5 },
+    dead: false,
+  };
+  const skeleton = new MobSim('skeleton', player.position.x + 8, player.position.y, player.position.z);
+  sim.mobs.set(skeleton.id, skeleton);
+
+  // Wall the player in completely; line of sight must fail in every direction.
+  for (let dy = 0; dy < 3; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        if (dx === 0 && dz === 0) continue;
+        world.applyEdit(
+          Math.floor(player.position.x) + dx,
+          Math.floor(player.position.y) + dy,
+          Math.floor(player.position.z) + dz,
+          1,
+        );
+      }
+    }
+  }
+
+  run(sim, [player], 8);
+  assert.equal(sim.arrows.size, 0, 'no arrow should be in flight');
+  assert.equal(fired.length, 0);
+  assert.equal(skeleton.drawTime, 0, 'and it should not stand there drawing at a wall');
+});
+
+test('a skeleton arrow stops at terrain instead of passing through it', () => {
+  const world = new ServerWorld(SEED, new Map());
+  const sim = new RoomSimulation(world, { damagePlayer: () => {}, giveItems: () => 0 });
+  const spawn = world.terrain.findSpawnColumn();
+  // Fire flat into the ground: it must stick, not tunnel onward forever.
+  const arrow = new ArrowSim(
+    { x: spawn.x + 0.5, y: spawn.y + 0.5, z: spawn.z + 0.5 },
+    { x: 0, y: -1, z: 0 },
+    40,
+    3,
+    999,
+  );
+  sim.arrows.set(arrow.id, arrow);
+  for (let i = 0; i < 40 && !arrow.stuck; i++) arrow.update(1 / 20, world, []);
+
+  assert.ok(arrow.stuck, 'the arrow flew through the ground');
+  assert.ok(
+    !world.isSolidAt(
+      Math.floor(arrow.position.x),
+      Math.floor(arrow.position.y),
+      Math.floor(arrow.position.z),
+    ),
+    'and it must come to rest in open air, not inside a block',
+  );
+});
+
+test('the ballistic solver hits its mark, and admits when it cannot', () => {
+  const speed = 26;
+  // A level shot at a reachable distance leans very slightly upward.
+  const flat = solveArrowArc(10, 0, speed);
+  assert.ok(flat !== null && flat > 0 && flat < 0.5, `implausible level shot slope: ${flat}`);
+
+  // Shooting upward needs more elevation than shooting level.
+  const up = solveArrowArc(10, 4, speed)!;
+  const down = solveArrowArc(10, -4, speed)!;
+  assert.ok(up > flat!, 'an uphill shot must aim higher');
+  assert.ok(down < flat!, 'a downhill shot must aim lower');
+
+  // And a shot beyond the bow's reach is refused rather than fudged.
+  assert.equal(solveArrowArc(10_000, 0, speed), null, 'an impossible shot must return null');
+});
+
+test('a skeleton drops bones and arrows, arming the player who kills it', () => {
+  const { world, sim, given } = makeRoom();
+  const player = spawnPlayer(world);
+  const skeleton = new MobSim('skeleton', player.position.x + 1, player.position.y, player.position.z);
+  sim.mobs.set(skeleton.id, skeleton);
+
+  for (let i = 0; i < 30 && !skeleton.dead; i++) {
+    sim.damageMob(skeleton.id, 5, 'p1', player.position);
+    sim.update(1 / 20, [player]);
+  }
+  assert.ok(skeleton.dead, 'the skeleton should have died');
+  assert.ok(
+    given.some(([, item]) => item === 'bone'),
+    `expected bones in the loot, got ${JSON.stringify(given)}`,
+  );
+  assert.ok(
+    given.every(([who]) => who === 'p1'),
+    'loot goes to the killer',
+  );
 });
 
 test('mob loot goes to whoever landed the killing blow', () => {

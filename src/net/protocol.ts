@@ -102,7 +102,7 @@ export interface PlayerVitals {
 export interface MobStateData {
   /** Host-assigned mob id, unique within the room. */
   i: number;
-  /** Mob kind: 0 zombie, 1 pig. */
+  /** Mob kind: see MOB_KIND_* below. */
   k: number;
   x: number;
   y: number;
@@ -115,15 +115,33 @@ export interface MobStateData {
    * case costs nothing on a snapshot sent twenty times a second.
    */
   s?: 1;
+  /**
+   * A skeleton's bow draw, 0..1, present only while it is actually drawing.
+   * Clients animate the pull from this, which is what lets a player see a shot
+   * coming and take cover instead of being hit out of nowhere.
+   */
+  d?: number;
+}
+
+/** An arrow fired by a mob, in flight. */
+export interface ArrowStateData {
+  i: number;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
 }
 
 export const MOB_KIND_ZOMBIE = 0;
 export const MOB_KIND_PIG = 1;
+export const MOB_KIND_SKELETON = 2;
 /** Server world-snapshot rate; clients interpolate between these. */
 export const MOB_SYNC_HZ = 10;
 /** How often the server steps its authoritative simulation. */
 export const SIM_HZ = 20;
 export const MAX_DROPS_PER_MESSAGE = 80;
+export const MAX_ARROWS_PER_MESSAGE = 40;
 
 /** A dropped item lying in the world, owned by the server. */
 export interface DropStateData {
@@ -142,6 +160,9 @@ export interface WorldStateData {
   drops: DropStateData[];
   removedMobs: number[];
   removedDrops: number[];
+  /** Arrows fired by mobs; player arrows are relayed separately. */
+  arrows: ArrowStateData[];
+  removedArrows: number[];
   /** Where mobs died this tick, so clients can play the sound. */
   mobDeaths: { x: number; y: number; z: number }[];
 }

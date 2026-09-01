@@ -119,6 +119,7 @@ material('diamond', 'Diamond', ItemTile.Diamond);
 material('leather', 'Leather', ItemTile.Leather);
 material('string', 'String', ItemTile.String);
 material('flint', 'Flint', ItemTile.Flint);
+material('bone', 'Bone', ItemTile.Bone);
 
 // --- Food ---
 register({

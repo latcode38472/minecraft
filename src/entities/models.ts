@@ -198,8 +198,25 @@ export class Rig {
    * as a body gets going. `swing` (0..1) is an attack or mining stroke, and
    * `pitch` tilts the head where the model has a separate one.
    */
-  pose(walkPhase: number, walkAmount: number, swing: number, pitch = 0): void {
+  pose(walkPhase: number, walkAmount: number, swing: number, pitch = 0, aim = 0): void {
     if (!this.articulated) return;
+
+    // Aiming overrides the arms entirely: they come up level and hold there
+    // while the draw builds, which is the whole tell that a shot is coming.
+    if (aim > 0) {
+      const raise = Math.min(1, aim * 2.2); // arms up fast, then steady
+      const arms = this.segments.get('arms');
+      if (arms) {
+        arms.rotation.x = -Math.PI / 2 * raise;
+        // A slight settle as the draw completes, so it does not look frozen.
+        arms.rotation.z = Math.sin(aim * Math.PI) * 0.05;
+      }
+      const stride = Math.sin(walkPhase) * 0.5 * walkAmount;
+      this.rotate('legL', stride);
+      this.rotate('legR', -stride);
+      this.rotate('head', Math.max(-0.6, Math.min(0.6, pitch)));
+      return;
+    }
 
     const stride = Math.sin(walkPhase) * 0.85 * walkAmount;
     const counter = Math.sin(walkPhase + Math.PI) * 0.85 * walkAmount;
@@ -297,6 +314,72 @@ export const ZOMBIE_SEGMENTS = (): RigSegment[] => {
       name: 'legR',
       pivot: [0.15, 0.65, 0],
       parts: [{ pos: [0, -0.33, 0], size: [0.25, 0.65, 0.25], color: pants }],
+    },
+  ];
+};
+
+export const SKELETON_SEGMENTS = (): RigSegment[] => {
+  const bone = 0xd6d3c4;
+  const dark = 0xa8a596;
+  return [
+    {
+      name: 'body',
+      pivot: [0, 0, 0],
+      parts: [
+        { pos: [0, 1.72, 0], size: [0.46, 0.46, 0.46], color: bone }, // skull
+        { pos: [0, 1.5, 0.2], size: [0.24, 0.16, 0.06], color: dark }, // eye sockets
+        { pos: [0, 1.08, 0], size: [0.34, 0.72, 0.22], color: bone }, // ribcage
+      ],
+    },
+    {
+      // Both arms move together: a skeleton holds its bow two-handed out front,
+      // and `aim` in Rig.pose raises this whole assembly to fire.
+      name: 'arms',
+      pivot: [0, 1.42, 0],
+      parts: [
+        { pos: [-0.32, -0.3, 0.06], size: [0.18, 0.62, 0.18], color: bone },
+        { pos: [0.32, -0.3, 0.06], size: [0.18, 0.62, 0.18], color: bone },
+      ],
+    },
+    {
+      name: 'legL',
+      pivot: [-0.12, 0.62, 0],
+      parts: [{ pos: [0, -0.31, 0], size: [0.18, 0.62, 0.18], color: bone }],
+    },
+    {
+      name: 'legR',
+      pivot: [0.12, 0.62, 0],
+      parts: [{ pos: [0, -0.31, 0], size: [0.18, 0.62, 0.18], color: bone }],
+    },
+  ];
+};
+
+/**
+ * The bow a skeleton carries. A separate rig so it can be parented to the arms
+ * and swing with them, and so the string can be pulled back independently as
+ * the draw builds.
+ */
+export const SKELETON_BOW_SEGMENTS = (): RigSegment[] => {
+  const wood = 0x7a5433;
+  const string = 0xe4e2d6;
+  return [
+    {
+      name: 'body',
+      pivot: [0, 0, 0],
+      parts: [
+        // Limbs, bent around a vertical axis so the bow faces forward.
+        { pos: [0, 0.34, 0], size: [0.06, 0.22, 0.06], color: wood },
+        { pos: [0, -0.34, 0], size: [0.06, 0.22, 0.06], color: wood },
+        { pos: [0, 0.17, 0.07], size: [0.06, 0.18, 0.06], color: wood },
+        { pos: [0, -0.17, 0.07], size: [0.06, 0.18, 0.06], color: wood },
+        { pos: [0, 0, 0.1], size: [0.06, 0.2, 0.06], color: wood },
+      ],
+    },
+    {
+      // The nock: pulled back along -Z as the draw builds.
+      name: 'arms',
+      pivot: [0, 0, 0],
+      parts: [{ pos: [0, 0, -0.02], size: [0.03, 0.86, 0.03], color: string }],
     },
   ];
 };

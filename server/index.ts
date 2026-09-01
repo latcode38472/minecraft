@@ -23,6 +23,7 @@ import {
   RATE_LIMIT_EDITS_PER_SEC,
   MAX_ATTACK_RANGE,
   MAX_DROP_RANGE,
+  MAX_ARROWS_PER_MESSAGE,
   MAX_DROPS_PER_MESSAGE,
   MAX_MOBS_PER_MESSAGE,
   SIM_HZ,
@@ -678,6 +679,8 @@ setInterval(() => {
       drops: room.sim.dropSnapshot().slice(0, MAX_DROPS_PER_MESSAGE),
       removedMobs: room.sim.removedMobs.splice(0),
       removedDrops: room.sim.removedDrops.splice(0),
+      arrows: room.sim.arrowSnapshot().slice(0, MAX_ARROWS_PER_MESSAGE),
+      removedArrows: room.sim.removedArrows.splice(0),
       mobDeaths: room.sim.mobDeaths.splice(0),
     });
   }

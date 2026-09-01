@@ -120,6 +120,7 @@ than one mesh, so an animated body costs more draw calls than a rigid one:
 | Body | Meshes animated | Meshes merged |
 | --- | --- | --- |
 | Zombie | 4 (body, both arms together, each leg) | 1 |
+| Skeleton | 4, plus 2 for the bow it carries | 1, plus the bow |
 | Pig | 3 (body, two diagonal leg pairs) | 1 |
 | Player | 6 (head, torso, two arms, two legs) | 1 |
 
@@ -178,7 +179,8 @@ and player counts for monitoring.
 | Player health, hunger and death (server-authoritative) | |
 | Worn armour, drawn on other players' bodies | |
 | PvP damage from melee and arrows | |
-| Mobs — position, health, death, attack swings (server-authoritative) | |
+| Mobs — position, health, death, attack swings, bow draw (server-authoritative) | |
+| Arrows fired by mobs, simulated server-side | |
 | Dropped items, including who is allowed to pick one up | |
 | Mob loot, awarded to whoever landed the killing blow | |
 | Time of day: the server owns the clock | |
@@ -218,8 +220,13 @@ for two seconds so it does not snap straight back.
   when full, and starves you when empty
 - Fall damage, mob damage with knockback and invulnerability frames
 - Death screen and respawn at your world spawn point
-- Passive pigs and hostile zombies; zombies chase and attack the nearest player,
-  take damage, die, and drop loot
+- Passive pigs, hostile zombies and skeletons; all take damage, die and drop loot
+- **Zombies** chase the nearest player and swing in melee
+- **Skeletons** are archers: they hold you at 5–11 blocks, strafe rather than
+  stand, need line of sight, and spend a visible second drawing the bow before
+  every shot — that draw is your cue to dodge or break cover. They aim with a
+  real ballistic solution (plus a little spread), so the arc is right at any
+  range, and they drop bones and arrows
 - **Melee**: swords, axes and pickaxes in four tiers, each with its own damage
   and attack cooldown; bare fists do 1
 - **Bow and arrows**: hold to draw (a charge bar fills), release to fire.
@@ -243,6 +250,9 @@ for two seconds so it does not snap straight back.
   rather than by time, so it stays in step at any frame rate
 - **Attacks**: swings are visible on other players and on mobs, not just felt as
   damage — the swing crosses the wire as one flag bit
+- **Aiming**: a skeleton raises its bow and pulls the string back as it draws,
+  then looses; the draw is a 0..1 level on the wire so every client sees the
+  same shot building
 - On touch devices the quality ladder can trade limb animation for draw calls;
   see **Performance on phones**
 
@@ -263,7 +273,7 @@ for two seconds so it does not snap straight back.
 src/
   constants.ts       all tunables (chunk size, gravity, reach, combat, hunger...)
   blocks.ts          block registry: tiles, hardness, tool + tier, drops
-  textures.ts        procedural atlas: block tiles + pixel-art item icons
+  textures.ts        procedural atlas: block tiles, item icons, crack stages
   input.ts           keyboard/wheel state, discrete press queue
   raycast.ts         Amanatides & Woo voxel DDA
   audio.ts           WebAudio generated sound effects
@@ -275,7 +285,7 @@ src/
     crafting.ts      recipes and stations (hand / table / furnace)
   shared/            runs identically in the browser and in Node
     voxel.ts         AABB-vs-voxel collision and ray/box tests, no THREE
-    mobsim.ts        mob behaviour (chase/attack, wander/flee) + item drops
+    mobsim.ts        mob behaviour (chase, shoot, wander/flee), drops, arrows
     roomsim.ts       the world simulation: mobs, drops, loot, day/night clock
   entities/
     entity.ts        Entity base: gravity, buoyancy, voxel collision
@@ -372,6 +382,14 @@ players and evicts them behind (4-chunk keep radius, 400-chunk hard cap), so a
 room's footprint stays flat however far anyone walks — a test walks 2,400 blocks
 and asserts the cache never grows past the cap.
 
+**Item icons.** Sprites are character maps — 16x16 for tools and weapons, 8x8
+upscaled for simpler things — but the polish is generated, not drawn. Every
+sprite gets an automatic outline (each transparent pixel touching the shape
+takes a darkened copy of its neighbour's colour) and edge relief (upper-left
+boundaries lighten, lower-right darken). That is what makes an icon read
+against both a bright hotbar and a night sky, and it applies to every sprite
+added later without anyone having to remember to draw a border.
+
 **Caves.** Two independent 3D noise fields are each thresholded into a thin
 shell (`|noise - 0.5| < t`); a voxel is carved only where *both* shells overlap,
 which yields connected tunnels instead of the disconnected blobs a single
@@ -451,11 +469,16 @@ protocol is identical on both platforms.
   `dropSnapshot()` alongside `SaveMeta`.
 - Mob AI has no pathfinding — zombies walk straight at you and hop one-block
   ledges, so they get stuck on complex terrain. Hook: `MobSim.update`.
-- Animation is procedural posing, not keyframes: bodies walk, swing, and tilt
-  their heads, but there is no jump, fall, sneak, swim, hurt-recoil or death
-  animation, and the first-person hand shows the item without an arm behind it.
-  Hook: more cases in `Rig.pose` and `Viewmodel.update`, which already receive
-  everything they would need.
+- Animation is procedural posing, not keyframes: bodies walk, swing, aim and
+  tilt their heads, but there is no jump, fall, sneak, swim, hurt-recoil or
+  death animation, and the first-person hand shows the item without an arm
+  behind it. Hook: more cases in `Rig.pose` and `Viewmodel.update`, which
+  already receive everything they would need.
+- Mob arrows are simulated server-side while *player* arrows stay client-side
+  (latency-compensated on the shooter's machine, hits reported). Two systems
+  for one concept; unifying them means moving player arrows into
+  `RoomSimulation` and giving up the local prediction that makes a bow feel
+  responsive. Hook: `ArrowSim` already models everything a player arrow needs.
 - Culled meshing, not greedy merging; fine at default view distance.
   TODO hook: `buildChunkGeometry` in `world/mesher.ts`.
 - Chunk generation/meshing runs on the main thread under a time budget.

@@ -19,7 +19,23 @@ import {
   START_TIME_OF_DAY,
 } from '../constants.ts';
 import { Block } from '../blocks.ts';
-import { DropSim, MobSim, isNightTime, type SimPlayer } from './mobsim.ts';
+import {
+  ArrowSim,
+  DropSim,
+  MobSim,
+  SKELETON_DRAW_S,
+  isNightTime,
+  type MobKind,
+  type SimPlayer,
+} from './mobsim.ts';
+import { MOB_KIND_PIG, MOB_KIND_SKELETON, MOB_KIND_ZOMBIE } from '../net/protocol.ts';
+
+/** Mob kinds are sent as small ints; this is the only place they are mapped. */
+const MOB_KIND_ON_WIRE: Record<MobKind, number> = {
+  zombie: MOB_KIND_ZOMBIE,
+  pig: MOB_KIND_PIG,
+  skeleton: MOB_KIND_SKELETON,
+};
 import type { BlockQuery, Vec3 } from './voxel.ts';
 
 /** What a simulation needs from a world: block lookups plus a spawn probe. */
@@ -33,6 +49,10 @@ export interface SimWorld extends BlockQuery {
 }
 
 const MAX_HOSTILE = 12;
+/** Fraction of night spawns that are archers rather than zombies. */
+const SKELETON_SHARE = 0.35;
+/** Mob arrows in flight at once, so a pack of skeletons cannot flood the wire. */
+const MAX_ARROWS = 40;
 const MAX_PASSIVE = 10;
 const MAX_DROPS = 120;
 /** Drops vanish after this long, like Minecraft's 5-minute despawn. */
@@ -57,10 +77,13 @@ export class RoomSimulation {
   readonly world: SimWorld;
   readonly mobs = new Map<number, MobSim>();
   readonly drops = new Map<number, DropSim>();
+  /** Arrows fired by mobs. Player arrows stay client-side; see ArrowSim. */
+  readonly arrows = new Map<number, ArrowSim>();
   timeOfDay = START_TIME_OF_DAY;
   /** Ids removed since the last drain, so clients can delete them. */
   readonly removedMobs: number[] = [];
   readonly removedDrops: number[] = [];
+  readonly removedArrows: number[] = [];
   /**
    * Where mobs died since the last drain. Removal alone doesn't say why — a
    * mob can also despawn — so deaths are reported separately for the sound.
@@ -84,6 +107,11 @@ export class RoomSimulation {
       onPlayerHit: (id: string, damage: number, fromX: number, fromZ: number) =>
         this.hooks.damagePlayer(id, damage, fromX, fromZ),
       onMobDied: () => {},
+      onMobShoot: (from: Vec3, dir: Vec3, speed: number, damage: number, shooterId: number) => {
+        if (this.arrows.size >= MAX_ARROWS) return;
+        const arrow = new ArrowSim(from, dir, speed, damage, shooterId);
+        this.arrows.set(arrow.id, arrow);
+      },
     };
 
     for (const mob of this.mobs.values()) {
@@ -91,6 +119,7 @@ export class RoomSimulation {
     }
 
     this.reapMobs(players);
+    this.updateArrows(dt, players);
     this.updateDrops(dt, players);
 
     this.spawnTimer -= dt;
@@ -100,6 +129,20 @@ export class RoomSimulation {
     }
 
     this.world.evict?.(players.map((p) => p.position));
+  }
+
+  /** Fly every mob arrow, and apply what it hits. */
+  private updateArrows(dt: number, players: SimPlayer[]): void {
+    for (const [id, arrow] of [...this.arrows]) {
+      const hit = arrow.update(dt, this.world, players);
+      if (hit) {
+        this.hooks.damagePlayer(hit.id, arrow.damage, arrow.position.x, arrow.position.z);
+      }
+      if (arrow.dead) {
+        this.arrows.delete(id);
+        this.removedArrows.push(id);
+      }
+    }
   }
 
   private reapMobs(players: SimPlayer[]): void {
@@ -197,12 +240,17 @@ export class RoomSimulation {
 
   private trySpawn(players: SimPlayer[]): void {
     if (players.length === 0 || this.mobs.size >= MAX_MOBS) return;
-    const hostile = isNightTime(this.timeOfDay);
-    let existing = 0;
+    const night = isNightTime(this.timeOfDay);
+    let hostiles = 0;
+    let passives = 0;
     for (const mob of this.mobs.values()) {
-      if ((mob.kind === 'zombie') === hostile) existing++;
+      if (mob.kind === 'pig') passives++;
+      else hostiles++;
     }
-    if (existing >= (hostile ? MAX_HOSTILE : MAX_PASSIVE)) return;
+    if (night ? hostiles >= MAX_HOSTILE : passives >= MAX_PASSIVE) return;
+    // Night is a mix: mostly zombies, with skeletons often enough that ranged
+    // pressure is a real part of being caught outside after dark.
+    const kind = night ? (Math.random() < SKELETON_SHARE ? 'skeleton' : 'zombie') : 'pig';
 
     // Spawn in a ring around a random player, on real ground.
     const anchor = players[Math.floor(Math.random() * players.length)];
@@ -218,7 +266,7 @@ export class RoomSimulation {
       const ground = this.world.getBlock(x, y - 1, z);
       if (ground === Block.Water || ground === Block.Leaves) continue;
 
-      const mob = new MobSim(hostile ? 'zombie' : 'pig', x + 0.5, y, z + 0.5);
+      const mob = new MobSim(kind, x + 0.5, y, z + 0.5);
       this.mobs.set(mob.id, mob);
       return;
     }
@@ -226,20 +274,40 @@ export class RoomSimulation {
 
   /** Compact snapshots for the wire. */
   mobSnapshot(): {
-    i: number; k: number; x: number; y: number; z: number; yaw: number; hp: number; s?: 1;
+    i: number; k: number; x: number; y: number; z: number; yaw: number; hp: number;
+    s?: 1; d?: number;
   }[] {
     const out = [];
     for (const mob of this.mobs.values()) {
       out.push({
         i: mob.id,
-        k: mob.kind === 'pig' ? 1 : 0,
+        k: MOB_KIND_ON_WIRE[mob.kind],
         x: round(mob.position.x),
         y: round(mob.position.y),
         z: round(mob.position.z),
         yaw: round(mob.yaw),
         hp: Math.max(0, Math.round(mob.health)),
-        // Only present mid-swing, so idle mobs add nothing to the packet.
+        // Both only present when they apply, so an idle mob adds nothing.
         ...(mob.swingTime > 0 ? { s: 1 as const } : {}),
+        ...(mob.drawTime > 0
+          ? { d: round(Math.min(1, mob.drawTime / SKELETON_DRAW_S)) }
+          : {}),
+      });
+    }
+    return out;
+  }
+
+  /** Arrows in flight, so every client sees the same shot from the same place. */
+  arrowSnapshot(): { i: number; x: number; y: number; z: number; yaw: number; pitch: number }[] {
+    const out = [];
+    for (const arrow of this.arrows.values()) {
+      out.push({
+        i: arrow.id,
+        x: round(arrow.position.x),
+        y: round(arrow.position.y),
+        z: round(arrow.position.z),
+        yaw: round(arrow.yaw),
+        pitch: round(arrow.pitch),
       });
     }
     return out;

@@ -6,12 +6,22 @@
 // positions directly with no added latency.
 
 import * as THREE from 'three';
-import { INTERPOLATION_DELAY_MS, MOB_KIND_PIG, type DropStateData, type MobStateData } from '../net/protocol';
+import {
+  INTERPOLATION_DELAY_MS,
+  MOB_KIND_PIG,
+  MOB_KIND_SKELETON,
+  type ArrowStateData,
+  type DropStateData,
+  type MobStateData,
+} from '../net/protocol';
 import {
   PIG_SEGMENTS,
   Rig,
+  SKELETON_BOW_SEGMENTS,
+  SKELETON_SEGMENTS,
   WALK_PHASE_PER_BLOCK,
   ZOMBIE_SEGMENTS,
+  buildBoxGeometry,
   getMobHurtMaterial,
   getMobMaterial,
 } from '../entities/models';
@@ -28,7 +38,11 @@ const ATTACK_POSE_MS = 300;
 const MOB_SHAPES = {
   pig: { halfWidth: 0.45, height: 0.9 },
   zombie: { halfWidth: 0.3, height: 1.95 },
+  skeleton: { halfWidth: 0.3, height: 1.95 },
 } as const;
+
+/** How far the bowstring is pulled back at full draw, in blocks. */
+const BOW_PULL = 0.22;
 
 interface Snapshot {
   time: number;
@@ -108,23 +122,43 @@ export class MobView extends Interpolated {
   private walkAmount = 0;
   private readonly lastRendered = new THREE.Vector3();
   private hasRendered = false;
+  /** The bow, when this mob carries one. Parented to the arms segment. */
+  private bow: Rig | null = null;
+  /** Latest reported bow draw, 0..1. */
+  private draw = 0;
 
   constructor(state: MobStateData, articulated: boolean) {
     super();
     this.id = state.i;
     this.kind = state.k;
     const isPig = state.k === MOB_KIND_PIG;
-    const shape = isPig ? MOB_SHAPES.pig : MOB_SHAPES.zombie;
+    const isSkeleton = state.k === MOB_KIND_SKELETON;
+    const shape = isPig
+      ? MOB_SHAPES.pig
+      : isSkeleton
+        ? MOB_SHAPES.skeleton
+        : MOB_SHAPES.zombie;
     this.halfWidth = shape.halfWidth;
     this.height = shape.height;
     this.health = state.hp;
     this.previousHp = state.hp;
     this.rig = new Rig(
-      isPig ? 'pig' : 'zombie',
-      isPig ? PIG_SEGMENTS : ZOMBIE_SEGMENTS,
+      isPig ? 'pig' : isSkeleton ? 'skeleton' : 'zombie',
+      isPig ? PIG_SEGMENTS : isSkeleton ? SKELETON_SEGMENTS : ZOMBIE_SEGMENTS,
       articulated,
     );
     this.object = this.rig.group;
+
+    // A skeleton carries a bow in the hands the arms rig moves, so parenting it
+    // to that segment makes it follow the aim for free.
+    if (isSkeleton) {
+      this.bow = new Rig('skeleton-bow', SKELETON_BOW_SEGMENTS, articulated);
+      this.bow.group.position.set(0, -0.52, 0.22);
+      this.bow.group.rotation.y = Math.PI / 2;
+      const hands = this.rig.segments.get('arms');
+      if (hands) hands.add(this.bow.group);
+      else this.rig.group.add(this.bow.group); // merged rig: still show the bow
+    }
     this.object.visible = false;
   }
 
@@ -136,6 +170,9 @@ export class MobView extends Interpolated {
     // The simulation reports a swing; hold the pose long enough to be seen
     // even when it lands between two snapshots.
     if (state.s) this.attackUntil = Math.max(this.attackUntil, now + ATTACK_POSE_MS);
+    // The draw is a level, not an event: it arrives on every snapshot while the
+    // bow is bent and is simply absent once it is loosed.
+    this.draw = state.d ?? 0;
     if (direct) this.set(state.x, state.y, state.z, state.yaw);
     else this.push(state.x, state.y, state.z, state.yaw, now);
   }
@@ -162,7 +199,15 @@ export class MobView extends Interpolated {
     this.hasRendered = true;
 
     const attack = now < this.attackUntil ? 1 - (this.attackUntil - now) / ATTACK_POSE_MS : 0;
-    this.rig.pose(this.walkPhase, this.walkAmount, attack);
+    // A drawn bow outranks a swing: an archer mid-draw is not also punching.
+    this.rig.pose(this.walkPhase, this.walkAmount, this.draw > 0 ? 0 : attack, 0, this.draw);
+    if (this.bow) {
+      // Pull the string back as the draw builds, and let it snap forward on
+      // release — the visible difference between aiming and having fired.
+      const nock = this.bow.segments.get('arms');
+      if (nock) nock.position.z = -this.draw * BOW_PULL;
+      this.bow.group.visible = true;
+    }
 
     // Swap materials only on the frames the flash starts or ends.
     const hurt = now < this.hurtUntil;
@@ -174,6 +219,7 @@ export class MobView extends Interpolated {
 
   /** Take over another view's interpolation state, so a rebuild does not jump. */
   adopt(previous: MobView): void {
+    this.draw = previous.draw;
     this.snapshots.push(...previous.snapshots);
     this.position.copy(previous.position);
     this.yaw = previous.yaw;
@@ -250,9 +296,56 @@ export class DropView extends Interpolated {
   }
 }
 
+let arrowGeometry: THREE.BufferGeometry | null = null;
+
+/** Shaft, head and fletching, modelled along +Z so it can be aimed directly. */
+function getArrowGeometry(): THREE.BufferGeometry {
+  if (!arrowGeometry) {
+    arrowGeometry = buildBoxGeometry([
+      { pos: [0, 0, 0], size: [0.05, 0.05, 0.72], color: 0x9a6b3f },
+      { pos: [0, 0, 0.4], size: [0.08, 0.08, 0.14], color: 0xc9c9c9 },
+      { pos: [0, 0, -0.28], size: [0.015, 0.14, 0.18], color: 0xeeeeee },
+      { pos: [0, 0, -0.28], size: [0.14, 0.015, 0.18], color: 0xeeeeee },
+    ]);
+  }
+  return arrowGeometry;
+}
+
 /**
- * Owns every mob and dropped item in the scene, whether they come from the
- * server or the local simulation.
+ * An arrow fired by a mob. Unlike a player's arrow — which is a local effect on
+ * the shooter's machine — this one is simulated by whoever owns the world, so
+ * every client sees the same shot on the same path.
+ */
+export class ArrowView extends Interpolated {
+  readonly mesh: THREE.Mesh;
+  readonly id: number;
+  private pitch = 0;
+
+  constructor(state: ArrowStateData) {
+    super();
+    this.id = state.i;
+    this.mesh = new THREE.Mesh(getArrowGeometry(), getMobMaterial());
+    this.mesh.visible = false;
+  }
+
+  apply(state: ArrowStateData, now: number, direct: boolean): void {
+    this.pitch = state.pitch;
+    if (direct) this.set(state.x, state.y, state.z, state.yaw);
+    else this.push(state.x, state.y, state.z, state.yaw, now);
+  }
+
+  render(now: number, direct: boolean): void {
+    if (!direct && !this.interpolate(now)) return;
+    this.mesh.position.copy(this.position);
+    // YXZ so pitch tilts the shaft without rolling it.
+    this.mesh.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
+    this.mesh.visible = true;
+  }
+}
+
+/**
+ * Owns every mob, dropped item and mob arrow in the scene, whether they come
+ * from the server or the local simulation.
  */
 export class WorldView {
   /** True in singleplayer: render exactly what the simulation says, now. */
@@ -260,6 +353,7 @@ export class WorldView {
 
   private readonly mobs = new Map<number, MobView>();
   private readonly drops = new Map<number, DropView>();
+  private readonly arrows = new Map<number, ArrowView>();
   private readonly scene: THREE.Scene;
   /** Whether new mobs get swinging limbs; see setArticulated. */
   private articulated = true;
@@ -299,6 +393,35 @@ export class WorldView {
       }
       mob.apply(state, now, this.direct);
     }
+  }
+
+  applyArrows(states: ArrowStateData[], now: number): void {
+    for (const state of states) {
+      let arrow = this.arrows.get(state.i);
+      if (!arrow) {
+        arrow = new ArrowView(state);
+        this.arrows.set(state.i, arrow);
+        this.scene.add(arrow.mesh);
+      }
+      arrow.apply(state, now, this.direct);
+    }
+  }
+
+  removeArrows(ids: number[]): void {
+    for (const id of ids) {
+      const arrow = this.arrows.get(id);
+      if (!arrow) continue;
+      this.scene.remove(arrow.mesh);
+      this.arrows.delete(id);
+    }
+  }
+
+  retainArrows(liveIds: Set<number>): void {
+    for (const id of [...this.arrows.keys()]) if (!liveIds.has(id)) this.removeArrows([id]);
+  }
+
+  get arrowCount(): number {
+    return this.arrows.size;
   }
 
   applyDrops(states: DropStateData[], now: number): void {
@@ -344,6 +467,7 @@ export class WorldView {
   update(now: number, dt: number): void {
     for (const mob of this.mobs.values()) mob.render(now, dt, this.direct);
     for (const drop of this.drops.values()) drop.render(now, dt, this.direct);
+    for (const arrow of this.arrows.values()) arrow.render(now, this.direct);
   }
 
   /** Nearest mob under the ray, for melee and arrows. */
@@ -376,6 +500,7 @@ export class WorldView {
   clear(): void {
     this.removeMobs([...this.mobs.keys()]);
     this.removeDrops([...this.drops.keys()]);
+    this.removeArrows([...this.arrows.keys()]);
   }
 }
 

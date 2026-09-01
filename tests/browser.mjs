@@ -430,6 +430,118 @@ try {
     await context.close();
   });
 
+  await testCase('a skeleton aims its bow, fires, and the arrow hurts you', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    // A flat lit arena, so line of sight is clear and nothing else interferes.
+    const at = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.getLocalSim().timeOfDay = 0.5;
+      v.autoQuality?.disable();
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -12; dx <= 12; dx++) {
+        for (let dz = -16; dz <= 6; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, 3);
+          for (let dy = 0; dy < 6; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      v.look.yaw = 0;
+      v.look.pitch = -0.05;
+      return { bx, by, bz };
+    });
+    await sleep(1200);
+
+    const id = await page.evaluate(
+      (a) => window.__voxel.spawnTestMob('skeleton', a.bx + 0.5, a.by, a.bz - 8),
+      at,
+    );
+    assert.ok(id, 'the test skeleton was not spawned');
+
+    // Watch a full draw / fire / reload cycle from the client's point of view.
+    let peakDraw = 0;
+    let sawArrow = false;
+    let armsRaisedAtFullDraw = null;
+    const health = [];
+    for (let i = 0; i < 260; i++) {
+      await sleep(45);
+      const s = await page.evaluate((mobId) => {
+        const v = window.__voxel;
+        const view = v.getWorldView();
+        const mob = view.allMobs.find((m) => m.id === mobId);
+        const arms = mob && mob.rig.segments.get('arms');
+        return {
+          draw: v.getLocalSim().mobs.get(mobId)?.drawTime ?? 0,
+          arrows: view.arrowCount,
+          arms: arms ? arms.rotation.x : null,
+          kind: mob ? mob.kind : null,
+          health: v.survival.health,
+        };
+      }, id);
+      health.push(s.health);
+      if (s.draw > peakDraw) peakDraw = s.draw;
+      if (s.draw > 0.85 && s.arms !== null) armsRaisedAtFullDraw = s.arms;
+      if (s.arrows > 0) sawArrow = true;
+      if (sawArrow && armsRaisedAtFullDraw !== null && s.health < 20) break;
+    }
+
+    assert.ok(peakDraw > 0.85, `the bow was never fully drawn (peak ${peakDraw.toFixed(2)}s)`);
+    assert.ok(
+      armsRaisedAtFullDraw !== null && armsRaisedAtFullDraw < -1,
+      `the arms did not raise to aim (got ${armsRaisedAtFullDraw})`,
+    );
+    assert.ok(sawArrow, 'no arrow was ever rendered in the world');
+    assert.ok(
+      health[health.length - 1] < 20,
+      'a skeleton that lands arrows must actually hurt the player',
+    );
+
+    // The arrow is a real world entity, not a client-side effect.
+    const kind = await page.evaluate(
+      (mobId) => window.__voxel.getWorldView().allMobs.find((m) => m.id === mobId)?.kind,
+      id,
+    );
+    assert.equal(kind, 2, 'the skeleton should render as its own mob kind');
+    await context.close();
+  });
+
+  await testCase('a skeleton keeps its distance rather than closing to melee', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    const at = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.getLocalSim().timeOfDay = 0.5;
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -12; dx <= 12; dx++) {
+        for (let dz = -12; dz <= 12; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, 3);
+          for (let dy = 0; dy < 6; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      return { bx, by, bz };
+    });
+    await sleep(1200);
+
+    // Spawn it right on top of the player: an archer should back away.
+    const id = await page.evaluate(
+      (a) => window.__voxel.spawnTestMob('skeleton', a.bx + 1.5, a.by, a.bz),
+      at,
+    );
+    await sleep(4000);
+    const distance = await page.evaluate((mobId) => {
+      const v = window.__voxel;
+      const mob = v.getLocalSim().mobs.get(mobId);
+      if (!mob) return -1;
+      return Math.hypot(mob.position.x - v.player.position.x, mob.position.z - v.player.position.z);
+    }, id);
+    assert.ok(distance > 3, `the archer closed to ${distance.toFixed(1)} blocks instead of backing off`);
+    await context.close();
+  });
+
   // --- Multiplayer: three real tabs, one of them "mobile" ---
   await testCase('three players share one world across desktop and mobile', async () => {
     const host = await openGame(browser);

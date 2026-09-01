@@ -1,7 +1,8 @@
 // Procedural texture atlas: 16x16-pixel tiles drawn onto one canvas at startup,
 // so the game ships with zero image assets. Block tiles are generated from
-// noise; item icons are 8x8 pixel-art sprite maps scaled 2x. Nearest-filtered
-// for the classic look.
+// noise; item icons are pixel-art sprite maps, drawn at native 16x16 where the
+// detail earns it and 8x8 upscaled where it does not, then outlined and
+// shaded automatically (see drawSprite). Nearest-filtered for the classic look.
 
 import * as THREE from 'three';
 import { Tile } from './blocks.ts';
@@ -71,6 +72,7 @@ export const ItemTile = {
   Leather: 61,
   String: 62,
   Flint: 63,
+  Bone: 74,
 } as const;
 export type ItemTile = (typeof ItemTile)[keyof typeof ItemTile];
 
@@ -116,9 +118,28 @@ function fillSpeckled(
   ctx.putImageData(img, ox, oy);
 }
 
+/** How much darker the automatic outline is than the pixel it borders. */
+const OUTLINE_DARKEN = 0.34;
+/** Lightening on an upper-left edge, darkening on a lower-right one. */
+const EDGE_LIGHT = 1.22;
+const EDGE_SHADE = 0.78;
+
 /**
- * Draw an 8x8 sprite map scaled 2x into a tile. Characters index `palette`;
- * '.' (or any unmapped char) leaves the pixel fully transparent.
+ * Draw a sprite map into a tile. Rows may be 16 characters wide (drawn at
+ * native resolution) or 8 (scaled 2x). Characters index `palette`; '.' or any
+ * unmapped character leaves the pixel transparent.
+ *
+ * Two passes run over the result, which is what separates a readable icon from
+ * a flat blob of colour, and what the shapes below are drawn to rely on:
+ *
+ *   outline — every transparent pixel touching the sprite becomes a darkened
+ *             version of its neighbour, so an icon reads against any
+ *             background instead of dissolving into it.
+ *   edges   — pixels on an upper-left boundary lighten, lower-right darken,
+ *             giving each shape a consistent light direction and some relief.
+ *
+ * Doing both here rather than by hand means every sprite gets them, including
+ * ones added later, and the shape maps stay legible as shapes.
  */
 function drawSprite(
   ctx: CanvasRenderingContext2D,
@@ -128,56 +149,115 @@ function drawSprite(
 ): void {
   const [ox, oy] = tileOrigin(tile);
   const img = ctx.createImageData(TILE_PX, TILE_PX);
+  const native = rows.length >= TILE_PX;
+  const at = (px: number, py: number): RGB | undefined => {
+    const row = native ? rows[py] : rows[py >> 1];
+    const ch = (native ? row?.[px] : row?.[px >> 1]) ?? '.';
+    return palette[ch];
+  };
+  const solid = (px: number, py: number): boolean =>
+    px >= 0 && py >= 0 && px < TILE_PX && py < TILE_PX && at(px, py) !== undefined;
+
+  const put = (px: number, py: number, rgb: RGB, scale: number): void => {
+    const i = (py * TILE_PX + px) * 4;
+    img.data[i] = Math.max(0, Math.min(255, rgb[0] * scale));
+    img.data[i + 1] = Math.max(0, Math.min(255, rgb[1] * scale));
+    img.data[i + 2] = Math.max(0, Math.min(255, rgb[2] * scale));
+    img.data[i + 3] = 255;
+  };
+
   for (let py = 0; py < TILE_PX; py++) {
     for (let px = 0; px < TILE_PX; px++) {
-      const ch = rows[py >> 1]?.[px >> 1] ?? '.';
-      const rgb = palette[ch];
-      const i = (py * TILE_PX + px) * 4;
-      if (!rgb) {
-        img.data[i + 3] = 0;
+      const rgb = at(px, py);
+      if (rgb) {
+        // Relief: an exposed top or left edge catches the light; an exposed
+        // bottom or right edge falls into shadow.
+        const lit = !solid(px, py - 1) || !solid(px - 1, py);
+        const shaded = !solid(px, py + 1) || !solid(px + 1, py);
+        put(px, py, rgb, lit && !shaded ? EDGE_LIGHT : shaded && !lit ? EDGE_SHADE : 1);
         continue;
       }
-      // Slight top-left lighting so icons read as 3D rather than flat.
-      const shade = 1 - ((px >> 1) + (py >> 1)) * 0.012;
-      img.data[i] = Math.min(255, rgb[0] * shade);
-      img.data[i + 1] = Math.min(255, rgb[1] * shade);
-      img.data[i + 2] = Math.min(255, rgb[2] * shade);
-      img.data[i + 3] = 255;
+      // Outline: borrow the colour of whichever neighbour we are touching.
+      const neighbour =
+        at(px, py - 1) ?? at(px, py + 1) ?? at(px - 1, py) ?? at(px + 1, py) ??
+        at(px - 1, py - 1) ?? at(px + 1, py - 1) ?? at(px - 1, py + 1) ?? at(px + 1, py + 1);
+      if (neighbour && px < TILE_PX && py < TILE_PX) {
+        put(px, py, neighbour, OUTLINE_DARKEN);
+      } else {
+        img.data[(py * TILE_PX + px) * 4 + 3] = 0;
+      }
     }
   }
   ctx.putImageData(img, ox, oy);
 }
 
-// --- Sprite shapes (S = stick/handle, H = head material, D = darker shade) ---
+// --- Sprite shapes ---------------------------------------------------------
+//
+// Palette characters, used consistently across every shape:
+//   H  the item's main material      L  its light/edge highlight
+//   D  its dark shade                S  stick/handle light   s  handle dark
+//   F  fletching                     .  transparent
+//
+// Tools and weapons are drawn at the tile's native 16x16 — four times the
+// detail of an upscaled 8x8 map, which is what lets a pickaxe head actually
+// look forged rather than like a staircase. Outlines and relief are added by
+// drawSprite, so none of these maps draw their own.
+
 const PICKAXE = [
-  '.HHHHH..',
-  'HH...HH.',
-  'H..S..H.',
-  '...S....',
-  '..S.....',
-  '.S......',
-  'S.......',
-  '........',
+  '................',
+  '....LLLLLLLL....',
+  '...LHHHHHHHHL...',
+  '...LH......HL...',
+  '...HH..Ss..HH...',
+  '.......Ss.......',
+  '......Ss........',
+  '......Ss........',
+  '.....Ss.........',
+  '.....Ss.........',
+  '....Ss..........',
+  '....Ss..........',
+  '...Ss...........',
+  '...Ss...........',
+  '................',
+  '................',
 ];
 const SWORD = [
-  '.....HH.',
-  '....HHH.',
-  '...HHH..',
-  '..HHH...',
-  '.DHH....',
-  '.DD.....',
-  'SD......',
-  'SS......',
+  '................',
+  '............LL..',
+  '...........LHL..',
+  '..........LHHL..',
+  '.........LHHL...',
+  '........LHHL....',
+  '.......LHHL.....',
+  '......LHHL......',
+  '.....LHHL.......',
+  '....LHHL........',
+  '..DDDHD.........',
+  '..DDsDD.........',
+  '....Ss..........',
+  '...Ss...........',
+  '..Ss............',
+  '................',
 ];
+// A wedge, not a ball: the cutting edge runs down the left and the head
+// tapers into the haft, which is what tells an axe from a hammer at 16px.
 const AXE = [
-  '.HHH....',
-  'HHHHH...',
-  'HH.HH...',
-  'H..S....',
-  '...S....',
-  '..S.....',
-  '.S......',
-  'S.......',
+  '................',
+  '....LLLL........',
+  '...LHHHHL.......',
+  '..LHHHHHHL......',
+  '..LHHHHHHHSs....',
+  '..LHHHHHHSs.....',
+  '..LHHHHHSs......',
+  '...LHHHSs.......',
+  '....LHSs........',
+  '......Ss........',
+  '.....Ss.........',
+  '.....Ss.........',
+  '....Ss..........',
+  '....Ss..........',
+  '...Ss...........',
+  '................',
 ];
 const LUMP = [
   '........',
@@ -260,25 +340,62 @@ const BOOTS = [
   'HHH..HHH',
   'HHHHHHHH',
 ];
+// A bow is a crescent and a chord, not a ring: the wooden limb curves down the
+// left only, and the string is the single straight line joining its two tips.
+// Wood on both sides closes the shape and it stops reading as a bow at all.
 const BOW = [
-  '.....HH.',
-  '...HH..H',
-  '..H.S..H',
-  '..H..S.H',
-  '..H.S..H',
-  '...HH..H',
-  '.....HH.',
-  '........',
+  '................',
+  '........HHH.....',
+  '......HH...H....',
+  '.....HH.....S...',
+  '....HH......S...',
+  '....H.......S...',
+  '...HH.......S...',
+  '...H........S...',
+  '...H........S...',
+  '...HH.......S...',
+  '....H.......S...',
+  '....HH......S...',
+  '.....HH.....S...',
+  '......HH...H....',
+  '........HHH.....',
+  '................',
 ];
 const ARROW = [
-  '......DH',
-  '.....DHD',
-  '....DS..',
-  '...DS...',
-  '..FS....',
-  '.FFS....',
-  'FF......',
-  '........',
+  '................',
+  '...........LLL..',
+  '..........LHHL..',
+  '.........LHHD...',
+  '.........Ss.....',
+  '........Ss......',
+  '.......Ss.......',
+  '......Ss........',
+  '.....Ss.........',
+  '....Ss..........',
+  '...FFs..........',
+  '..FFF...........',
+  '.FFF............',
+  '.FF.............',
+  '................',
+  '................',
+];
+const BONE = [
+  '................',
+  '...........HH...',
+  '..........HHHH..',
+  '..........HHHH..',
+  '.........HHHH...',
+  '........HHH.....',
+  '.......HHH......',
+  '......HHH.......',
+  '.....HHH........',
+  '....HHH.........',
+  '...HHHH.........',
+  '..HHHH..........',
+  '..HHHH..........',
+  '...HH...........',
+  '................',
+  '................',
 ];
 const HIDE = [
   '........',
@@ -311,14 +428,22 @@ const FLINT = [
   '........',
 ];
 const SHIELD = [
-  '.HHHHHH.',
-  '.HDDDDH.',
-  '.HDSSDH.',
-  '.HDSSDH.',
-  '.HDDDDH.',
-  '..HDDH..',
-  '...HH...',
-  '........',
+  '................',
+  '...LLLLLLLLLL...',
+  '...LHHHHHHHHL...',
+  '...LHDDDDDDHL...',
+  '...LHDSSSSDHL...',
+  '...LHDSSSSDHL...',
+  '...LHDSSSSDHL...',
+  '...LHDDDDDDHL...',
+  '...LHHHHHHHHL...',
+  '....LHHHHHHL....',
+  '.....LHHHHL.....',
+  '......LHHL......',
+  '.......LL.......',
+  '................',
+  '................',
+  '................',
 ];
 
 const STICK_COLOR: RGB = [122, 88, 51];
@@ -537,10 +662,13 @@ function buildAtlas(): HTMLCanvasElement {
   // --- Item icons ---
   const tool = (tile: number, shape: string[], tier: keyof typeof TIER_COLORS): void => {
     const head = TIER_COLORS[tier];
+    const scale = (c: RGB, k: number): RGB => [c[0] * k, c[1] * k, c[2] * k];
     drawSprite(ctx, tile, shape, {
       H: head,
-      D: [head[0] * 0.7, head[1] * 0.7, head[2] * 0.7],
+      L: scale(head, 1.18),
+      D: scale(head, 0.7),
       S: STICK_COLOR,
+      s: scale(STICK_COLOR, 0.74),
     });
   };
   tool(ItemTile.WoodenPickaxe, PICKAXE, 'wood');
@@ -578,17 +706,20 @@ function buildAtlas(): HTMLCanvasElement {
   drawSprite(ctx, ItemTile.RottenFlesh, MEAT, { H: [130, 110, 72], D: [96, 80, 52] });
 
   // Bow, arrow and shield.
-  drawSprite(ctx, ItemTile.Bow, BOW, { H: [154, 107, 63], S: [225, 225, 210] });
+  drawSprite(ctx, ItemTile.Bow, BOW, {
+    H: [154, 107, 63], L: [186, 134, 82], D: [110, 76, 44], S: [231, 231, 218],
+  });
   drawSprite(ctx, ItemTile.Arrow, ARROW, {
     H: [190, 190, 190], D: [140, 140, 140], S: STICK_COLOR, F: [235, 235, 235],
   });
   drawSprite(ctx, ItemTile.Shield, SHIELD, {
-    H: [122, 84, 46], D: [154, 107, 63], S: [200, 200, 200],
+    H: [154, 107, 63], L: [188, 136, 84], D: [110, 76, 44], S: [206, 208, 214],
   });
 
   drawSprite(ctx, ItemTile.Leather, HIDE, { H: [178, 128, 84], D: [148, 102, 64] });
   drawSprite(ctx, ItemTile.String, STRING_SPRITE, { H: [232, 232, 226] });
   drawSprite(ctx, ItemTile.Flint, FLINT, { H: [72, 68, 68], D: [44, 42, 42] });
+  drawSprite(ctx, ItemTile.Bone, BONE, { H: [226, 224, 208] });
 
   drawCrackTiles(ctx);
 

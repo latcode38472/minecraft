@@ -36,7 +36,7 @@ import { BLOCKS } from './blocks';
 import type { EntityContext } from './entities/entity';
 import { EntityManager } from './entities/manager';
 import { RoomSimulation } from './shared/roomsim';
-import { isNightTime, type SimPlayer } from './shared/mobsim';
+import { MobSim, isNightTime, type MobKind, type SimPlayer } from './shared/mobsim';
 import { WorldView } from './game/worldview';
 import { Viewmodel } from './game/viewmodel';
 import { BreakOverlay } from './game/breakoverlay';
@@ -671,11 +671,14 @@ async function boot(choice: StartChoice): Promise<void> {
           sky.timeOfDay = state.time;
           worldView.applyMobs(state.mobs, now);
           worldView.applyDrops(state.drops, now);
+          worldView.applyArrows(state.arrows, now);
           worldView.removeMobs(state.removedMobs);
           worldView.removeDrops(state.removedDrops);
+          worldView.removeArrows(state.removedArrows);
           // Anything absent from a full snapshot is gone.
           worldView.retainMobs(new Set(state.mobs.map((m) => m.i)));
           worldView.retainDrops(new Set(state.drops.map((d) => d.i)));
+          worldView.retainArrows(new Set(state.arrows.map((a) => a.i)));
           playMobDeaths(state.mobDeaths);
         },
         onKnockback: (fromX, fromZ) => knockbackPlayer(fromX, fromZ),
@@ -754,6 +757,17 @@ async function boot(choice: StartChoice): Promise<void> {
         damage,
         selfNetId(),
       ),
+    /**
+     * Put a mob of a given kind at a fixed spot in the local simulation, so a
+     * test can exercise one deterministically instead of waiting for the
+     * spawner to roll it. Singleplayer only; returns its id, or null.
+     */
+    spawnTestMob: (kind: MobKind, x: number, y: number, z: number): number | null => {
+      if (!localSim) return null;
+      const mob = new MobSim(kind, x, y, z);
+      localSim.mobs.set(mob.id, mob);
+      return mob.id;
+    },
     /** Drive one interaction tick with the live camera ray. */
     tickInteraction: (dt: number, mining: boolean, using: boolean, taps: number) => {
       player.eyePosition(eye);
@@ -839,8 +853,10 @@ async function boot(choice: StartChoice): Promise<void> {
       sky.timeOfDay = localSim.timeOfDay;
       worldView.applyMobs(localSim.mobSnapshot(), nowMs);
       worldView.applyDrops(localSim.dropSnapshot(), nowMs);
+      worldView.applyArrows(localSim.arrowSnapshot(), nowMs);
       worldView.removeMobs(localSim.removedMobs.splice(0));
       worldView.removeDrops(localSim.removedDrops.splice(0));
+      worldView.removeArrows(localSim.removedArrows.splice(0));
       playMobDeaths(localSim.mobDeaths.splice(0));
     }
     worldView.update(nowMs, dt);
@@ -917,7 +933,7 @@ async function boot(choice: StartChoice): Promise<void> {
         `pos ${player.position.x.toFixed(1)} ${player.position.y.toFixed(1)} ${player.position.z.toFixed(1)}`,
         `chunk ${Math.floor(player.position.x / CHUNK_SIZE)},${Math.floor(player.position.z / CHUNK_SIZE)}`,
         `chunks ${world.chunks.size} (pending mesh ${world.pendingMeshCount})`,
-        `entities ${entities.entities.length}  mobs ${worldView.mobCount}  drops ${worldView.dropCount}`,
+        `entities ${entities.entities.length}  mobs ${worldView.mobCount}  drops ${worldView.dropCount}  arrows ${worldView.arrowCount}`,
         `hp ${survival.health.toFixed(0)}  food ${survival.hunger.toFixed(1)}`,
         `draw calls ${renderer.info.render.calls}  tris ${renderer.info.render.triangles}`,
         `seed ${seed}  time ${(sky.timeOfDay * 24).toFixed(1)}h ${isNightTime(sky.timeOfDay) ? '(night)' : '(day)'}`,
