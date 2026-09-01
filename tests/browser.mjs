@@ -184,36 +184,52 @@ try {
     const { context, page } = await openGame(browser);
     await startSingleplayer(page);
 
-    // Aim straight down. The look direction comes from the camera, which the
-    // frame loop updates, so give it a frame before mining.
+    // Clear a pocket, floor it with dirt, and aim down at it. Building the
+    // ground rather than trusting the seed keeps the test deterministic.
     const at = await page.evaluate(() => {
       const v = window.__voxel;
       const p = v.player.position;
-      const at = { x: Math.floor(p.x), y: Math.floor(p.y) - 1, z: Math.floor(p.z) };
-      v.world.setBlock(at.x, at.y, at.z, 3); // dirt: quick to break bare-handed
-      v.look.pitch = -Math.PI / 2 + 0.01;
-      return at;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -4; dz <= 0; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, 2); // dirt
+          for (let dy = 0; dy < 4; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      v.look.yaw = 0;
+      v.look.pitch = -0.62;
+      return { x: bx, y: by - 1, z: bz };
     });
-    await sleep(300);
+    await sleep(1200);
+    assert.ok(
+      await page.evaluate(() => Boolean(window.__voxel.interaction.target)),
+      'the crosshair must be on a block before mining can be tested',
+    );
 
-    const mined = await page.evaluate((at) => {
+    // Hold the real mine button, so the game's own loop does the mining.
+    const before = await page.evaluate(() => window.__voxel.getLocalSim().drops.size);
+    await page.evaluate(() =>
+      document.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true })),
+    );
+    const after = await until(
+      page,
+      () => window.__voxel.getLocalSim().drops.size,
+      20000,
+      'a block to break and drop',
+    );
+    await page.evaluate(() =>
+      document.dispatchEvent(new MouseEvent('mouseup', { button: 0, bubbles: true })),
+    );
+    assert.ok(after > before, 'breaking a block must drop an item');
+    assert.ok(at.y > 0, 'sanity: the test built real ground');
+
+    // And the drop must be collectable: step onto it and it goes in the bag.
+    await page.evaluate(() => {
       const v = window.__voxel;
-      // Count in the simulation, not the view: the view only catches up on the
-      // next frame, and these ticks run between frames.
-      const before = v.getLocalSim().drops.size;
-      // 20 simulated seconds: comfortably past dirt's bare-handed break time.
-      for (let i = 0; i < 1200; i++) v.tickInteraction(1 / 60, true, false, 0);
-      return {
-        before,
-        after: v.getLocalSim().drops.size,
-        block: v.world.getBlock(at.x, at.y, at.z),
-      };
-    }, at);
-
-    assert.equal(mined.block, 0, 'the block was not broken');
-    assert.ok(mined.after > mined.before, 'breaking a block must drop an item');
-
-    // And the drop must be collectable: standing on it puts it in the bag.
+      const drop = [...v.getLocalSim().drops.values()][0];
+      v.player.position.set(drop.position.x, drop.position.y, drop.position.z);
+    });
     const collected = await until(
       page,
       () => window.__voxel.inventory.count('dirt'),
@@ -221,6 +237,196 @@ try {
       'the drop to be collected',
     );
     assert.ok(collected > 0, 'walking over a drop must add it to the inventory');
+    await context.close();
+  });
+
+  // --- Animation ---
+  await testCase('the held item is drawn in front of the camera and swings', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    const held = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.inventory.add('diamond_pickaxe', 1);
+      v.inventory.selectSlot(v.inventory.slots.findIndex((s) => s && s.id === 'diamond_pickaxe'));
+      return true;
+    });
+    assert.ok(held);
+    await sleep(300);
+
+    // A pose is only meaningful if there is something to pose.
+    const hasMesh = await page.evaluate(() => Boolean(window.__voxel.viewmodel.mesh));
+    assert.ok(hasMesh, 'holding an item must put a model in front of the camera');
+
+    // A swing must actually move it, then settle back.
+    const rest = await page.evaluate(() => {
+      const h = window.__voxel.viewmodel.holder;
+      return { y: h.position.y, rotX: h.rotation.x };
+    });
+    await page.evaluate(() => window.__voxel.viewmodel.swing());
+    await sleep(90); // mid-stroke
+    const mid = await page.evaluate(() => {
+      const h = window.__voxel.viewmodel.holder;
+      return { y: h.position.y, rotX: h.rotation.x, swinging: window.__voxel.viewmodel.swinging };
+    });
+    assert.ok(mid.swinging, 'the swing should still be running');
+    assert.ok(mid.y > rest.y + 0.05, `the item should rise on a swing: ${rest.y} -> ${mid.y}`);
+    assert.ok(mid.rotX < rest.rotX - 0.3, 'and rotate through the stroke');
+
+    // Poll rather than assume a wall-clock duration: the stroke advances on
+    // frame dt, which runs slower than real time on a struggling renderer.
+    await until(page, () => !window.__voxel.viewmodel.swinging, 8000, 'the stroke to end');
+    await sleep(120);
+    const after = await page.evaluate(() => window.__voxel.viewmodel.holder.position.y);
+    assert.ok(Math.abs(after - rest.y) < 0.05, `the item must return to rest, got ${after}`);
+    await context.close();
+  });
+
+  await testCase('mining swings the arm and cracks the block', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    // Stone underfoot and a slow tool, so the crack stages are observable.
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -4; dz <= 0; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, 3); // stone
+          for (let dy = 0; dy < 4; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      v.look.yaw = 0;
+      v.look.pitch = -0.62;
+    });
+    await sleep(1200);
+
+    // Hold the real mine button: the game's own loop does the mining.
+    await page.evaluate(() =>
+      document.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true })),
+    );
+
+    const stages = new Set();
+    let sawSwing = false;
+    for (let i = 0; i < 120; i++) {
+      await sleep(50);
+      const s = await page.evaluate(() => {
+        const v = window.__voxel;
+        const ov = v.breakOverlay;
+        return {
+          progress: v.interaction.breakProgress,
+          overlayVisible: ov.mesh.visible,
+          tile: ov.currentTile,
+          swinging: v.viewmodel.swinging,
+        };
+      });
+      if (s.swinging) sawSwing = true;
+      if (s.progress > 0 && s.overlayVisible) stages.add(s.tile);
+      if (stages.size >= 4) break;
+    }
+    await page.evaluate(() =>
+      document.dispatchEvent(new MouseEvent('mouseup', { button: 0, bubbles: true })),
+    );
+
+    assert.ok(sawSwing, 'mining must swing the arm, not just fill a progress bar');
+    assert.ok(stages.size >= 4, `cracks should advance through stages, saw ${stages.size}`);
+
+    // Releasing the button clears the cracks.
+    await sleep(300);
+    const cleared = await page.evaluate(() => window.__voxel.breakOverlay.mesh.visible);
+    assert.equal(cleared, false, 'cracks must disappear when you stop mining');
+    await context.close();
+  });
+
+  await testCase('mobs walk with moving legs, and stand still when idle', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    await page.evaluate(() => {
+      window.__voxel.getLocalSim().timeOfDay = 0.8; // night: hostiles that chase
+    });
+    await until(page, () => window.__voxel.getWorldView().mobCount, 40000, 'mobs');
+
+    // Every mob must be built as a rig with independently posable limbs.
+    const rig = await page.evaluate(() => {
+      const mob = window.__voxel.getWorldView().allMobs[0];
+      return {
+        parts: mob.object.children.length,
+        names: [...mob.rig.segments.keys()],
+      };
+    });
+    assert.ok(rig.parts > 1, 'an animated mob is more than one rigid mesh');
+    assert.ok(rig.names.includes('body'), `expected a body segment, got ${rig.names}`);
+
+    // Sample a walking mob's leg over time: it must actually move.
+    const swept = await page.evaluate(async () => {
+      const view = window.__voxel.getWorldView();
+      const angles = [];
+      for (let i = 0; i < 40; i++) {
+        for (const mob of view.allMobs) {
+          const leg = mob.rig.segments.get('legL') ?? mob.rig.segments.get('legsA');
+          if (leg && mob.object.visible) angles.push(leg.rotation.x);
+        }
+        await new Promise((r) => setTimeout(r, 60));
+      }
+      return { min: Math.min(...angles), max: Math.max(...angles), n: angles.length };
+    });
+    assert.ok(swept.n > 0, 'no mob was visible to sample');
+    assert.ok(
+      swept.max - swept.min > 0.15,
+      `mob legs barely moved over 2.4s (range ${(swept.max - swept.min).toFixed(3)})`,
+    );
+    await context.close();
+  });
+
+  await testCase('dropping limb animation keeps mobs on screen and cheap', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    await page.evaluate(() => {
+      window.__voxel.getLocalSim().timeOfDay = 0.8;
+    });
+    await until(page, () => window.__voxel.getWorldView().mobCount, 40000, 'mobs');
+
+    const before = await page.evaluate(() => {
+      const view = window.__voxel.getWorldView();
+      return {
+        mobs: view.mobCount,
+        parts: view.allMobs.reduce((n, m) => n + m.object.children.length, 0),
+      };
+    });
+
+    // This is what the quality ladder does on a struggling device.
+    await page.evaluate(() => window.__voxel.setAnimatedLimbs(false));
+    await sleep(600);
+
+    const after = await page.evaluate(() => {
+      const view = window.__voxel.getWorldView();
+      return {
+        mobs: view.mobCount,
+        parts: view.allMobs.reduce((n, m) => n + m.object.children.length, 0),
+        visible: view.allMobs.filter((m) => m.object.visible).length,
+        viewmodel: window.__voxel.viewmodel.enabled,
+      };
+    });
+
+    assert.equal(after.mobs, before.mobs, 'no mob may be lost when limbs are dropped');
+    assert.ok(after.parts < before.parts, 'and the draw-call count must actually fall');
+    assert.equal(after.parts, after.mobs, 'a merged mob is exactly one mesh');
+    assert.ok(after.visible > 0, 'mobs must still be rendered, just not animated');
+    assert.equal(after.viewmodel, false, 'the held-item pass is dropped too');
+
+    // And it must come back.
+    await page.evaluate(() => window.__voxel.setAnimatedLimbs(true));
+    await sleep(600);
+    const restored = await page.evaluate(() => {
+      const view = window.__voxel.getWorldView();
+      return {
+        parts: view.allMobs.reduce((n, m) => n + m.object.children.length, 0),
+        mobs: view.mobCount,
+      };
+    });
+    assert.ok(restored.parts > restored.mobs, 'limbs must come back when the device recovers');
     await context.close();
   });
 
@@ -381,6 +587,107 @@ try {
     } finally {
       await host.context.close();
       await guest.context.close();
+    }
+  });
+
+  await testCase('another player\'s walking and swinging is visible across the wire', async () => {
+    const host = await openGame(browser);
+    // The watcher is a phone, so this also covers PC -> mobile animation.
+    const phone = await openGame(browser, { mobile: true });
+
+    try {
+      await host.page.click('#mode-multi');
+      await host.page.fill('#mp-name', 'Walker');
+      await host.page.click('#mp-create');
+      await host.page.waitForSelector('#mp-lobby-code:not(:empty)');
+      const code = (await host.page.textContent('#mp-lobby-code')).trim();
+
+      await phone.page.click('#mode-multi');
+      await phone.page.fill('#mp-name', 'Watcher');
+      await phone.page.fill('#mp-code', code);
+      await phone.page.click('#mp-join');
+      await until(phone.page, () => Boolean(window.__voxel?.getSession()), 30000, 'session');
+
+      await host.page.click('#mp-start');
+      await until(host.page, () => Boolean(window.__voxel?.getSession()), 30000, 'session');
+      for (const tab of [host, phone]) {
+        await until(tab.page, () => window.__voxel.world.chunks.size > 0, 40000, 'chunks');
+      }
+      await until(
+        phone.page,
+        () => window.__voxel.getSession().remotePlayers.all.length,
+        25000,
+        'the other player',
+      );
+
+      // This test is about what crosses the wire, not about the quality ladder.
+      // Software rendering here runs at ~20 FPS, which would make AutoQuality
+      // strip limbs mid-test on the phone tab and hide what we came to measure;
+      // the ladder's own behaviour has a dedicated test above.
+      await phone.page.evaluate(() => {
+        window.__voxel.autoQuality?.disable();
+        window.__voxel.setAnimatedLimbs(true);
+      });
+
+      // The watcher must be rendering the walker as a jointed body.
+      const rig = await phone.page.evaluate(() => {
+        const p = window.__voxel.getSession().remotePlayers.all[0];
+        return [...p.rig.segments.keys()];
+      });
+      assert.ok(rig.includes('legL'), `remote body has no legs to swing: ${rig}`);
+      assert.ok(rig.includes('armR'), 'remote body has no tool arm');
+
+      // Walk the host forward for real, and watch the legs on the phone.
+      await host.page.evaluate(() => {
+        window.__voxel.look.locked = true;
+        document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true }));
+      });
+      const legs = await phone.page.evaluate(async () => {
+        const angles = [];
+        for (let i = 0; i < 45; i++) {
+          const p = window.__voxel.getSession().remotePlayers.all[0];
+          const leg = p && p.rig.segments.get('legL');
+          if (leg && p.group.visible) angles.push(leg.rotation.x);
+          await new Promise((r) => setTimeout(r, 60));
+        }
+        return { min: Math.min(...angles), max: Math.max(...angles), n: angles.length };
+      });
+      await host.page.evaluate(() =>
+        document.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })),
+      );
+      assert.ok(legs.n > 10, 'the remote body was never visible');
+      assert.ok(
+        legs.max - legs.min > 0.15,
+        `a walking player's legs did not move on the other screen (range ${(legs.max - legs.min).toFixed(3)})`,
+      );
+
+      // Now swing, and watch the arm.
+      const arm = await Promise.all([
+        phone.page.evaluate(async () => {
+          const angles = [];
+          for (let i = 0; i < 40; i++) {
+            const p = window.__voxel.getSession().remotePlayers.all[0];
+            const a = p && p.rig.segments.get('armR');
+            if (a) angles.push(a.rotation.x);
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          return { min: Math.min(...angles), max: Math.max(...angles) };
+        }),
+        (async () => {
+          // Repeated swings, so at least one lands inside the sampling window.
+          for (let i = 0; i < 8; i++) {
+            await host.page.evaluate(() => window.__voxel.viewmodel.swing());
+            await sleep(220);
+          }
+        })(),
+      ]);
+      assert.ok(
+        arm[0].max - arm[0].min > 0.5,
+        `a swinging player's arm did not move on the other screen (range ${(arm[0].max - arm[0].min).toFixed(3)})`,
+      );
+    } finally {
+      await host.context.close();
+      await phone.context.close();
     }
   });
 

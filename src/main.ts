@@ -38,6 +38,9 @@ import { EntityManager } from './entities/manager';
 import { RoomSimulation } from './shared/roomsim';
 import { isNightTime, type SimPlayer } from './shared/mobsim';
 import { WorldView } from './game/worldview';
+import { Viewmodel } from './game/viewmodel';
+import { BreakOverlay } from './game/breakoverlay';
+import { drawTileTo } from './textures';
 import { Arrow } from './entities/arrow';
 import type { CombatTarget } from './game/interaction';
 import { ARROW_SPEED, BLOCK_SLOWDOWN, PLAYER_HALF_WIDTH, PLAYER_HEIGHT } from './constants';
@@ -49,6 +52,7 @@ import { Input } from './input';
 import { MouseLook } from './player/camera';
 import { Player, type MoveInput } from './player/player';
 import { Survival } from './player/survival';
+import { receiveClock } from './net/protocol';
 import type { MultiplayerSession } from './net/session';
 import { MultiplayerSession as Session } from './net/session';
 import type { StartChoice } from './ui/multiplayerui';
@@ -133,6 +137,7 @@ async function boot(choice: StartChoice): Promise<void> {
     renderer.setSize(window.innerWidth, window.innerHeight);
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
+    viewmodel.setAspect(camera.aspect);
   });
 
   // --- Game systems ---
@@ -147,6 +152,13 @@ async function boot(choice: StartChoice): Promise<void> {
   // simulation-owned and rendered from snapshots.
   const entities = new EntityManager(scene);
   const worldView = new WorldView(scene);
+  // The hand/held item in front of the camera, and the cracks on the block
+  // being mined. Both are pure presentation: no simulation depends on them.
+  const viewmodel = new Viewmodel(camera.fov);
+  viewmodel.setAspect(camera.aspect);
+  const breakOverlay = new BreakOverlay(scene);
+  /** Mirrors the quality ladder, so late-joining bodies match the rest. */
+  let animatedLimbs = true;
   /** Singleplayer runs the SAME simulation class the server runs. */
   let localSim: RoomSimulation | null = null;
 
@@ -248,6 +260,7 @@ async function boot(choice: StartChoice): Promise<void> {
     onBreakBlock: (def) => playBreak(def.sound),
     onPlaceBlock: (def) => playPlace(def.sound),
     onAttack: () => playAttack(),
+    onSwing: () => viewmodel.swing(),
     tryEat: (hunger) => {
       if (!survival.eat(hunger)) return false;
       playEat();
@@ -279,7 +292,7 @@ async function boot(choice: StartChoice): Promise<void> {
   function combatTargets(): CombatTarget[] {
     const targets: CombatTarget[] = [];
     for (const mob of worldView.allMobs) {
-      if (!mob.mesh.visible) continue;
+      if (!mob.object.visible) continue;
       targets.push({
         id: `mob:${mob.id}`,
         position: mob.position,
@@ -382,9 +395,25 @@ async function boot(choice: StartChoice): Promise<void> {
           applyViewDistance();
         },
         setPixelScale: applyPixelScale,
+        setAnimatedLimbs: setAnimatedLimbs,
         notify: (msg) => hud.toast(msg),
       })
     : null;
+
+  /**
+   * Turn limb animation on or off everywhere at once. Bodies are rebuilt in
+   * place, keeping their interpolation state, so the switch is invisible apart
+   * from the limbs stopping.
+   */
+  function setAnimatedLimbs(on: boolean): void {
+    worldView.setArticulated(on);
+    // The manager remembers it too, so anyone joining later matches.
+    session?.remotePlayers.setArticulated(on);
+    animatedLimbs = on;
+    // The first-person hand is one mesh; it rides the same setting so the
+    // weakest devices skip its extra pass entirely.
+    viewmodel.enabled = on;
+  }
 
   menu.addEventListener('pointerup', () => {
     if (survival.dead) return;
@@ -636,7 +665,9 @@ async function boot(choice: StartChoice): Promise<void> {
         },
         onWorldState: (state) => {
           // The server owns mobs, dropped items and the clock.
-          const now = Date.now();
+          // receiveClock() must match the clock the frame loop hands to
+          // worldView.update, or interpolation silently renders stale frames.
+          const now = receiveClock();
           sky.timeOfDay = state.time;
           worldView.applyMobs(state.mobs, now);
           worldView.applyDrops(state.drops, now);
@@ -674,8 +705,10 @@ async function boot(choice: StartChoice): Promise<void> {
     );
     mpHud.show(multiplayer.code);
     mpHud.setRoster(multiplayer.players);
-    // Mobs are single-player only for now: they are not synchronised, so each
-    // client would simulate its own and they would disagree.
+    // Carry the current quality setting into the new session, in case the
+    // ladder already stepped down before anyone joined.
+    session.remotePlayers.setArticulated(animatedLimbs);
+    // Arrows are per-client effects; drop any left from before the room.
     entities.clear();
   }
 
@@ -697,6 +730,13 @@ async function boot(choice: StartChoice): Promise<void> {
     getWorldView: () => worldView,
     getLocalSim: () => localSim,
     dropHeldItem,
+    viewmodel,
+    breakOverlay,
+    /** Draw any atlas tile into a 2D context; used to inspect textures in tests. */
+    drawTile: (ctx: CanvasRenderingContext2D, tile: number, x: number, y: number, size: number) =>
+      drawTileTo(ctx, tile, x, y, size),
+    setAnimatedLimbs,
+    getAnimatedLimbs: () => animatedLimbs,
     getViewDistance: () => viewDistance,
     // Thin wrappers over the real rules, so automated tests exercise the same
     // code paths the game does rather than reimplementing them.
@@ -814,6 +854,8 @@ async function boot(choice: StartChoice): Promise<void> {
     if (session) {
       // Camera yaw/pitch is the shared abstraction: keyboard+mouse and touch
       // both feed it, so both platforms emit identical network state.
+      // Publish the swing so other players see the arm move, not just the damage.
+      session.swinging = viewmodel.swinging;
       session.update(nowMs, dt, look.yaw, look.pitch, playing);
       session.sendVitals(nowMs, survival.health, survival.hunger, survival.dead);
       session.sendEquipment(inventory.equipmentTiers());
@@ -843,6 +885,22 @@ async function boot(choice: StartChoice): Promise<void> {
     highlight.visible = hit !== null;
     if (hit) highlight.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
 
+    // Cracks spread across whatever block is being worked on.
+    if (hit && interaction.breakProgress > 0) {
+      breakOverlay.show(hit.x, hit.y, hit.z, interaction.breakProgress);
+    } else {
+      breakOverlay.hide();
+    }
+
+    // The held item tracks the hand: sway with movement, arc on a swing.
+    viewmodel.update({
+      dt,
+      held: inventory.selectedStack,
+      speed: Math.hypot(player.velocity.x, player.velocity.z),
+      bowCharge: playing ? interaction.bowCharge : 0,
+      blocking: playing && interaction.blocking,
+    });
+
     look.apply(eye);
     hud.setUnderwater(player.eyeInWater);
     hud.refresh();
@@ -868,6 +926,8 @@ async function boot(choice: StartChoice): Promise<void> {
     );
 
     renderer.render(scene, camera);
+    // Drawn last, over the finished world, on its own depth range.
+    viewmodel.render(renderer);
   });
 }
 

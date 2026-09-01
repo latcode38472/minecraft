@@ -8,13 +8,26 @@ import { MIN_VIEW_DISTANCE } from './constants';
 export interface AutoQualityHooks {
   setViewDistance(v: number): void;
   setPixelScale(scale: number): void;
+  /**
+   * Turn limb animation on/off. Articulated bodies cost a few draw calls each;
+   * dropping them is the last thing tried, because a world of sliding statues
+   * is a bigger loss than a slightly blurrier one.
+   */
+  setAnimatedLimbs(on: boolean): void;
   notify(message: string): void;
 }
 
 interface QualityLevel {
   scale: number;
   viewDistance: number;
+  animatedLimbs: boolean;
 }
+
+/**
+ * Fraction of the ladder that keeps animated limbs. Below this the device is
+ * struggling badly enough that draw calls are worth trading for motion.
+ */
+const LIMBS_UNTIL = 0.6;
 
 const WARMUP_S = 6; // ignore initial world streaming
 const SAMPLE_WINDOW_S = 1;
@@ -42,17 +55,20 @@ export class AutoQuality {
     // (fill rate is the usual phone bottleneck and the cut is less visible).
     let scaleIdx = 0;
     let vd = baseViewDistance;
-    this.levels.push({ scale: PIXEL_SCALES[0], viewDistance: vd });
+    this.levels.push({ scale: PIXEL_SCALES[0], viewDistance: vd, animatedLimbs: true });
     while (scaleIdx < PIXEL_SCALES.length - 1 || vd > MIN_VIEW_DISTANCE) {
       if (scaleIdx < PIXEL_SCALES.length - 1) {
         scaleIdx++;
-        this.levels.push({ scale: PIXEL_SCALES[scaleIdx], viewDistance: vd });
+        this.levels.push({ scale: PIXEL_SCALES[scaleIdx], viewDistance: vd, animatedLimbs: true });
       }
       if (vd > MIN_VIEW_DISTANCE) {
         vd--;
-        this.levels.push({ scale: PIXEL_SCALES[scaleIdx], viewDistance: vd });
+        this.levels.push({ scale: PIXEL_SCALES[scaleIdx], viewDistance: vd, animatedLimbs: true });
       }
     }
+    // Mark the bottom of the ladder as the no-animation band.
+    const keepFrom = Math.ceil(this.levels.length * LIMBS_UNTIL);
+    for (let i = keepFrom; i < this.levels.length; i++) this.levels[i].animatedLimbs = false;
   }
 
   /** Call once per frame with the frame's delta time in seconds. */
@@ -97,6 +113,7 @@ export class AutoQuality {
   disable(): void {
     this.enabled = false;
     this.hooks.setPixelScale(1);
+    this.hooks.setAnimatedLimbs(true);
   }
 
   get currentLevel(): number {
@@ -107,6 +124,7 @@ export class AutoQuality {
     const q = this.levels[this.level];
     this.hooks.setViewDistance(q.viewDistance);
     this.hooks.setPixelScale(q.scale);
+    this.hooks.setAnimatedLimbs(q.animatedLimbs);
     const res = q.scale < 1 ? `, ${Math.round(q.scale * 100)}% res` : '';
     this.hooks.notify(`${prefix} (view ${q.viewDistance}${res})`);
   }

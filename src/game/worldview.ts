@@ -8,9 +8,10 @@
 import * as THREE from 'three';
 import { INTERPOLATION_DELAY_MS, MOB_KIND_PIG, type DropStateData, type MobStateData } from '../net/protocol';
 import {
-  PIG_PARTS,
-  ZOMBIE_PARTS,
-  cachedGeometry,
+  PIG_SEGMENTS,
+  Rig,
+  WALK_PHASE_PER_BLOCK,
+  ZOMBIE_SEGMENTS,
   getMobHurtMaterial,
   getMobMaterial,
 } from '../entities/models';
@@ -21,6 +22,8 @@ const SNAPSHOT_BUFFER = 16;
 /** Beyond this gap we snap instead of interpolating (teleport or long stall). */
 const SNAP_DISTANCE = 12;
 const DROP_SIZE = 0.3;
+/** How long a mob holds its attack pose, so a swing is visible between ticks. */
+const ATTACK_POSE_MS = 300;
 
 const MOB_SHAPES = {
   pig: { halfWidth: 0.45, height: 0.9 },
@@ -87,16 +90,26 @@ class Interpolated {
 }
 
 export class MobView extends Interpolated {
-  readonly mesh: THREE.Mesh;
+  readonly object: THREE.Object3D;
   readonly id: number;
   readonly kind: number;
   readonly halfWidth: number;
   readonly height: number;
   health: number;
-  private hurtUntil = 0;
-  private previousHp: number;
 
-  constructor(state: MobStateData) {
+  /** Public so tools and tests can inspect the pose; treat as read-only. */
+  readonly rig: Rig;
+  private hurtUntil = 0;
+  private hurtActive = false;
+  private previousHp: number;
+  private attackUntil = 0;
+  /** Gait position, advanced by distance travelled rather than by time. */
+  private walkPhase = 0;
+  private walkAmount = 0;
+  private readonly lastRendered = new THREE.Vector3();
+  private hasRendered = false;
+
+  constructor(state: MobStateData, articulated: boolean) {
     super();
     this.id = state.i;
     this.kind = state.k;
@@ -106,11 +119,13 @@ export class MobView extends Interpolated {
     this.height = shape.height;
     this.health = state.hp;
     this.previousHp = state.hp;
-    this.mesh = new THREE.Mesh(
-      isPig ? cachedGeometry('pig', PIG_PARTS) : cachedGeometry('zombie', ZOMBIE_PARTS),
-      getMobMaterial(),
+    this.rig = new Rig(
+      isPig ? 'pig' : 'zombie',
+      isPig ? PIG_SEGMENTS : ZOMBIE_SEGMENTS,
+      articulated,
     );
-    this.mesh.visible = false;
+    this.object = this.rig.group;
+    this.object.visible = false;
   }
 
   apply(state: MobStateData, now: number, direct: boolean): void {
@@ -118,16 +133,58 @@ export class MobView extends Interpolated {
     if (state.hp < this.previousHp) this.hurtUntil = now + 400;
     this.previousHp = state.hp;
     this.health = state.hp;
+    // The simulation reports a swing; hold the pose long enough to be seen
+    // even when it lands between two snapshots.
+    if (state.s) this.attackUntil = Math.max(this.attackUntil, now + ATTACK_POSE_MS);
     if (direct) this.set(state.x, state.y, state.z, state.yaw);
     else this.push(state.x, state.y, state.z, state.yaw, now);
   }
 
-  render(now: number, direct: boolean): void {
+  render(now: number, dt: number, direct: boolean): void {
     if (!direct && !this.interpolate(now)) return;
-    this.mesh.position.copy(this.position);
-    this.mesh.rotation.y = this.yaw;
-    this.mesh.visible = true;
-    this.mesh.material = now < this.hurtUntil ? getMobHurtMaterial() : getMobMaterial();
+    this.object.position.copy(this.position);
+    this.object.rotation.y = this.yaw;
+    this.object.visible = true;
+
+    // Derive the gait from how far the body actually moved since last frame.
+    // Nothing about the walk cycle travels over the wire.
+    if (this.hasRendered) {
+      const moved = Math.hypot(
+        this.position.x - this.lastRendered.x,
+        this.position.z - this.lastRendered.z,
+      );
+      this.walkPhase += moved * WALK_PHASE_PER_BLOCK;
+      const speed = dt > 0 ? moved / dt : 0;
+      const target = Math.min(1, speed / 2.2);
+      this.walkAmount += (target - this.walkAmount) * Math.min(1, dt * 9);
+    }
+    this.lastRendered.copy(this.position);
+    this.hasRendered = true;
+
+    const attack = now < this.attackUntil ? 1 - (this.attackUntil - now) / ATTACK_POSE_MS : 0;
+    this.rig.pose(this.walkPhase, this.walkAmount, attack);
+
+    // Swap materials only on the frames the flash starts or ends.
+    const hurt = now < this.hurtUntil;
+    if (hurt !== this.hurtActive) {
+      this.hurtActive = hurt;
+      this.rig.setMaterial(hurt ? getMobHurtMaterial() : getMobMaterial());
+    }
+  }
+
+  /** Take over another view's interpolation state, so a rebuild does not jump. */
+  adopt(previous: MobView): void {
+    this.snapshots.push(...previous.snapshots);
+    this.position.copy(previous.position);
+    this.yaw = previous.yaw;
+    this.walkPhase = previous.walkPhase;
+    this.walkAmount = previous.walkAmount;
+    this.lastRendered.copy(previous.lastRendered);
+    this.hasRendered = previous.hasRendered;
+  }
+
+  dispose(): void {
+    this.rig.dispose();
   }
 }
 
@@ -204,18 +261,41 @@ export class WorldView {
   private readonly mobs = new Map<number, MobView>();
   private readonly drops = new Map<number, DropView>();
   private readonly scene: THREE.Scene;
+  /** Whether new mobs get swinging limbs; see setArticulated. */
+  private articulated = true;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
+  }
+
+  /**
+   * Turn limb animation on or off. Articulated bodies cost a few draw calls
+   * each; the quality ladder drops them on devices that cannot spare it.
+   * Existing mobs are rebuilt so the change takes effect immediately.
+   */
+  setArticulated(on: boolean): void {
+    if (on === this.articulated) return;
+    this.articulated = on;
+    for (const [id, mob] of [...this.mobs]) {
+      const replacement = new MobView(
+        { i: mob.id, k: mob.kind, x: 0, y: 0, z: 0, yaw: 0, hp: mob.health },
+        on,
+      );
+      replacement.adopt(mob);
+      this.scene.remove(mob.object);
+      mob.dispose();
+      this.scene.add(replacement.object);
+      this.mobs.set(id, replacement);
+    }
   }
 
   applyMobs(states: MobStateData[], now: number): void {
     for (const state of states) {
       let mob = this.mobs.get(state.i);
       if (!mob) {
-        mob = new MobView(state);
+        mob = new MobView(state, this.articulated);
         this.mobs.set(state.i, mob);
-        this.scene.add(mob.mesh);
+        this.scene.add(mob.object);
       }
       mob.apply(state, now, this.direct);
     }
@@ -237,7 +317,8 @@ export class WorldView {
     for (const id of ids) {
       const mob = this.mobs.get(id);
       if (!mob) continue;
-      this.scene.remove(mob.mesh);
+      this.scene.remove(mob.object);
+      mob.dispose();
       this.mobs.delete(id);
     }
   }
@@ -261,7 +342,7 @@ export class WorldView {
   }
 
   update(now: number, dt: number): void {
-    for (const mob of this.mobs.values()) mob.render(now, this.direct);
+    for (const mob of this.mobs.values()) mob.render(now, dt, this.direct);
     for (const drop of this.drops.values()) drop.render(now, dt, this.direct);
   }
 
@@ -270,7 +351,7 @@ export class WorldView {
     let best: MobView | null = null;
     let bestT = Infinity;
     for (const mob of this.mobs.values()) {
-      if (!mob.mesh.visible) continue;
+      if (!mob.object.visible) continue;
       const t = rayBox(origin, dir, mob, maxDist);
       if (t !== null && t < bestT) {
         bestT = t;

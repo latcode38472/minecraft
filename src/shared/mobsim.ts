@@ -50,6 +50,8 @@ export const MOB_STATS: Record<MobKind, MobStats> = {
 
 const PIG_FLEE_SPEED = 2.8;
 const PIG_FLEE_DURATION_S = 4;
+/** How long a landed hit keeps the mob's arms mid-swing on every client. */
+const SWING_TIME_S = 0.35;
 const HURT_FLASH_S = 0.4;
 const JUMP_SPEED = 7.2;
 
@@ -84,6 +86,8 @@ export class MobSim {
   hurtTime = 0;
   /** Who last damaged this mob — decides who receives the loot. */
   lastAttackerId: string | null = null;
+  /** Seconds left of the swing animation clients should be drawing. */
+  swingTime = 0;
 
   private attackCooldown = 0;
   private wanderYaw = Math.random() * Math.PI * 2;
@@ -130,6 +134,7 @@ export class MobSim {
   update(dt: number, world: BlockQuery, players: SimPlayer[], events: SimEvents): void {
     this.hurtTime = Math.max(0, this.hurtTime - dt);
     this.attackCooldown = Math.max(0, this.attackCooldown - dt);
+    this.swingTime = Math.max(0, this.swingTime - dt);
 
     if (this.kind === 'zombie') this.updateZombie(dt, world, players, events);
     else this.updatePig(dt, world);
@@ -171,6 +176,7 @@ export class MobSim {
       ) {
         events.onPlayerHit(target.id, this.stats.attackDamage, this.position.x, this.position.z);
         this.attackCooldown = this.stats.attackCooldown;
+        this.swingTime = SWING_TIME_S;
       }
       return;
     }

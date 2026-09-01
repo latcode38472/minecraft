@@ -114,6 +114,24 @@ use smaller per-frame chunk generation/meshing budgets so world streaming
 never causes visible hitches. A device without WebGL 2 gets a clear message
 instead of a black screen.
 
+**Animation and the draw-call budget.** Limbs can only move if the body is more
+than one mesh, so an animated body costs more draw calls than a rigid one:
+
+| Body | Meshes animated | Meshes merged |
+| --- | --- | --- |
+| Zombie | 4 (body, both arms together, each leg) | 1 |
+| Pig | 3 (body, two diagonal leg pairs) | 1 |
+| Player | 6 (head, torso, two arms, two legs) | 1 |
+
+With the caps in place — 24 mobs and 2 other players — that is at most ~108
+draw calls animated against ~26 merged. Both are small next to the few hundred
+the terrain costs, so limb animation is on everywhere by default. It is only
+traded away at the *bottom* of the quality ladder, below resolution and view
+distance, because a world of sliding statues is a worse loss than a slightly
+blurrier one. Bodies are rebuilt in place when it flips, keeping their
+interpolation state, so nothing pops or teleports. Turning it off also drops
+the first-person hand's render pass.
+
 URL parameters: `?seed=12345` starts a specific singleplayer world (a new seed
 wipes saved edits), `?reset` wipes the save entirely, `?touch=1` forces touch
 controls, `?server=host:port` points multiplayer at a specific server.
@@ -154,13 +172,13 @@ and player counts for monitoring.
 
 | Synchronised | Not synchronised |
 | --- | --- |
-| Player position, yaw, pitch, movement/jump/sneak flags | Inventory and hotbar contents |
+| Player position, yaw, pitch, movement/jump/sneak/swing flags | Inventory and hotbar contents |
 | Joins, leaves, display names, room roster | |
 | Block breaks and placements (server-authoritative) | |
 | Player health, hunger and death (server-authoritative) | |
 | Worn armour, drawn on other players' bodies | |
 | PvP damage from melee and arrows | |
-| Mobs — position, health, death (server-authoritative) | |
+| Mobs — position, health, death, attack swings (server-authoritative) | |
 | Dropped items, including who is allowed to pick one up | |
 | Mob loot, awarded to whoever landed the killing blow | |
 | Time of day: the server owns the clock | |
@@ -214,6 +232,20 @@ for two seconds so it does not snap straight back.
   Worn armour is drawn on other players' bodies, and a small health bar appears
   under their name once they are hurt
 
+**Animation**
+- **First-person hand**: the held tool, block or bare hand is drawn in front of
+  the camera, sways as you walk, arcs through a swing when you mine or attack,
+  draws back as a bow charges, and comes up to guard when a shield is raised
+- **Block cracks**: ten damage stages spread across the block you are mining,
+  chosen from the same 0..1 progress the HUD bar uses
+- **Walking**: players and mobs have jointed limbs. Arms and legs counter-swing,
+  a pig moves on diagonal pairs, and the gait is driven by distance travelled
+  rather than by time, so it stays in step at any frame rate
+- **Attacks**: swings are visible on other players and on mobs, not just felt as
+  damage — the swing crosses the wire as one flag bit
+- On touch devices the quality ladder can trade limb animation for draw calls;
+  see **Performance on phones**
+
 **Items and building**
 - Mining takes time based on block hardness and the tool you hold; the wrong
   tool tier means no drop at all (stone without a pickaxe drops nothing)
@@ -248,11 +280,13 @@ src/
   entities/
     entity.ts        Entity base: gravity, buoyancy, voxel collision
     arrow.ts         swept projectile: reports block, mob and player hits
-    models.ts        merged box geometry per mob type (one draw call each)
+    models.ts        box models as jointed rigs (or one merged mesh), + posing
     manager.ts       lifecycle for client-side entities (arrows)
   game/
     interaction.ts   mining progress, placing, attacking, eating, stations
     worldview.ts     renders mobs and drops from simulation snapshots
+    viewmodel.ts     the held item in front of the camera: sway, swing, draw
+    breakoverlay.ts  the crack stages on the block being mined
   net/
     protocol.ts      wire types, limits and validators (shared with the server)
     config.ts        WebSocket URL resolution (query > env > same-host)
@@ -265,6 +299,7 @@ server/
 tests/
   simulation.test.ts headless: terrain, mobs, loot, drops, memory bounds
   protocol.test.ts   every sanitiser, from an attacker's point of view
+  animation.test.ts  rigs, gait, swings, crack stages, the snapshot clock
   multiplayer.test.ts a real server driven by real WebSocket clients
   browser.mjs        real Chromium tabs, including a simulated phone
   world/
@@ -381,6 +416,23 @@ snapshots straddling that moment, so movement stays smooth at 60+ FPS and never
 teleports between packets. Your own movement is applied locally the instant you
 press a key or touch the joystick — nothing waits for a round trip.
 
+Everything that arrives on the wire is timestamped with `receiveClock()`
+(`net/protocol.ts`), which is the *same* clock the frame loop interpolates
+against. This matters more than it looks: `Date.now()` and `performance.now()`
+differ by about 1.7×10¹², so stamping with one and comparing against the other
+means no snapshot is ever "old enough" to render. Bodies then silently fall back
+to the oldest sample in the buffer — over a second stale, with no smoothing —
+while still appearing to move, which is exactly the kind of bug that survives a
+casual playtest. One function, used on both sides, removes the choice.
+
+*Remote animation* rides the same snapshots rather than adding traffic. A walk
+cycle is derived from how far a body actually moved on screen between frames, so
+nothing about the gait is transmitted; a swing is a single flag bit. The
+receiver replays a stroke whenever that bit is up and the last stroke has
+finished, rather than edge-triggering on it — at 15 Hz a player mining
+continuously holds the bit up with only millisecond gaps, and edge-triggering
+would show one swing and then a frozen arm for the rest of the dig.
+
 *Cross-play* falls out of the input design: both control schemes already funnel
 into the same camera yaw/pitch and the same `MoveInput`, so the network layer
 reads that shared state and never touches a keyboard, mouse or touch API. The
@@ -399,6 +451,11 @@ protocol is identical on both platforms.
   `dropSnapshot()` alongside `SaveMeta`.
 - Mob AI has no pathfinding — zombies walk straight at you and hop one-block
   ledges, so they get stuck on complex terrain. Hook: `MobSim.update`.
+- Animation is procedural posing, not keyframes: bodies walk, swing, and tilt
+  their heads, but there is no jump, fall, sneak, swim, hurt-recoil or death
+  animation, and the first-person hand shows the item without an arm behind it.
+  Hook: more cases in `Rig.pose` and `Viewmodel.update`, which already receive
+  everything they would need.
 - Culled meshing, not greedy merging; fine at default view distance.
   TODO hook: `buildChunkGeometry` in `world/mesher.ts`.
 - Chunk generation/meshing runs on the main thread under a time budget.

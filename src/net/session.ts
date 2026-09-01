@@ -15,10 +15,12 @@ import {
   FLAG_JUMPING,
   FLAG_MOVING,
   FLAG_SNEAKING,
+  FLAG_SWINGING,
   MAX_BLOCK_ID,
   MAX_CHUNK_REQUEST,
   PROTOCOL_VERSION,
   STATE_SEND_HZ,
+  receiveClock,
   WORLD_HEIGHT_LIMIT,
   type PlayerInfo,
   type PlayerVitals,
@@ -73,6 +75,12 @@ export class MultiplayerSession {
   private lastStateSentAt = 0;
   private lastVitalsSentAt = 0;
   private lastEquipmentSent = '';
+  /**
+   * Set by the game loop while the local player is mid-swing, so other clients
+   * can animate the arm. Kept as a field rather than another `update` argument
+   * because it changes independently of position and look.
+   */
+  swinging = false;
   private readonly lastSent = { x: NaN, y: NaN, z: NaN, yaw: NaN, pitch: NaN, flags: -1 };
   /** Chunks we've already asked the server about, so we ask at most once each. */
   private readonly requestedChunks = new Set<string>();
@@ -175,6 +183,7 @@ export class MultiplayerSession {
     if (!this.player.onGround) flags |= FLAG_JUMPING;
     if (this.player.onGround) flags |= FLAG_GROUNDED;
     if (this.player.sneaking) flags |= FLAG_SNEAKING;
+    if (this.swinging) flags |= FLAG_SWINGING;
 
     // Idle players cost nothing: skip the packet when nothing changed.
     const moved =
@@ -347,7 +356,9 @@ export class MultiplayerSession {
       }
       case 'player_state': {
         // Ignore state for anyone not on the roster (stale or spoofed id).
-        this.remotePlayers.applyState(msg.id, msg.s, Date.now());
+        // Stamped with the SAME clock the frame loop interpolates against —
+        // see receiveClock().
+        this.remotePlayers.applyState(msg.id, msg.s, receiveClock());
         return;
       }
       case 'block_update': {

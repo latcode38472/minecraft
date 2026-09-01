@@ -4,55 +4,75 @@
 // for the classic look.
 
 import * as THREE from 'three';
-import { Tile } from './blocks';
+import { Tile } from './blocks.ts';
 
 export const TILE_PX = 16;
-export const ATLAS_TILES = 8; // 8x8 grid of tiles
+export const ATLAS_TILES = 16; // 16x16 grid of tiles
 const ATLAS_PX = TILE_PX * ATLAS_TILES;
 
-/** Item icon tiles, continuing after the block tiles in blocks.ts. */
-export const enum ItemTile {
-  WoodenPickaxe = 24,
-  StonePickaxe = 25,
-  IronPickaxe = 26,
-  DiamondPickaxe = 27,
-  WoodenSword = 28,
-  StoneSword = 29,
-  IronSword = 30,
-  DiamondSword = 31,
-  WoodenAxe = 32,
-  StoneAxe = 33,
-  IronAxe = 34,
-  DiamondAxe = 35,
-  Stick = 36,
-  Coal = 37,
-  RawIron = 38,
-  RawGold = 39,
-  IronIngot = 40,
-  GoldIngot = 41,
-  Diamond = 42,
-  RawPorkchop = 43,
-  CookedPorkchop = 44,
-  RottenFlesh = 45,
-  Bow = 46,
-  Arrow = 47,
-  Shield = 48,
-  LeatherHelmet = 49,
-  LeatherChestplate = 50,
-  LeatherLeggings = 51,
-  LeatherBoots = 52,
-  IronHelmet = 53,
-  IronChestplate = 54,
-  IronLeggings = 55,
-  IronBoots = 56,
-  DiamondHelmet = 57,
-  DiamondChestplate = 58,
-  DiamondLeggings = 59,
-  DiamondBoots = 60,
-  Leather = 61,
-  String = 62,
-  Flint = 63,
+/**
+ * Progressive block-damage overlays, drawn over the block being mined.
+ * Ten stages, like Minecraft's destroy_stage_0..9.
+ */
+export const CRACK_TILE_0 = 64;
+export const CRACK_STAGES = 10;
+
+/** Which crack tile matches a 0..1 mining progress. */
+export function crackTileFor(progress: number): number {
+  const stage = Math.min(CRACK_STAGES - 1, Math.floor(progress * CRACK_STAGES));
+  return CRACK_TILE_0 + Math.max(0, stage);
 }
+
+/**
+ * Item icon tiles, continuing after the block tiles in blocks.ts.
+ *
+ * A plain const object rather than a `const enum` for the same reason as
+ * `Block` and `Tile`: Node's native type stripping runs this file in tests and
+ * cannot erase an enum. Call sites are identical either way.
+ */
+export const ItemTile = {
+  WoodenPickaxe: 24,
+  StonePickaxe: 25,
+  IronPickaxe: 26,
+  DiamondPickaxe: 27,
+  WoodenSword: 28,
+  StoneSword: 29,
+  IronSword: 30,
+  DiamondSword: 31,
+  WoodenAxe: 32,
+  StoneAxe: 33,
+  IronAxe: 34,
+  DiamondAxe: 35,
+  Stick: 36,
+  Coal: 37,
+  RawIron: 38,
+  RawGold: 39,
+  IronIngot: 40,
+  GoldIngot: 41,
+  Diamond: 42,
+  RawPorkchop: 43,
+  CookedPorkchop: 44,
+  RottenFlesh: 45,
+  Bow: 46,
+  Arrow: 47,
+  Shield: 48,
+  LeatherHelmet: 49,
+  LeatherChestplate: 50,
+  LeatherLeggings: 51,
+  LeatherBoots: 52,
+  IronHelmet: 53,
+  IronChestplate: 54,
+  IronLeggings: 55,
+  IronBoots: 56,
+  DiamondHelmet: 57,
+  DiamondChestplate: 58,
+  DiamondLeggings: 59,
+  DiamondBoots: 60,
+  Leather: 61,
+  String: 62,
+  Flint: 63,
+} as const;
+export type ItemTile = (typeof ItemTile)[keyof typeof ItemTile];
 
 /** Deterministic per-pixel hash so the atlas looks identical every run. */
 function pixelHash(x: number, y: number, salt: number): number {
@@ -314,6 +334,82 @@ const TIER_COLORS: Record<string, RGB> = {
   diamond: [92, 219, 213],
 };
 
+/**
+ * Ten block-damage overlays: a fixed set of jagged fractures that reveal
+ * themselves one at a time, so the crack pattern grows rather than shuffling
+ * between frames. Everything not on a fracture is fully transparent.
+ */
+function drawCrackTiles(ctx: CanvasRenderingContext2D): void {
+  // Each fracture walks from a seed point in a jittered direction. Generating
+  // them once and revealing progressively is what makes the stages continuous.
+  interface Fracture {
+    points: [number, number][];
+    /** Stage at which this fracture starts appearing. */
+    stage: number;
+  }
+  const fractures: Fracture[] = [];
+  const CENTRE = (TILE_PX - 1) / 2;
+
+  const COUNT = 15;
+  for (let f = 0; f < COUNT; f++) {
+    // Fan the fractures evenly around the tile rather than letting the hash
+    // clump them, then jitter — otherwise damage looks like a smudge on one
+    // side instead of a block splitting.
+    const spoke = (f / COUNT) * Math.PI * 2 + (pixelHash(f, 0, 991) - 0.5) * 0.7;
+    const radius = 1.5 + pixelHash(f, 1, 991) * 4.5;
+    let x = CENTRE + Math.cos(spoke) * radius;
+    let y = CENTRE + Math.sin(spoke) * radius;
+    // Fractures run outward from where they start, so they reach the edges.
+    let dir = spoke + (pixelHash(f, 2, 991) - 0.5) * 0.9;
+    const points: [number, number][] = [];
+    const length = 5 + Math.floor(pixelHash(f, 3, 991) * 6);
+    for (let s = 0; s < length; s++) {
+      points.push([Math.round(x), Math.round(y)]);
+      dir += (pixelHash(f, s + 4, 991) - 0.5) * 1.2; // wander, so lines look split not drawn
+      x += Math.cos(dir) * 1.5;
+      y += Math.sin(dir) * 1.5;
+      if (x < -1 || x > TILE_PX || y < -1 || y > TILE_PX) break;
+    }
+    fractures.push({ points, stage: Math.floor((f / COUNT) * CRACK_STAGES) });
+  }
+
+  for (let stage = 0; stage < CRACK_STAGES; stage++) {
+    const [ox, oy] = tileOrigin(CRACK_TILE_0 + stage);
+    const img = ctx.createImageData(TILE_PX, TILE_PX);
+    // Transparent everywhere by default (createImageData zero-fills alpha).
+    const plot = (px: number, py: number, alpha: number): void => {
+      if (px < 0 || py < 0 || px >= TILE_PX || py >= TILE_PX) return;
+      const i = (py * TILE_PX + px) * 4;
+      if (img.data[i + 3] >= alpha) return;
+      img.data[i] = 26;
+      img.data[i + 1] = 24;
+      img.data[i + 2] = 22;
+      img.data[i + 3] = alpha;
+    };
+
+    for (const fracture of fractures) {
+      if (fracture.stage > stage) continue;
+      // A fracture extends as later stages arrive, rather than popping in whole.
+      const grown = (stage - fracture.stage + 1) / (CRACK_STAGES - fracture.stage);
+      const visible = Math.max(2, Math.ceil(fracture.points.length * grown));
+      for (let p = 0; p < Math.min(visible, fracture.points.length); p++) {
+        const [px, py] = fracture.points[p];
+        plot(px, py, 240);
+        // Fill the gap to the next point so a wandering fracture stays a line
+        // rather than a dotted trail at 16 pixels across.
+        const next = fracture.points[p + 1];
+        if (next && p + 1 < visible) {
+          plot(Math.round((px + next[0]) / 2), Math.round((py + next[1]) / 2), 245);
+        }
+        // One softer shoulder gives the crack depth without closing up the
+        // face — late stages must still read as damaged stone, not a black hole.
+        plot(px + 1, py, 105);
+      }
+    }
+    ctx.putImageData(img, ox, oy);
+  }
+}
+
 function buildAtlas(): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = ATLAS_PX;
@@ -493,6 +589,8 @@ function buildAtlas(): HTMLCanvasElement {
   drawSprite(ctx, ItemTile.Leather, HIDE, { H: [178, 128, 84], D: [148, 102, 64] });
   drawSprite(ctx, ItemTile.String, STRING_SPRITE, { H: [232, 232, 226] });
   drawSprite(ctx, ItemTile.Flint, FLINT, { H: [72, 68, 68], D: [44, 42, 42] });
+
+  drawCrackTiles(ctx);
 
   // Armour: one shape per slot, recoloured per tier.
   const armorPieces: [number[], string[]][] = [

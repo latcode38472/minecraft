@@ -18,6 +18,9 @@ import type { Player } from '../player/player';
 import { raycastVoxel, type RayHit } from '../raycast';
 import type { World } from '../world/world';
 
+/** Seconds between arm swings while a block is being mined. */
+const SWING_INTERVAL_S = 0.3;
+
 /** Anything alive the local player can shoot or hit: a mob or another player. */
 export interface CombatTarget {
   id: string;
@@ -30,6 +33,11 @@ export interface InteractionHooks {
   onBreakBlock(def: BlockDef): void;
   onPlaceBlock(def: BlockDef): void;
   onAttack(): void;
+  /**
+   * Start an arm-swing animation: once per landed hit, and repeatedly while
+   * mining. Separate from onAttack, which is the sound and fires only on hits.
+   */
+  onSwing(): void;
   /**
    * Everything that can be hit: simulated mobs plus any remote players. Mob
    * ids are prefixed "mob:" so one list serves both.
@@ -92,6 +100,8 @@ export class Interaction {
   private attackCooldown = 0;
   private nextUseAt = 0;
   private drawingBow = false;
+  /** Counts down between mining strokes, so the arm swings in a rhythm. */
+  private swingTimer = 0;
 
   private readonly eye = new THREE.Vector3();
   private readonly dir = new THREE.Vector3();
@@ -135,11 +145,18 @@ export class Interaction {
     const blockDist = this.target ? this.eye.distanceTo(this.targetCentre(this.target)) : Infinity;
     const combatInFront = (combatHit?.distance ?? Infinity) < blockDist;
 
+    this.swingTimer = Math.max(0, this.swingTimer - dt);
+
     if (input.mining && combatInFront) {
       this.attackTarget(combatHit!.target);
       this.resetMining();
     } else if (input.mining && this.target) {
       this.tickMining(dt, this.target);
+      // Keep swinging for as long as the block is being worked on.
+      if (this.swingTimer === 0) {
+        this.swingTimer = SWING_INTERVAL_S;
+        this.hooks.onSwing();
+      }
     } else {
       this.resetMining();
     }
@@ -211,6 +228,7 @@ export class Interaction {
       if (this.inventory.damageSelected()) this.hooks.toast('Your weapon broke!');
     }
     this.hooks.onAttack();
+    this.hooks.onSwing();
   }
 
   private targetCentre(hit: RayHit): THREE.Vector3 {

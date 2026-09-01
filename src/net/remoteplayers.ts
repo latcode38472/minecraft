@@ -6,12 +6,21 @@ import * as THREE from 'three';
 import {
   FLAG_JUMPING,
   FLAG_MOVING,
+  FLAG_SWINGING,
   INTERPOLATION_DELAY_MS,
   type PlayerInfo,
   type PlayerStateData,
 } from './protocol';
-import { buildBoxGeometry, getMobMaterial, type BoxPart } from '../entities/models';
+import {
+  Rig,
+  WALK_PHASE_PER_BLOCK,
+  type BoxPart,
+  type RigSegment,
+} from '../entities/models';
 import { PLAYER_HALF_WIDTH, PLAYER_HEIGHT } from '../constants';
+
+/** How long one attack/mining stroke plays on a remote body. */
+const SWING_TIME_S = 0.3;
 
 /** One colour per room slot so the three players are always distinguishable. */
 const BODY_COLORS = [0x4f8fd6, 0xd6644f, 0x63b558];
@@ -34,74 +43,77 @@ const ARMOR_COLORS = [0, 0xa06a3c, 0xd8d8d8, 0x5cdbd5];
 /** How far armour boxes are inflated past the body, so they read as worn. */
 const ARMOR_PAD = 0.06;
 
-function playerParts(color: number, gear: number[]): BoxPart[] {
+/**
+ * A player body as jointed segments. Limb boxes hang below their pivot so a
+ * rotation about the shoulder or hip reads as a swing, not a spin.
+ *
+ * Armour is drawn as slightly larger shells over the body parts, so a glance
+ * tells you how well protected another player is — and because each shell
+ * lives in the same segment as the limb it covers, it swings along with it.
+ */
+function playerSegments(color: number, gear: number[]): RigSegment[] {
   const skin = 0xd8b18a;
-  const legs = 0x394a6b;
-  const parts: BoxPart[] = [
-    { pos: [0, 1.62, 0], size: [0.5, 0.5, 0.5], color: skin }, // head
-    { pos: [0, 1.0, 0], size: [0.55, 0.7, 0.28], color }, // torso
-    { pos: [-0.4, 1.0, 0], size: [0.24, 0.7, 0.24], color }, // arms
-    { pos: [0.4, 1.0, 0], size: [0.24, 0.7, 0.24], color },
-    { pos: [-0.14, 0.32, 0], size: [0.26, 0.65, 0.26], color: legs }, // legs
-    { pos: [0.14, 0.32, 0], size: [0.26, 0.65, 0.26], color: legs },
-  ];
+  const legColor = 0x394a6b;
+  const [headTier, chestTier, legsTier, feetTier] = gear;
 
-  // Worn armour is drawn as slightly larger shells over the body parts, so a
-  // glance tells you how well protected another player is.
-  const [head, chest, legsTier, feet] = gear;
-  const inflate = (p: BoxPart, tier: number, scale = 1): BoxPart => ({
-    pos: p.pos,
-    size: [p.size[0] + ARMOR_PAD, p.size[1] * scale + ARMOR_PAD * 0.5, p.size[2] + ARMOR_PAD],
-    color: ARMOR_COLORS[tier],
-  });
+  const head: BoxPart[] = [{ pos: [0, 0.25, 0], size: [0.5, 0.5, 0.5], color: skin }];
+  if (headTier > 0) {
+    head.push({
+      pos: [0, 0.25, 0],
+      size: [0.5 + ARMOR_PAD, 0.5 + ARMOR_PAD, 0.5 + ARMOR_PAD],
+      color: ARMOR_COLORS[headTier],
+    });
+  }
 
-  if (head > 0) parts.push(inflate(parts[0], head));
-  if (chest > 0) {
-    parts.push(inflate(parts[1], chest));
-    // Pauldrons: the upper half of each arm.
-    for (const armIndex of [2, 3]) {
-      const arm = parts[armIndex];
+  const torso: BoxPart[] = [{ pos: [0, 1.0, 0], size: [0.55, 0.7, 0.28], color }];
+  if (chestTier > 0) {
+    torso.push({
+      pos: [0, 1.0, 0],
+      size: [0.55 + ARMOR_PAD, 0.7 + ARMOR_PAD * 0.5, 0.28 + ARMOR_PAD],
+      color: ARMOR_COLORS[chestTier],
+    });
+  }
+
+  const arm = (): BoxPart[] => {
+    const parts: BoxPart[] = [{ pos: [0, -0.35, 0], size: [0.24, 0.7, 0.24], color }];
+    // A pauldron on the upper arm, rotating with the shoulder.
+    if (chestTier > 0) {
       parts.push({
-        pos: [arm.pos[0], arm.pos[1] + 0.18, arm.pos[2]],
-        size: [arm.size[0] + ARMOR_PAD, 0.3, arm.size[2] + ARMOR_PAD],
-        color: ARMOR_COLORS[chest],
+        pos: [0, -0.17, 0],
+        size: [0.24 + ARMOR_PAD, 0.3, 0.24 + ARMOR_PAD],
+        color: ARMOR_COLORS[chestTier],
       });
     }
-  }
-  if (legsTier > 0) {
-    for (const legIndex of [4, 5]) {
-      const leg = parts[legIndex];
+    return parts;
+  };
+
+  const leg = (): BoxPart[] => {
+    const parts: BoxPart[] = [{ pos: [0, -0.33, 0], size: [0.26, 0.65, 0.26], color: legColor }];
+    if (legsTier > 0) {
       parts.push({
-        pos: [leg.pos[0], leg.pos[1] + 0.14, leg.pos[2]],
-        size: [leg.size[0] + ARMOR_PAD, 0.42, leg.size[2] + ARMOR_PAD],
+        pos: [0, -0.19, 0],
+        size: [0.26 + ARMOR_PAD, 0.42, 0.26 + ARMOR_PAD],
         color: ARMOR_COLORS[legsTier],
       });
     }
-  }
-  if (feet > 0) {
-    for (const legIndex of [4, 5]) {
-      const leg = parts[legIndex];
+    if (feetTier > 0) {
       parts.push({
-        pos: [leg.pos[0], leg.pos[1] - 0.22, leg.pos[2]],
-        size: [leg.size[0] + ARMOR_PAD, 0.2, leg.size[2] + ARMOR_PAD * 2],
-        color: ARMOR_COLORS[feet],
+        pos: [0, -0.55, 0],
+        size: [0.26 + ARMOR_PAD, 0.2, 0.26 + ARMOR_PAD * 2],
+        color: ARMOR_COLORS[feetTier],
       });
     }
-  }
-  return parts;
-}
+    return parts;
+  };
 
-// Keyed by colour + gear, so two players in identical armour share one buffer.
-const geometryCache = new Map<string, THREE.BufferGeometry>();
-
-function bodyGeometry(colorIndex: number, gear: number[]): THREE.BufferGeometry {
-  const key = `${colorIndex}|${gear.join(',')}`;
-  let geo = geometryCache.get(key);
-  if (!geo) {
-    geo = buildBoxGeometry(playerParts(BODY_COLORS[colorIndex % BODY_COLORS.length], gear));
-    geometryCache.set(key, geo);
-  }
-  return geo;
+  return [
+    { name: 'head', pivot: [0, 1.37, 0], parts: head },
+    { name: 'torso', pivot: [0, 0, 0], parts: torso },
+    { name: 'armL', pivot: [-0.4, 1.35, 0], parts: arm() },
+    { name: 'armR', pivot: [0.4, 1.35, 0], parts: arm() },
+    { name: 'legL', pivot: [-0.14, 0.65, 0], parts: leg() },
+    { name: 'legR', pivot: [0.14, 0.65, 0], parts: leg() },
+  ];
 }
 
 /** Render a name onto a canvas sprite that always faces the camera. */
@@ -141,21 +153,47 @@ export class RemotePlayer {
   /** Latest interpolated position; used for player-vs-player separation. */
   readonly position = new THREE.Vector3();
 
-  private readonly body: THREE.Mesh;
+  /** Public so tests can inspect the pose; treat as read-only. */
+  rig: Rig;
   private readonly label: THREE.Sprite;
   private readonly healthBar: THREE.Mesh;
   private readonly snapshots: Snapshot[] = [];
-  private bobPhase = 0;
   private gear: number[];
+  private articulated: boolean;
 
-  constructor(info: PlayerInfo) {
+  /** Gait position, advanced by distance walked rather than by time. */
+  private walkPhase = 0;
+  private walkAmount = 0;
+  private swingTime = 0;
+  private readonly lastRendered = new THREE.Vector3();
+  private hasRendered = false;
+
+  constructor(info: PlayerInfo, articulated = true) {
     this.info = info;
+    this.articulated = articulated;
     this.gear = normalizeGear(info.equipment);
-    this.body = new THREE.Mesh(bodyGeometry(info.colorIndex, this.gear), getMobMaterial());
+    this.rig = this.buildRig();
     this.label = makeNameLabel(info.name);
     this.healthBar = makeHealthBar();
-    this.group.add(this.body, this.label, this.healthBar);
+    this.group.add(this.rig.group, this.label, this.healthBar);
     this.group.visible = false; // until the first snapshot arrives
+  }
+
+  private buildRig(): Rig {
+    // Cache key covers colour and armour, so two players in identical gear
+    // share every buffer.
+    return new Rig(
+      `player|${this.info.colorIndex}|${this.gear.join(',')}`,
+      () => playerSegments(BODY_COLORS[this.info.colorIndex % BODY_COLORS.length], this.gear),
+      this.articulated,
+    );
+  }
+
+  private rebuild(): void {
+    this.group.remove(this.rig.group);
+    this.rig.dispose();
+    this.rig = this.buildRig();
+    this.group.add(this.rig.group);
   }
 
   /** Swap in new armour; geometry is shared per (colour, gear) combination. */
@@ -163,7 +201,14 @@ export class RemotePlayer {
     const next = normalizeGear(gear);
     if (next.join(',') === this.gear.join(',')) return;
     this.gear = next;
-    this.body.geometry = bodyGeometry(this.info.colorIndex, next);
+    this.rebuild();
+  }
+
+  /** Turn limb animation on or off (the quality ladder's last resort). */
+  setArticulated(on: boolean): void {
+    if (on === this.articulated) return;
+    this.articulated = on;
+    this.rebuild();
   }
 
   /** Show a small bar under the name when the player is hurt. */
@@ -234,16 +279,42 @@ export class RemotePlayer {
     this.group.rotation.y = yaw + Math.PI;
     this.group.visible = true;
 
-    // A little walk bob and head tilt so remote players read as alive.
     const flags = (newer ?? older).flags;
-    const moving = (flags & FLAG_MOVING) !== 0;
     const jumping = (flags & FLAG_JUMPING) !== 0;
-    this.bobPhase = moving ? this.bobPhase + dt * 9 : 0;
-    const bob = moving ? Math.abs(Math.sin(this.bobPhase)) * 0.06 : 0;
-    this.body.position.y = bob + (jumping ? 0.05 : 0);
-    this.body.rotation.x = Math.max(-0.5, Math.min(0.5, pitch)) * 0.15;
-    this.label.position.y = PLAYER_HEIGHT + 0.45 + bob;
-    this.healthBar.position.y = PLAYER_HEIGHT + 0.24 + bob;
+
+    // Drive the gait from distance actually covered on screen, so the legs
+    // match the ground however jittery the packets were. FLAG_MOVING gates it
+    // so a player being shoved around does not appear to stroll.
+    const moving = (flags & FLAG_MOVING) !== 0;
+    if (this.hasRendered) {
+      const stepped = Math.hypot(x - this.lastRendered.x, z - this.lastRendered.z);
+      this.walkPhase += stepped * WALK_PHASE_PER_BLOCK;
+      const speed = dt > 0 ? stepped / dt : 0;
+      const target = moving ? Math.min(1, speed / 4) : 0;
+      this.walkAmount += (target - this.walkAmount) * Math.min(1, dt * 9);
+    }
+    this.lastRendered.set(x, y, z);
+    this.hasRendered = true;
+
+    // Start a stroke whenever the flag is up and the last one has finished.
+    //
+    // Deliberately NOT edge-triggered: the flag is a level sampled ~15 times a
+    // second, and someone mining continuously holds it up with only millisecond
+    // gaps between strokes. Edge-triggering would show one swing and then a
+    // frozen arm for the rest of the dig. Replaying while it is held gives the
+    // repeated strokes that mining actually looks like, and a single swing
+    // still plays once because the flag clears before the stroke ends.
+    if ((flags & FLAG_SWINGING) !== 0 && this.swingTime === 0) this.swingTime = SWING_TIME_S;
+    this.swingTime = Math.max(0, this.swingTime - dt);
+    const swing = this.swingTime > 0 ? 1 - this.swingTime / SWING_TIME_S : 0;
+
+    this.rig.pose(this.walkPhase, this.walkAmount, swing, pitch);
+
+    // A jumping body lifts slightly; the label rides along with it.
+    const lift = jumping ? 0.05 : 0;
+    this.rig.group.position.y = lift;
+    this.label.position.y = PLAYER_HEIGHT + 0.45 + lift;
+    this.healthBar.position.y = PLAYER_HEIGHT + 0.24 + lift;
   }
 
   dispose(): void {
@@ -293,14 +364,22 @@ function shortestAngle(from: number, to: number): number {
 
 export class RemotePlayerManager {
   private readonly players = new Map<string, RemotePlayer>();
+  /** Remembered so players joining after a quality change match everyone else. */
+  private articulated = true;
 
   constructor(private readonly scene: THREE.Scene) {}
 
   add(info: PlayerInfo): void {
     if (this.players.has(info.id)) return; // never duplicate a player
-    const player = new RemotePlayer(info);
+    const player = new RemotePlayer(info, this.articulated);
     this.players.set(info.id, player);
     this.scene.add(player.group);
+  }
+
+  /** Turn limb animation on or off for present and future bodies alike. */
+  setArticulated(on: boolean): void {
+    this.articulated = on;
+    for (const player of this.players.values()) player.setArticulated(on);
   }
 
   remove(id: string): void {

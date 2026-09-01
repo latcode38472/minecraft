@@ -43,6 +43,20 @@ export const MAX_HORIZONTAL_COORD = 30_000_000;
 export const STATE_SEND_HZ = 15;
 /** How far behind live the interpolator renders remote players. */
 export const INTERPOLATION_DELAY_MS = 120;
+
+/**
+ * The clock every inbound snapshot is stamped with, and the one interpolation
+ * compares against. It MUST be the same clock the frame loop uses.
+ *
+ * `Date.now()` and `performance.now()` have completely different epochs, so
+ * mixing them silently breaks interpolation: no snapshot ever compares as "old
+ * enough" to render, and bodies fall back to the oldest sample in the buffer —
+ * a second or more behind, with no smoothing at all. It is also monotonic,
+ * which a wall clock is not; an NTP correction would reorder the buffer.
+ */
+export function receiveClock(): number {
+  return performance.now();
+}
 export const PING_INTERVAL_MS = 2000;
 /** Server drops a connection that has not been heard from in this long. */
 export const CLIENT_TIMEOUT_MS = 30_000;
@@ -52,6 +66,10 @@ export const FLAG_MOVING = 1;
 export const FLAG_JUMPING = 2;
 export const FLAG_GROUNDED = 4;
 export const FLAG_SNEAKING = 8;
+/** Mid-swing: mining or attacking. Drives the arm animation on other screens. */
+export const FLAG_SWINGING = 16;
+/** Mask applied to inbound flags — widen this when adding a flag above. */
+export const FLAG_MASK = 0x1f;
 
 export interface WorldInfo {
   seed: number;
@@ -92,6 +110,11 @@ export interface MobStateData {
   yaw: number;
   /** Current health, so guests can show hurt flashes and remove corpses. */
   hp: number;
+  /**
+   * 1 while the mob is mid-swing. Omitted the rest of the time, so the common
+   * case costs nothing on a snapshot sent twenty times a second.
+   */
+  s?: 1;
 }
 
 export const MOB_KIND_ZOMBIE = 0;
@@ -257,7 +280,7 @@ export function sanitizePlayerState(raw: unknown): PlayerStateData | null {
   if (!isFiniteNumber(s.yaw) || !isFiniteNumber(s.pitch)) return null;
   if (Math.abs(s.x) > MAX_HORIZONTAL_COORD || Math.abs(s.z) > MAX_HORIZONTAL_COORD) return null;
   if (s.y < -64 || s.y > WORLD_HEIGHT_LIMIT + 64) return null;
-  const flags = isFiniteNumber(s.flags) ? Math.floor(s.flags) & 0xf : 0;
+  const flags = isFiniteNumber(s.flags) ? Math.floor(s.flags) & FLAG_MASK : 0;
   return {
     x: s.x,
     y: s.y,

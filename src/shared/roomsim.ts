@@ -225,7 +225,9 @@ export class RoomSimulation {
   }
 
   /** Compact snapshots for the wire. */
-  mobSnapshot(): { i: number; k: number; x: number; y: number; z: number; yaw: number; hp: number }[] {
+  mobSnapshot(): {
+    i: number; k: number; x: number; y: number; z: number; yaw: number; hp: number; s?: 1;
+  }[] {
     const out = [];
     for (const mob of this.mobs.values()) {
       out.push({
@@ -236,6 +238,8 @@ export class RoomSimulation {
         z: round(mob.position.z),
         yaw: round(mob.yaw),
         hp: Math.max(0, Math.round(mob.health)),
+        // Only present mid-swing, so idle mobs add nothing to the packet.
+        ...(mob.swingTime > 0 ? { s: 1 as const } : {}),
       });
     }
     return out;
