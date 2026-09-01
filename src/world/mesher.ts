@@ -8,7 +8,7 @@
 // lowered slightly when exposed to air.
 
 import * as THREE from 'three';
-import { BLOCKS, Block, isOpaque } from '../blocks';
+import { BLOCKS, Block, isCutout, isOpaque } from '../blocks';
 import { CHUNK_SIZE, WORLD_HEIGHT } from '../constants';
 import { getAtlasTexture, tileUVRect } from '../textures';
 import { Chunk } from './chunk';
@@ -115,6 +115,7 @@ class MeshBuilder {
 }
 
 let opaqueMaterial: THREE.MeshLambertMaterial | null = null;
+let cutoutMaterial: THREE.MeshLambertMaterial | null = null;
 let waterMaterial: THREE.MeshLambertMaterial | null = null;
 
 export function getOpaqueMaterial(): THREE.MeshLambertMaterial {
@@ -122,6 +123,19 @@ export function getOpaqueMaterial(): THREE.MeshLambertMaterial {
     opaqueMaterial = new THREE.MeshLambertMaterial({ map: getAtlasTexture(), vertexColors: true });
   }
   return opaqueMaterial;
+}
+
+/** See-through blocks (glass): alpha-tested, so no transparency sorting. */
+export function getCutoutMaterial(): THREE.MeshLambertMaterial {
+  if (!cutoutMaterial) {
+    cutoutMaterial = new THREE.MeshLambertMaterial({
+      map: getAtlasTexture(),
+      vertexColors: true,
+      alphaTest: 0.5,
+      side: THREE.DoubleSide,
+    });
+  }
+  return cutoutMaterial;
 }
 
 export function getWaterMaterial(): THREE.MeshLambertMaterial {
@@ -140,11 +154,13 @@ export function getWaterMaterial(): THREE.MeshLambertMaterial {
 
 export interface ChunkGeometry {
   opaque: THREE.BufferGeometry | null;
+  cutout: THREE.BufferGeometry | null;
   water: THREE.BufferGeometry | null;
 }
 
 export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeometry {
   const opaque = new MeshBuilder();
+  const cutout = new MeshBuilder();
   const water = new MeshBuilder();
   const ox = chunk.cx * CHUNK_SIZE;
   const oz = chunk.cz * CHUNK_SIZE;
@@ -157,23 +173,29 @@ export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeo
         const wx = ox + lx;
         const wz = oz + lz;
         const isWater = id === Block.Water;
+        const cut = isCutout(id);
         const def = BLOCKS[id];
+        const target = isWater ? water : cut ? cutout : opaque;
 
         for (const face of FACES) {
           const neighbor = sample(wx + face.dir[0], y + face.dir[1], wz + face.dir[2]);
           if (isWater) {
             if (neighbor !== Block.Air) continue;
+          } else if (cut) {
+            // Cull against opaque neighbours and against the same block, so a
+            // glass wall has no interior faces but still shows through.
+            if (isOpaque(neighbor) || neighbor === id) continue;
           } else if (isOpaque(neighbor)) {
             continue;
           }
           const tile = def.tiles[face.kind];
-          emitFace(isWater ? water : opaque, face, lx, y, lz, wx, wz, tile, isWater, sample);
+          emitFace(target, face, lx, y, lz, wx, wz, tile, isWater, sample);
         }
       }
     }
   }
 
-  return { opaque: opaque.build(), water: water.build() };
+  return { opaque: opaque.build(), cutout: cutout.build(), water: water.build() };
 }
 
 function emitFace(

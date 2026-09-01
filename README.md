@@ -23,8 +23,9 @@ Production build: `npm run build`, serve with `npm run preview`.
 | Mouse | look |
 | Space | jump / swim up |
 | Shift | sneak / swim down |
-| Left click (hold) | break block |
-| Right click (hold) | place selected block |
+| Left click (hold) | mine the targeted block / attack a mob |
+| Right click | place block, eat food, use a crafting table or furnace |
+| E | inventory & crafting |
 | 1–9 / mouse wheel | select hotbar slot |
 | `[` / `]` | decrease / increase view distance |
 | T | skip time forward (test day/night) |
@@ -39,11 +40,12 @@ landscape):
 | --- | --- |
 | Left pad | move (analog) |
 | Drag anywhere else | look |
-| Tap | break targeted block |
-| Press & hold | place selected block (repeats) |
+| Hold | mine the targeted block / attack a mob |
+| Tap | place block, eat food, use a crafting table or furnace |
 | ▲ button | jump / swim up (hold) |
 | ▼ button | sneak / swim down (toggle) |
-| Tap hotbar | select block |
+| Tap hotbar | select item |
+| ☰ button | inventory & crafting |
 | ❚❚ button | pause / show menu |
 
 Touch defaults to a 4-chunk view distance for phone GPUs. Detection uses the
@@ -62,34 +64,61 @@ instead of a black screen.
 URL parameters: `?seed=12345` starts a specific world (a new seed wipes saved
 edits), `?reset` wipes the save entirely, `?touch=1` forces touch controls.
 
-## What's in the MVP
+## What's in the game
 
-- First-person camera with pointer-lock mouse look
+**World**
 - Chunk-based world (16×72×16 columns), streamed in/out around the player
-- Seeded procedural terrain: continents/oceans, plains, hills, mountains,
-  beaches, water, trees; layered grass/dirt/stone/bedrock
-- Break and place blocks with a 9-slot hotbar (grass, dirt, stone, sand, log,
-  leaves, planks, cobblestone, water)
-- AABB collision, gravity, jumping, swimming
-- Day/night cycle driving sun light, ambient light, sky and fog colour
-- Baked ambient occlusion + directional face shading on chunk meshes
-- Generated sound effects (break / place / footsteps) via WebAudio
-- Mobile touch controls: virtual joystick, drag-look, tap/hold to break/place
-- World persistence in IndexedDB: seed, player state, and per-chunk edit diffs,
-  auto-saved every 5 s and on tab hide
+- Seeded terrain: continents/oceans, plains, hills, mountains, beaches, valleys,
+  and cave systems carved by 3D noise (~6% of underground volume)
+- Ore generation by depth: coal, then iron, gold, and diamond deepest and rarest
+- 20 block types including gravel, bricks, glass, crafting table and furnace
+- Trees, water, day/night cycle driving sun, sky and fog
+
+**Survival**
+- 20 health, 20 hunger; hunger drains with time and distance, regenerates health
+  when full, and starves you when empty
+- Fall damage, mob damage with knockback and invulnerability frames
+- Death screen and respawn at your world spawn point
+- Passive pigs and hostile zombies; zombies chase and attack at night, both take
+  damage, die, and drop loot
+
+**Items and building**
+- Mining takes time based on block hardness and the tool you hold; the wrong
+  tool tier means no drop at all (stone without a pickaxe drops nothing)
+- Broken blocks and dead mobs drop collectable item entities
+- 36-slot inventory with a 9-slot hotbar, stacking, and tool durability
+- Crafting: planks, sticks and a crafting table by hand; pickaxes, axes and
+  swords in four tiers at a table; smelting (iron, gold, glass, stone, bricks,
+  cooked food) at a furnace
+- Persistence in IndexedDB: seed, player state, inventory, health/hunger, and
+  per-chunk edit diffs
 
 ## Architecture
 
 ```
 src/
-  constants.ts       all tunables (chunk size, gravity, reach, speeds...)
-  blocks.ts          block registry: tiles, solidity, opacity, sounds
-  textures.ts        procedural 16px texture atlas (canvas -> CanvasTexture)
+  constants.ts       all tunables (chunk size, gravity, reach, combat, hunger...)
+  blocks.ts          block registry: tiles, hardness, tool + tier, drops
+  textures.ts        procedural atlas: block tiles + pixel-art item icons
+  physics.ts         shared AABB-vs-voxel collision (player and mobs)
   input.ts           keyboard/wheel state, discrete press queue
   raycast.ts         Amanatides & Woo voxel DDA
   audio.ts           WebAudio generated sound effects
   sky.ts             day/night: sun/ambient lights, sky+fog colour keyframes
-  save.ts            IndexedDB store (meta + per-chunk edit diffs)
+  save.ts            IndexedDB store (meta, inventory, per-chunk edit diffs)
+  items/
+    items.ts         item registry: blocks, materials, food, tools, weapons
+    inventory.ts     slots, stacking, durability, serialisation
+    crafting.ts      recipes and stations (hand / table / furnace)
+  entities/
+    entity.ts        Entity + Mob base: gravity, knockback, hurt state
+    models.ts        merged box geometry per mob type (one draw call each)
+    zombie.ts        hostile AI: chase, attack, wander
+    pig.ts           passive AI: wander, flee when hit
+    itemdrop.ts      dropped items: spin, bob, pickup
+    manager.ts       lifecycle, spawning/despawning, ray-vs-mob queries
+  game/
+    interaction.ts   mining progress, placing, attacking, eating, stations
   world/
     chunk.ts         flat Uint8Array voxel storage per 16x72x16 column
     noise.ts         seeded value noise + fBm
@@ -98,10 +127,13 @@ src/
     mesher.ts        culled face meshing with baked AO, opaque+water buffers
   player/
     camera.ts        pointer-lock yaw/pitch
-    player.ts        AABB physics: axis-separated collision, swim, substeps
+    player.ts        movement intent, water state, fall tracking
+    survival.ts      health, hunger, regen, starvation, death
   ui/
-    hud.ts           hotbar, FPS counter, debug panel, toasts
-    touch.ts         virtual joystick, look/tap/long-press gestures, buttons
+    hud.ts           hotbar bound to the inventory, FPS, debug, toasts
+    statusui.ts      hearts, hunger, mining progress, death screen
+    inventoryui.ts   inventory grid and recipe list
+    touch.ts         virtual joystick, look/tap/hold gestures, buttons
   main.ts            bootstrapping and the frame loop
 ```
 
@@ -130,39 +162,68 @@ ray. Every voxel on the ray is visited exactly once (no skipped corners), and
 the axis of the last step gives the hit face's normal — which is where a
 placed block goes.
 
-**Physics.** The player is an AABB moved one axis at a time; after each axis
-move, any overlapped solid voxel clamps the position back to the voxel face
-and zeroes that velocity component. Movement is integrated in substeps small
-enough that no step exceeds 0.4 blocks, which rules out tunnelling at any
-frame rate. Unloaded chunks read as solid so the player can't fall through
-terrain that hasn't streamed in yet.
+**Physics.** Bodies are AABBs moved one axis at a time (`physics.ts`, shared by
+the player and every mob); after each axis move, any overlapped solid voxel
+clamps the position back to the voxel face and zeroes that velocity component.
+Movement is integrated in substeps small enough that no step exceeds 0.4 blocks,
+which rules out tunnelling at any frame rate. Unloaded chunks read as solid so
+nothing falls through terrain that hasn't streamed in yet.
+
+**Caves.** Two independent 3D noise fields are each thresholded into a thin
+shell (`|noise - 0.5| < t`); a voxel is carved only where *both* shells overlap,
+which yields connected tunnels instead of the disconnected blobs a single
+threshold gives. The threshold is the measured 5th percentile of that metric
+(`TerrainGenerator.caveMetric` is public precisely so it can be re-measured),
+so ~6% of underground volume becomes cave. Sea floors are left sealed because
+water here is static and would not flow into an opened cavern.
+
+**Mining.** Break time is `hardness × (harvestable ? 1.5 : 5) / toolSpeed`.
+Holding the right tool class speeds a block up; holding one of insufficient
+*tier* still breaks it but forfeits the drop — so stone mined by hand yields
+nothing, exactly like Minecraft. Progress resets whenever the crosshair moves
+to a different voxel.
+
+**Mobs.** Each mob type's body is a handful of boxes merged into a single
+cached `BufferGeometry` with baked vertex colours, so a mob costs one draw call
+and all instances of a type share one buffer. AI is a per-frame `update` on a
+`Mob` subclass: zombies chase and attack inside a detection radius, pigs wander
+and flee. Attacks use a slab-method ray/AABB test against mob boxes, and a mob
+in front of the targeted block takes the hit instead of the block.
 
 ## Current limitations
 
 - Water is static (no flow simulation); placing/removing blocks doesn't make
   water spread.
 - No per-voxel light propagation — lighting is sun + ambient + baked AO, so
-  caves/overhangs don't get properly dark and torches don't exist yet.
-- Culled meshing, not greedy merging; fine at default view distance, and the
-  mesher is the single hook to upgrade (`world/mesher.ts`,
-  `buildChunkGeometry`). TODO there if 12+ chunk view distances are wanted.
-- Chunk generation/meshing runs on the main thread under a time budget; a
-  worker would remove the last hitches at high view distance.
+  caves aren't dark inside and torches don't exist yet. Hostile spawning is
+  gated on time of day rather than light level for the same reason.
+- Mobs are not saved; they despawn past 72 blocks and respawn naturally. Only
+  the seed, player state, inventory and block edits persist.
+  TODO hook: serialise `EntityManager.entities` alongside `SaveMeta`.
+- Mob AI has no pathfinding — zombies walk straight at you and hop one-block
+  ledges, so they get stuck on complex terrain. Hook: `Zombie.update`.
+- Culled meshing, not greedy merging; fine at default view distance.
+  TODO hook: `buildChunkGeometry` in `world/mesher.ts`.
+- Chunk generation/meshing runs on the main thread under a time budget.
   TODO hook: move `buildChunkGeometry` + `TerrainGenerator.generate` behind a
-  worker boundary (both are pure functions of chunk data already).
-- No inventory beyond the hotbar, no block drops — breaking destroys.
+  worker boundary (both are already pure functions of chunk data).
+- Inventory is click-to-pick-up/click-to-place rather than true drag-and-drop,
+  and there is no drop-item-from-inventory action.
+- Dying keeps your inventory (deliberate for now); no armour, no bow, no
+  shovels — `ToolKind` already includes `'shovel'` as the extension point.
 
 ## Next 5 features (priority order)
 
-1. **Per-voxel lighting** — flood-fill sunlight + block light (torches) stored
-   per voxel, sampled in the mesher; makes caves dark and enables torches.
+1. **Per-voxel lighting** — flood-fill sunlight + block light stored per voxel
+   and sampled in the mesher. Unlocks dark caves, torches, and light-based
+   hostile spawning, all of which the current systems are stubbed for.
    Hook: add a light array to `Chunk`, sample it in `emitFace`.
 2. **Web worker meshing/generation** — moves the remaining frame hitches off
-   the main thread; `mesher.ts`/`terrain.ts` are already pure.
-3. **Block drops + inventory counts** — breaking yields items, hotbar shows
-   counts; first step toward survival mode.
-4. **Greedy meshing** — merge coplanar same-texture quads; cuts triangle count
+   the main thread; `mesher.ts`/`terrain.ts` are already pure functions.
+3. **Armour, bows and a real damage model** — item slots for armour with damage
+   reduction, plus a projectile entity. `ItemDef` and `Entity` are the hooks.
+4. **Biomes and structures** — swap the single terrain function for a biome
+   table (desert, forest, snow) and scatter simple structures; the chunk
+   pipeline already supports it via `TerrainGenerator.generate`.
+5. **Greedy meshing** — merge coplanar same-texture quads; cuts triangle count
    several-fold and unlocks much larger view distances.
-5. **Caves and ores** — 3D noise carving below the surface plus ore veins;
-   makes digging worthwhile. Hook: carve in `TerrainGenerator.generate` after
-   the column fill.

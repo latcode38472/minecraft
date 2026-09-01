@@ -40,12 +40,35 @@ function playNoiseBurst(
   src.stop(now + duration);
 }
 
+/** Short pitched tone, for UI-ish feedback (pickup, hurt, eat). */
+function playTone(
+  startFreq: number,
+  endFreq: number,
+  duration: number,
+  volume: number,
+  type: OscillatorType = 'square',
+): void {
+  if (!ctx || ctx.state !== 'running') return;
+  const now = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  osc.type = type;
+  osc.frequency.setValueAtTime(startFreq, now);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), now + duration);
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(volume, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + duration);
+}
+
 const BREAK_FREQ: Record<SoundKind, number> = {
   soft: 900,
   hard: 2400,
   wood: 1200,
   sand: 700,
   liquid: 500,
+  glass: 3600,
 };
 
 export function playBreak(kind: SoundKind): void {
@@ -58,4 +81,28 @@ export function playPlace(kind: SoundKind): void {
 
 export function playStep(): void {
   playNoiseBurst(0.06, 650, 0.12, 0.55);
+}
+
+/** Swing whoosh when attacking. */
+export function playAttack(): void {
+  playNoiseBurst(0.12, 1800, 0.14, 0.25);
+}
+
+/** Descending tone when the player takes damage. */
+export function playHurt(): void {
+  playTone(420, 180, 0.22, 0.16, 'sawtooth');
+}
+
+/** Rising blip when an item is collected. */
+export function playPickup(): void {
+  playTone(700, 1150, 0.09, 0.09, 'square');
+}
+
+export function playEat(): void {
+  playNoiseBurst(0.18, 480, 0.2, 0.4);
+}
+
+/** Low thud when a mob dies. */
+export function playMobDeath(): void {
+  playTone(260, 90, 0.3, 0.14, 'triangle');
 }

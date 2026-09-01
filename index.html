@@ -14,11 +14,12 @@
         touch-action: none; overscroll-behavior: none;
         -webkit-user-select: none; user-select: none;
         -webkit-tap-highlight-color: transparent;
+        font-family: 'Courier New', monospace;
       }
       #app { position: fixed; inset: 0; }
       canvas { display: block; }
 
-      .hud { position: fixed; font-family: 'Courier New', monospace; color: #fff; user-select: none; pointer-events: none; }
+      .hud { position: fixed; color: #fff; user-select: none; pointer-events: none; }
 
       #crosshair {
         left: 50%; top: 50%; transform: translate(-50%, -50%);
@@ -28,10 +29,41 @@
       #fps { left: 8px; top: 6px; font-size: 13px; text-shadow: 1px 1px 0 #000; }
       #debug { left: 8px; top: 24px; font-size: 12px; text-shadow: 1px 1px 0 #000; white-space: pre; display: none; }
       #toast {
-        left: 50%; top: 20%; transform: translateX(-50%);
+        left: 50%; top: 18%; transform: translateX(-50%);
         font-size: 16px; text-shadow: 1px 1px 0 #000; opacity: 0; transition: opacity 0.4s;
       }
+      #held-name {
+        left: 50%; bottom: 82px; transform: translateX(-50%);
+        font-size: 15px; text-shadow: 1px 1px 0 #000; opacity: 0; transition: opacity 0.5s;
+      }
 
+      /* --- Mining progress --- */
+      #break-progress {
+        left: 50%; top: calc(50% + 20px); transform: translateX(-50%);
+        width: 70px; height: 6px; display: none;
+        background: rgba(0, 0, 0, 0.55); border: 1px solid #000; border-radius: 2px;
+      }
+      #break-progress-bar { height: 100%; width: 0; background: #ddd; }
+
+      /* --- Survival bars --- */
+      #status {
+        left: 50%; bottom: 66px; transform: translateX(-50%);
+        display: none; gap: 26px; width: 420px; max-width: 92vw;
+        justify-content: space-between;
+      }
+      html.playing #status { display: flex; }
+      #health-bar, #hunger-bar { display: flex; gap: 1px; }
+      #hunger-bar { flex-direction: row-reverse; }
+      #status svg { width: 17px; height: 17px; filter: drop-shadow(1px 1px 0 rgba(0,0,0,0.9)); }
+      #status svg path { stroke: #1a1a1a; stroke-width: 1.4; }
+      .heart.full path { fill: #e33d3d; }
+      .heart.half path { fill: url(#halfHeart); }
+      .heart.empty path { fill: #4a4a4a; }
+      .food.full path { fill: #d8913f; }
+      .food.half path { fill: #a86e2f; }
+      .food.empty path { fill: #4a4a4a; }
+
+      /* --- Hotbar --- */
       #hotbar {
         left: 50%; bottom: calc(10px + env(safe-area-inset-bottom)); transform: translateX(-50%);
         display: flex; gap: 4px; padding: 4px;
@@ -48,30 +80,87 @@
         position: absolute; left: 3px; top: 1px; font-size: 10px; color: #ddd;
         text-shadow: 1px 1px 0 #000;
       }
-
-      #water-overlay {
-        inset: 0; background: rgba(20, 60, 160, 0.35); display: none;
+      .slot .count, .inv-slot .count {
+        position: absolute; right: 3px; bottom: 1px; font-size: 12px; font-weight: bold;
+        color: #fff; text-shadow: 1px 1px 0 #000;
+      }
+      .slot .durability {
+        position: absolute; left: 2px; bottom: 2px; height: 3px; display: none;
+        border-radius: 1px;
       }
 
-      #menu {
+      #water-overlay { inset: 0; background: rgba(20, 60, 160, 0.35); display: none; }
+      #hurt-flash {
+        inset: 0; background: radial-gradient(circle, rgba(160,0,0,0) 35%, rgba(170,0,0,0.9) 100%);
+        opacity: 0; transition: opacity 0.15s;
+      }
+
+      /* --- Overlays (menu, death, inventory) --- */
+      .overlay {
         position: fixed; inset: 0; display: flex; flex-direction: column;
         align-items: center; justify-content: center; gap: 14px;
-        background: rgba(0, 0, 0, 0.6); color: #fff;
-        font-family: 'Courier New', monospace; cursor: pointer; z-index: 10;
+        background: rgba(0, 0, 0, 0.62); color: #fff; z-index: 10;
       }
+      #menu { cursor: pointer; }
       #menu h1 { margin: 0; font-size: 42px; letter-spacing: 3px; text-shadow: 3px 3px 0 #2a2a2a; }
       #menu .hint { font-size: 18px; animation: pulse 1.6s infinite; }
       #menu table { font-size: 14px; color: #ccc; border-spacing: 12px 3px; }
       #menu td:first-child { color: #fff; text-align: right; }
       @keyframes pulse { 50% { opacity: 0.4; } }
 
-      /* Touch controls: shown only when main.ts adds .touch to <html>. */
+      #death { display: none; background: rgba(90, 0, 0, 0.65); }
+      #death h1 { margin: 0; font-size: 38px; color: #ff6b6b; text-shadow: 3px 3px 0 #2a0000; }
+      button {
+        font-family: inherit; font-size: 16px; padding: 10px 26px; cursor: pointer;
+        color: #fff; background: #4a4a4a; border: 2px solid #8a8a8a; border-radius: 3px;
+      }
+      button:hover:not(:disabled) { background: #5c5c5c; }
+      button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+      /* --- Inventory --- */
+      #inventory { display: none; }
+      .inv-panel {
+        display: flex; gap: 18px; padding: 16px 18px; max-width: 96vw; max-height: 92vh;
+        background: #2b2b2b; border: 3px solid #6d6d6d; border-radius: 4px;
+      }
+      .inv-left { display: flex; flex-direction: column; gap: 10px; }
+      .inv-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+      #inv-title { font-size: 17px; font-weight: bold; }
+      #inv-close { padding: 4px 12px; font-size: 14px; }
+      #inv-grid, #inv-hotbar {
+        display: grid; grid-template-columns: repeat(9, 1fr); gap: 3px;
+      }
+      #inv-hotbar { padding-top: 8px; border-top: 2px solid #555; }
+      .inv-slot {
+        width: 42px; height: 42px; position: relative; cursor: pointer;
+        background: #555; border: 2px solid #3a3a3a; border-radius: 2px;
+      }
+      .inv-slot:hover { background: #6a6a6a; }
+      .inv-slot.held { background: #8a7a3a; border-color: #d8c060; }
+      .inv-slot canvas { width: 100%; height: 100%; image-rendering: pixelated; }
+      .inv-right {
+        width: 300px; max-width: 44vw; display: flex; flex-direction: column; gap: 6px;
+        overflow-y: auto; padding-right: 4px;
+      }
+      .inv-right h3 { margin: 0 0 2px; font-size: 14px; color: #cfcfcf; letter-spacing: 1px; }
+      .recipe {
+        display: flex; align-items: center; gap: 10px; padding: 5px 8px; text-align: left;
+        background: #3d3d3d; border: 2px solid #565656; border-radius: 3px; width: 100%;
+      }
+      .recipe canvas { width: 28px; height: 28px; image-rendering: pixelated; flex-shrink: 0; }
+      .recipe-text { display: flex; flex-direction: column; line-height: 1.35; min-width: 0; }
+      .recipe-text strong { font-size: 13px; }
+      .recipe-text em { font-size: 11px; color: #b3b3b3; font-style: normal; }
+      .recipe.locked { opacity: 0.45; cursor: not-allowed; }
+      .recipe-hint { font-size: 11px; color: #9a9a9a; margin: 6px 2px 0; line-height: 1.4; }
+
+      /* --- Touch controls --- */
       .touch-only { display: none; }
       html.touch .desktop-only { display: none; }
       html.touch span.touch-only { display: inline; }
       html.touch table.touch-only { display: table; }
       #touch-ui { display: none; }
-      html.touch #touch-ui { display: block; }
+      html.touch.playing #touch-ui { display: block; }
       #touch-ui > * { position: fixed; pointer-events: auto; touch-action: none; z-index: 5; }
       #joystick {
         left: 20px; bottom: calc(80px + env(safe-area-inset-bottom));
@@ -85,9 +174,8 @@
       }
       .touch-btn {
         display: flex; align-items: center; justify-content: center;
-        color: #fff; font-family: 'Courier New', monospace;
-        background: rgba(0, 0, 0, 0.35); border: 2px solid rgba(255, 255, 255, 0.5);
-        border-radius: 50%;
+        color: #fff; background: rgba(0, 0, 0, 0.35);
+        border: 2px solid rgba(255, 255, 255, 0.5); border-radius: 50%;
       }
       #btn-jump {
         right: 24px; bottom: calc(96px + env(safe-area-inset-bottom));
@@ -102,21 +190,72 @@
         right: 12px; top: calc(10px + env(safe-area-inset-top));
         width: 44px; height: 44px; font-size: 14px; border-radius: 8px;
       }
+      #btn-inventory {
+        right: 64px; top: calc(10px + env(safe-area-inset-top));
+        width: 44px; height: 44px; font-size: 18px; border-radius: 8px;
+      }
       @media (max-width: 760px) {
         .slot { width: 34px; height: 34px; }
+        .inv-slot { width: 32px; height: 32px; }
         #menu h1 { font-size: 30px; }
+        #status { bottom: 54px; width: 320px; }
+        #status svg { width: 14px; height: 14px; }
+        .inv-panel { flex-direction: column; gap: 10px; padding: 10px; }
+        .inv-right { width: auto; max-width: none; max-height: 30vh; }
       }
     </style>
   </head>
   <body>
     <div id="app"></div>
+
+    <!-- Gradient used by half-full hearts -->
+    <svg width="0" height="0" style="position: absolute">
+      <defs>
+        <linearGradient id="halfHeart" x1="0" x2="1" y1="0" y2="0">
+          <stop offset="50%" stop-color="#e33d3d" />
+          <stop offset="50%" stop-color="#4a4a4a" />
+        </linearGradient>
+      </defs>
+    </svg>
+
     <div id="water-overlay" class="hud"></div>
+    <div id="hurt-flash" class="hud"></div>
     <div id="crosshair" class="hud">+</div>
+    <div id="break-progress" class="hud"><div id="break-progress-bar"></div></div>
     <div id="fps" class="hud"></div>
     <div id="debug" class="hud"></div>
     <div id="toast" class="hud"></div>
+    <div id="held-name" class="hud"></div>
+    <div id="status" class="hud">
+      <div id="health-bar"></div>
+      <div id="hunger-bar"></div>
+    </div>
     <div id="hotbar" class="hud"></div>
-    <div id="menu">
+
+    <div id="inventory" class="overlay">
+      <div class="inv-panel">
+        <div class="inv-left">
+          <div class="inv-head">
+            <span id="inv-title">Inventory</span>
+            <button id="inv-close" type="button">Close (E)</button>
+          </div>
+          <div id="inv-grid"></div>
+          <div id="inv-hotbar"></div>
+        </div>
+        <div class="inv-right">
+          <h3>CRAFTING</h3>
+          <div id="recipe-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="death" class="overlay">
+      <h1>YOU DIED</h1>
+      <div id="death-msg"></div>
+      <button id="respawn-btn" type="button">Respawn</button>
+    </div>
+
+    <div id="menu" class="overlay">
       <h1>VOXELCRAFT</h1>
       <div class="hint">
         <span class="desktop-only">Click</span><span class="touch-only">Tap</span> to play
@@ -124,11 +263,11 @@
       <table class="desktop-only">
         <tr><td>W A S D</td><td>move</td></tr>
         <tr><td>Mouse</td><td>look</td></tr>
-        <tr><td>Space</td><td>jump / swim up</td></tr>
-        <tr><td>Shift</td><td>sneak / swim down</td></tr>
-        <tr><td>Left click</td><td>break block</td></tr>
-        <tr><td>Right click</td><td>place block</td></tr>
-        <tr><td>1-9 / wheel</td><td>select block</td></tr>
+        <tr><td>Space / Shift</td><td>jump / sneak</td></tr>
+        <tr><td>Hold left click</td><td>mine block / attack</td></tr>
+        <tr><td>Right click</td><td>place, eat, use table</td></tr>
+        <tr><td>E</td><td>inventory &amp; crafting</td></tr>
+        <tr><td>1-9 / wheel</td><td>select item</td></tr>
         <tr><td>[ / ]</td><td>view distance</td></tr>
         <tr><td>T</td><td>skip time</td></tr>
         <tr><td>F3</td><td>debug info</td></tr>
@@ -137,13 +276,13 @@
       <table class="touch-only">
         <tr><td>Left pad</td><td>move</td></tr>
         <tr><td>Drag screen</td><td>look</td></tr>
-        <tr><td>Tap</td><td>break block</td></tr>
-        <tr><td>Press &amp; hold</td><td>place block</td></tr>
-        <tr><td>&#9650;</td><td>jump / swim up (hold)</td></tr>
-        <tr><td>&#9660;</td><td>sneak / swim down (toggle)</td></tr>
-        <tr><td>Tap hotbar</td><td>select block</td></tr>
+        <tr><td>Hold</td><td>mine block / attack</td></tr>
+        <tr><td>Tap</td><td>place, eat, use table</td></tr>
+        <tr><td>&#9650; / &#9660;</td><td>jump / sneak</td></tr>
+        <tr><td>Backpack button</td><td>inventory &amp; crafting</td></tr>
       </table>
     </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

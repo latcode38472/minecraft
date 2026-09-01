@@ -2,6 +2,7 @@
 // seed, player state, and per-chunk *edit diffs* — terrain regenerates from
 // the seed and the diffs are re-applied on top.
 
+import type { ItemStack } from './items/inventory';
 import type { ChunkEdits } from './world/world';
 
 const DB_NAME = 'voxelcraft';
@@ -15,6 +16,11 @@ export interface SaveMeta {
   timeOfDay: number;
   player: { x: number; y: number; z: number; yaw: number; pitch: number };
   selectedSlot: number;
+  // Survival state — optional so worlds saved before survival existed still load.
+  inventory?: (ItemStack | null)[];
+  health?: number;
+  hunger?: number;
+  spawn?: { x: number; y: number; z: number };
 }
 
 interface EditsRecord {

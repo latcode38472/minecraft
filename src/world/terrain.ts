@@ -5,11 +5,18 @@
 import { Block } from '../blocks';
 import { CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT } from '../constants';
 import { Chunk } from './chunk';
-import { coordRandom, fbm2, smoothstep } from './noise';
+import { coordRandom, fbm2, fbm3, smoothstep } from './noise';
 
 const TREE_SALT = 0x7ee5;
 const TREE_CHANCE = 0.007;
 const TREE_MARGIN = 2; // how far outside a chunk a tree centre can still reach in
+
+/**
+ * Carve where the cave metric falls below this; see TerrainGenerator.caveMetric.
+ * This is the measured 5th percentile of that metric, i.e. ~5% of underground
+ * volume becomes cave.
+ */
+const CAVE_THRESHOLD = 0.0414;
 
 export class TerrainGenerator {
   constructor(readonly seed: number) {}
@@ -50,8 +57,43 @@ export class TerrainGenerator {
     const ground = this.heightAt(wx, wz);
     // Trees only on grass, comfortably above the beach line.
     if (ground <= SEA_LEVEL + 2) return null;
+    // Don't root a tree over a cave mouth — it would be left floating.
+    if (this.isCaveAt(wx, ground - 1, wz)) return null;
     const r = coordRandom(wx, wz, this.seed ^ (TREE_SALT + 1));
     return { height: 4 + Math.floor(r * 3) };
+  }
+
+  /**
+   * Caves are the intersection of two noise "sheets": each |noise - 0.5| < t
+   * band is a warped surface, and where two of them cross you get a tunnel
+   * rather than the swiss-cheese blobs a single threshold produces.
+   *
+   * Returns how far the worst of the two sheets is from its centre, so
+   * `metric < CAVE_THRESHOLD` is the carve test. Exposed for calibration:
+   * the threshold is the Nth percentile of this metric, which is how the
+   * value below was picked (~5% of underground volume carved).
+   */
+  caveMetric(wx: number, y: number, wz: number): number {
+    // Y is scaled up so tunnels run flatter than they do wide.
+    const a = fbm3(wx * 0.031, y * 0.055, wz * 0.031, this.seed + 4001, 2);
+    const b = fbm3(wx * 0.031, y * 0.055, wz * 0.031, this.seed + 8009, 2);
+    return Math.max(Math.abs(a - 0.5), Math.abs(b - 0.5));
+  }
+
+  isCaveAt(wx: number, y: number, wz: number): boolean {
+    if (y < 2) return false;
+    return this.caveMetric(wx, y, wz) < CAVE_THRESHOLD;
+  }
+
+  /** Ore blobs: rarer and deeper as the material gets more valuable. */
+  private oreAt(wx: number, y: number, wz: number, ground: number): number | null {
+    const blob = (salt: number, freq: number): number =>
+      fbm3(wx * freq, y * freq, wz * freq, this.seed + salt, 2);
+    if (y < 14 && blob(9101, 0.155) > 0.815) return Block.DiamondOre;
+    if (y < 28 && blob(9203, 0.145) > 0.79) return Block.GoldOre;
+    if (y < 46 && blob(9307, 0.135) > 0.752) return Block.IronOre;
+    if (y < ground - 3 && blob(9403, 0.125) > 0.722) return Block.CoalOre;
+    return null;
   }
 
   generate(chunk: Chunk): void {
@@ -60,14 +102,38 @@ export class TerrainGenerator {
 
     for (let lz = 0; lz < CHUNK_SIZE; lz++) {
       for (let lx = 0; lx < CHUNK_SIZE; lx++) {
-        const ground = this.heightAt(ox + lx, oz + lz);
+        const wx = ox + lx;
+        const wz = oz + lz;
+        const ground = this.heightAt(wx, wz);
         const beach = ground <= SEA_LEVEL + 1;
+        // Keep the sea floor sealed: an open cave under water would be a dry
+        // air pocket, since water here is static.
+        const underwater = ground < SEA_LEVEL;
+
         for (let y = 0; y < ground; y++) {
           let id: number;
           if (y === 0) id = Block.Bedrock;
           else if (y < ground - 4) id = Block.Stone;
           else if (y < ground - 1) id = beach ? Block.Sand : Block.Dirt;
           else id = beach ? Block.Sand : Block.Grass;
+
+          if (id === Block.Stone) {
+            const sealFloor = underwater && y >= ground - 3;
+            if (!sealFloor && this.isCaveAt(wx, y, wz)) {
+              id = Block.Air;
+            } else {
+              // Gravel patches, then ores, both only inside stone.
+              if (fbm3(wx * 0.085, y * 0.085, wz * 0.085, this.seed + 5501, 2) > 0.735) {
+                id = Block.Gravel;
+              } else {
+                id = this.oreAt(wx, y, wz, ground) ?? id;
+              }
+            }
+          } else if (y > 1 && y < ground - 1 && !underwater && this.isCaveAt(wx, y, wz)) {
+            // Let tunnels break through dirt so caves have surface entrances.
+            id = Block.Air;
+          }
+
           chunk.set(lx, y, lz, id);
         }
         for (let y = ground; y < SEA_LEVEL; y++) {

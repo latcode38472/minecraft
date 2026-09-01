@@ -1,13 +1,13 @@
 // Touch control scheme (Minecraft Pocket Edition style):
 // - virtual joystick (bottom-left) moves, with analog magnitude
 // - dragging anywhere else looks around
-// - a quick tap breaks the targeted block; holding still places (repeating)
+// - a quick tap uses/places (Pocket Edition style); holding still mines
 // - dedicated jump (hold) and sneak (toggle) buttons, pause button top-right
 //
 // One finger may own the joystick while another owns the look surface, tracked
 // by pointerId. The tap/hold/drag decision per look-finger: travel beyond
 // TOUCH_TAP_CANCEL_PX makes it a drag; releasing within TOUCH_TAP_MAX_MS with
-// little travel is a tap; holding still past TOUCH_LONG_PRESS_MS starts placing.
+// little travel is a tap; holding still past TOUCH_LONG_PRESS_MS starts mining.
 
 import {
   TOUCH_LONG_PRESS_MS,
@@ -22,13 +22,14 @@ export class TouchControls {
   moveStrafe = 0;
   jumpHeld = false;
   sneakOn = false;
-  /** True while a long-press is active (place repeatedly). */
-  placeHeld = false;
+  /** True while a long-press is active: mine the targeted block. */
+  holdActive = false;
   onPause: (() => void) | null = null;
+  onInventory: (() => void) | null = null;
 
   private lookDeltaX = 0;
   private lookDeltaY = 0;
-  private breakTaps = 0;
+  private taps = 0;
 
   private lookPointer = -1;
   private lookStartX = 0;
@@ -49,7 +50,8 @@ export class TouchControls {
       <div id="joystick"><div id="joystick-knob"></div></div>
       <div class="touch-btn" id="btn-jump">&#9650;</div>
       <div class="touch-btn" id="btn-sneak">&#9660;</div>
-      <div class="touch-btn" id="btn-pause">&#10074;&#10074;</div>`;
+      <div class="touch-btn" id="btn-pause">&#10074;&#10074;</div>
+      <div class="touch-btn" id="btn-inventory">&#9776;</div>`;
     document.body.append(root);
     this.knob = root.querySelector<HTMLElement>('#joystick-knob')!;
 
@@ -66,10 +68,10 @@ export class TouchControls {
     return out;
   }
 
-  /** Number of break taps since the last call. */
-  takeBreakTaps(): number {
-    const out = this.breakTaps;
-    this.breakTaps = 0;
+  /** Number of use/place taps since the last call. */
+  takeTaps(): number {
+    const out = this.taps;
+    this.taps = 0;
     return out;
   }
 
@@ -136,6 +138,11 @@ export class TouchControls {
       e.preventDefault();
       this.onPause?.();
     });
+
+    root.querySelector<HTMLElement>('#btn-inventory')!.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      this.onInventory?.();
+    });
   }
 
   private bindLookSurface(surface: HTMLElement): void {
@@ -149,7 +156,7 @@ export class TouchControls {
       this.lookStartTime = performance.now();
       this.lookDragging = false;
       this.longPressTimer = window.setTimeout(() => {
-        if (this.lookPointer === e.pointerId && !this.lookDragging) this.placeHeld = true;
+        if (this.lookPointer === e.pointerId && !this.lookDragging) this.holdActive = true;
       }, TOUCH_LONG_PRESS_MS);
     });
 
@@ -160,7 +167,7 @@ export class TouchControls {
       this.lookLastX = e.clientX;
       this.lookLastY = e.clientY;
       const travel = Math.hypot(e.clientX - this.lookStartX, e.clientY - this.lookStartY);
-      if (travel > TOUCH_TAP_CANCEL_PX && !this.placeHeld && !this.lookDragging) {
+      if (travel > TOUCH_TAP_CANCEL_PX && !this.holdActive && !this.lookDragging) {
         this.lookDragging = true;
         clearTimeout(this.longPressTimer);
       }
@@ -170,15 +177,15 @@ export class TouchControls {
       if (e.pointerId !== this.lookPointer) return;
       clearTimeout(this.longPressTimer);
       const quick = performance.now() - this.lookStartTime < TOUCH_TAP_MAX_MS;
-      if (!this.lookDragging && !this.placeHeld && quick) this.breakTaps++;
-      this.placeHeld = false;
+      if (!this.lookDragging && !this.holdActive && quick) this.taps++;
+      this.holdActive = false;
       this.lookPointer = -1;
     });
 
     surface.addEventListener('pointercancel', (e) => {
       if (e.pointerId !== this.lookPointer) return;
       clearTimeout(this.longPressTimer);
-      this.placeHeld = false;
+      this.holdActive = false;
       this.lookPointer = -1;
     });
   }

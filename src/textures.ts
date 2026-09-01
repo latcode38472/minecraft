@@ -1,5 +1,7 @@
 // Procedural texture atlas: 16x16-pixel tiles drawn onto one canvas at startup,
-// so the game ships with zero image assets. Nearest-filtered for the classic look.
+// so the game ships with zero image assets. Block tiles are generated from
+// noise; item icons are 8x8 pixel-art sprite maps scaled 2x. Nearest-filtered
+// for the classic look.
 
 import * as THREE from 'three';
 import { Tile } from './blocks';
@@ -7,6 +9,32 @@ import { Tile } from './blocks';
 export const TILE_PX = 16;
 export const ATLAS_TILES = 8; // 8x8 grid of tiles
 const ATLAS_PX = TILE_PX * ATLAS_TILES;
+
+/** Item icon tiles, continuing after the block tiles in blocks.ts. */
+export const enum ItemTile {
+  WoodenPickaxe = 24,
+  StonePickaxe = 25,
+  IronPickaxe = 26,
+  DiamondPickaxe = 27,
+  WoodenSword = 28,
+  StoneSword = 29,
+  IronSword = 30,
+  DiamondSword = 31,
+  WoodenAxe = 32,
+  StoneAxe = 33,
+  IronAxe = 34,
+  DiamondAxe = 35,
+  Stick = 36,
+  Coal = 37,
+  RawIron = 38,
+  RawGold = 39,
+  IronIngot = 40,
+  GoldIngot = 41,
+  Diamond = 42,
+  RawPorkchop = 43,
+  CookedPorkchop = 44,
+  RottenFlesh = 45,
+}
 
 /** Deterministic per-pixel hash so the atlas looks identical every run. */
 function pixelHash(x: number, y: number, salt: number): number {
@@ -17,6 +45,7 @@ function pixelHash(x: number, y: number, salt: number): number {
 }
 
 type RGB = [number, number, number];
+type RGBA = [number, number, number, number];
 
 let atlasCanvas: HTMLCanvasElement | null = null;
 let atlasTexture: THREE.CanvasTexture | null = null;
@@ -30,32 +59,143 @@ function fillSpeckled(
   tile: number,
   base: RGB,
   variance: number,
-  perPixel?: (px: number, py: number, rand: number) => RGB | null,
+  perPixel?: (px: number, py: number, rand: number) => RGB | RGBA | null,
 ): void {
   const [ox, oy] = tileOrigin(tile);
   const img = ctx.createImageData(TILE_PX, TILE_PX);
   for (let py = 0; py < TILE_PX; py++) {
     for (let px = 0; px < TILE_PX; px++) {
       const rand = pixelHash(px, py, tile * 7919);
-      let rgb = perPixel?.(px, py, rand) ?? base;
+      const rgb = perPixel?.(px, py, rand) ?? base;
       const jitter = 1 + (rand - 0.5) * 2 * variance;
       const i = (py * TILE_PX + px) * 4;
       img.data[i] = Math.min(255, rgb[0] * jitter);
       img.data[i + 1] = Math.min(255, rgb[1] * jitter);
       img.data[i + 2] = Math.min(255, rgb[2] * jitter);
+      img.data[i + 3] = rgb.length === 4 ? rgb[3] : 255;
+    }
+  }
+  ctx.putImageData(img, ox, oy);
+}
+
+/**
+ * Draw an 8x8 sprite map scaled 2x into a tile. Characters index `palette`;
+ * '.' (or any unmapped char) leaves the pixel fully transparent.
+ */
+function drawSprite(
+  ctx: CanvasRenderingContext2D,
+  tile: number,
+  rows: string[],
+  palette: Record<string, RGB>,
+): void {
+  const [ox, oy] = tileOrigin(tile);
+  const img = ctx.createImageData(TILE_PX, TILE_PX);
+  for (let py = 0; py < TILE_PX; py++) {
+    for (let px = 0; px < TILE_PX; px++) {
+      const ch = rows[py >> 1]?.[px >> 1] ?? '.';
+      const rgb = palette[ch];
+      const i = (py * TILE_PX + px) * 4;
+      if (!rgb) {
+        img.data[i + 3] = 0;
+        continue;
+      }
+      // Slight top-left lighting so icons read as 3D rather than flat.
+      const shade = 1 - ((px >> 1) + (py >> 1)) * 0.012;
+      img.data[i] = Math.min(255, rgb[0] * shade);
+      img.data[i + 1] = Math.min(255, rgb[1] * shade);
+      img.data[i + 2] = Math.min(255, rgb[2] * shade);
       img.data[i + 3] = 255;
     }
   }
   ctx.putImageData(img, ox, oy);
 }
 
+// --- Sprite shapes (S = stick/handle, H = head material, D = darker shade) ---
+const PICKAXE = [
+  '.HHHHH..',
+  'HH...HH.',
+  'H..S..H.',
+  '...S....',
+  '..S.....',
+  '.S......',
+  'S.......',
+  '........',
+];
+const SWORD = [
+  '.....HH.',
+  '....HHH.',
+  '...HHH..',
+  '..HHH...',
+  '.DHH....',
+  '.DD.....',
+  'SD......',
+  'SS......',
+];
+const AXE = [
+  '.HHH....',
+  'HHHHH...',
+  'HH.HH...',
+  'H..S....',
+  '...S....',
+  '..S.....',
+  '.S......',
+  'S.......',
+];
+const LUMP = [
+  '........',
+  '..HHH...',
+  '.HHHHH..',
+  '.HHHHH..',
+  '.HHHH...',
+  '..HH....',
+  '........',
+  '........',
+];
+const INGOT = [
+  '........',
+  '........',
+  '..HHHH..',
+  '.HHHHHH.',
+  '.HHHHHH.',
+  '..HHHH..',
+  '........',
+  '........',
+];
+const GEM = [
+  '...HH...',
+  '..HHHH..',
+  '.HHHHHH.',
+  'HHHHHHHH',
+  '.HHHHHH.',
+  '..HHHH..',
+  '...HH...',
+  '........',
+];
+const MEAT = [
+  '........',
+  '..HHHH..',
+  '.HHHHHH.',
+  'HHHDDHH.',
+  'HHHDDHH.',
+  '.HHHHHH.',
+  '..HHHH..',
+  '........',
+];
+
+const STICK_COLOR: RGB = [122, 88, 51];
+const TIER_COLORS: Record<string, RGB> = {
+  wood: [156, 118, 70],
+  stone: [130, 130, 130],
+  iron: [216, 216, 216],
+  diamond: [92, 219, 213],
+};
+
 function buildAtlas(): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = ATLAS_PX;
   canvas.height = ATLAS_PX;
   const ctx = canvas.getContext('2d')!;
-  ctx.fillStyle = '#f0f';
-  ctx.fillRect(0, 0, ATLAS_PX, ATLAS_PX);
+  ctx.clearRect(0, 0, ATLAS_PX, ATLAS_PX);
 
   const GRASS: RGB = [106, 170, 64];
   const DIRT: RGB = [134, 96, 67];
@@ -72,6 +212,7 @@ function buildAtlas(): HTMLCanvasElement {
   fillSpeckled(ctx, Tile.Sand, SAND, 0.06);
   fillSpeckled(ctx, Tile.Bedrock, [58, 58, 58], 0.28);
   fillSpeckled(ctx, Tile.Water, [55, 108, 196], 0.04);
+  fillSpeckled(ctx, Tile.Gravel, [136, 130, 127], 0.22);
 
   // Dirt with a jagged grass fringe along the top edge (canvas y=0 renders as UV v=1).
   fillSpeckled(ctx, Tile.GrassSide, DIRT, 0.1, (px, py) => {
@@ -103,14 +244,118 @@ function buildAtlas(): HTMLCanvasElement {
   });
 
   // Blobby cobbles: distance to jittered cell centres.
-  fillSpeckled(ctx, Tile.Cobblestone, [117, 117, 117], 0.08, (px, py) => {
+  const cobble = (px: number, py: number): RGB | null => {
     const cx = Math.floor(px / 5.34);
     const cy = Math.floor(py / 5.34);
     const jx = cx * 5.34 + 2.7 + (pixelHash(cx, cy, 5) - 0.5) * 2;
     const jy = cy * 5.34 + 2.7 + (pixelHash(cx, cy, 9) - 0.5) * 2;
-    const d = Math.hypot(px - jx, py - jy);
-    return d > 2.6 ? [86, 86, 86] : null;
+    return Math.hypot(px - jx, py - jy) > 2.6 ? [86, 86, 86] : null;
+  };
+  fillSpeckled(ctx, Tile.Cobblestone, [117, 117, 117], 0.08, cobble);
+
+  // Ores: stone base with a cluster of coloured specks.
+  const oreTile = (tile: number, color: RGB, salt: number): void => {
+    fillSpeckled(ctx, tile, STONE, 0.07, (px, py) => {
+      // Two blobs per tile, positioned deterministically from the salt.
+      for (let b = 0; b < 3; b++) {
+        const bx = 3 + pixelHash(b, 0, salt) * 10;
+        const by = 3 + pixelHash(b, 1, salt) * 10;
+        if (Math.hypot(px - bx, py - by) < 2.1 + pixelHash(b, 2, salt) * 0.9) return color;
+      }
+      return null;
+    });
+  };
+  oreTile(Tile.CoalOre, [38, 38, 38], 11);
+  oreTile(Tile.IronOre, [197, 155, 121], 23);
+  oreTile(Tile.GoldOre, [232, 196, 76], 37);
+  oreTile(Tile.DiamondOre, [92, 219, 213], 53);
+
+  // Brick courses, offset every other row.
+  fillSpeckled(ctx, Tile.Bricks, [150, 84, 68], 0.05, (px, py) => {
+    const course = Math.floor(py / 4);
+    const mortarY = py % 4 === 0;
+    const offset = course % 2 === 0 ? 0 : 4;
+    const mortarX = (px + offset) % 8 === 0;
+    return mortarY || mortarX ? [176, 168, 160] : null;
   });
+
+  // Glass: opaque frame, transparent centre (alpha-tested in the cutout pass).
+  fillSpeckled(ctx, Tile.Glass, [190, 226, 236], 0.02, (px, py) => {
+    const edge = px === 0 || py === 0 || px === TILE_PX - 1 || py === TILE_PX - 1;
+    if (edge) return [206, 236, 244];
+    // A couple of diagonal highlight streaks keep it readable as glass.
+    if (px + py === 6 || px + py === 20) return [226, 244, 250, 190] as RGBA;
+    return [0, 0, 0, 0] as RGBA;
+  });
+
+  // Crafting table: grid on top, tool rack on the sides.
+  fillSpeckled(ctx, Tile.CraftingTableTop, PLANK, 0.05, (px, py) => {
+    if (px % 5 === 0 || py % 5 === 0) return [96, 72, 42];
+    return null;
+  });
+  fillSpeckled(ctx, Tile.CraftingTableSide, PLANK, 0.05, (px, py) => {
+    if (py < 3) return [120, 92, 53];
+    if (py > 5 && py < 13 && (px === 4 || px === 11)) return [96, 72, 42];
+    if (py === 9 && px > 3 && px < 12) return [96, 72, 42];
+    return null;
+  });
+
+  // Furnace: cobble body with a dark opening on the front face.
+  fillSpeckled(ctx, Tile.FurnaceSide, [117, 117, 117], 0.08, cobble);
+  fillSpeckled(ctx, Tile.FurnaceTop, [110, 110, 110], 0.08, (px, py) => {
+    const ring = Math.max(Math.abs(px - 7.5), Math.abs(py - 7.5));
+    return ring < 4 ? [92, 92, 92] : cobble(px, py);
+  });
+  fillSpeckled(ctx, Tile.FurnaceFront, [117, 117, 117], 0.08, (px, py) => {
+    if (px >= 3 && px <= 12 && py >= 6 && py <= 13) {
+      // Glowing embers at the bottom of the opening.
+      return py >= 11 ? [196, 108, 42] : [38, 34, 32];
+    }
+    return cobble(px, py);
+  });
+
+  // --- Item icons ---
+  const tool = (tile: number, shape: string[], tier: keyof typeof TIER_COLORS): void => {
+    const head = TIER_COLORS[tier];
+    drawSprite(ctx, tile, shape, {
+      H: head,
+      D: [head[0] * 0.7, head[1] * 0.7, head[2] * 0.7],
+      S: STICK_COLOR,
+    });
+  };
+  tool(ItemTile.WoodenPickaxe, PICKAXE, 'wood');
+  tool(ItemTile.StonePickaxe, PICKAXE, 'stone');
+  tool(ItemTile.IronPickaxe, PICKAXE, 'iron');
+  tool(ItemTile.DiamondPickaxe, PICKAXE, 'diamond');
+  tool(ItemTile.WoodenSword, SWORD, 'wood');
+  tool(ItemTile.StoneSword, SWORD, 'stone');
+  tool(ItemTile.IronSword, SWORD, 'iron');
+  tool(ItemTile.DiamondSword, SWORD, 'diamond');
+  tool(ItemTile.WoodenAxe, AXE, 'wood');
+  tool(ItemTile.StoneAxe, AXE, 'stone');
+  tool(ItemTile.IronAxe, AXE, 'iron');
+  tool(ItemTile.DiamondAxe, AXE, 'diamond');
+
+  drawSprite(ctx, ItemTile.Stick, [
+    '........',
+    '.....SS.',
+    '....SS..',
+    '...SS...',
+    '..SS....',
+    '.SS.....',
+    '.S......',
+    '........',
+  ], { S: STICK_COLOR });
+
+  drawSprite(ctx, ItemTile.Coal, LUMP, { H: [42, 42, 42] });
+  drawSprite(ctx, ItemTile.RawIron, LUMP, { H: [197, 160, 130] });
+  drawSprite(ctx, ItemTile.RawGold, LUMP, { H: [216, 180, 74] });
+  drawSprite(ctx, ItemTile.IronIngot, INGOT, { H: [216, 216, 216] });
+  drawSprite(ctx, ItemTile.GoldIngot, INGOT, { H: [246, 208, 62] });
+  drawSprite(ctx, ItemTile.Diamond, GEM, { H: [92, 219, 213] });
+  drawSprite(ctx, ItemTile.RawPorkchop, MEAT, { H: [238, 154, 150], D: [214, 112, 108] });
+  drawSprite(ctx, ItemTile.CookedPorkchop, MEAT, { H: [190, 130, 74], D: [150, 96, 50] });
+  drawSprite(ctx, ItemTile.RottenFlesh, MEAT, { H: [130, 110, 72], D: [96, 80, 52] });
 
   return canvas;
 }
@@ -145,4 +390,17 @@ export function tileUVRect(tile: number): [number, number, number, number] {
   const v1 = 1 - row / ATLAS_TILES - inset;
   const v0 = 1 - (row + 1) / ATLAS_TILES + inset;
   return [u0, v0, u1, v1];
+}
+
+/** Draw one atlas tile into a 2D context (hotbar and inventory icons). */
+export function drawTileTo(
+  ctx: CanvasRenderingContext2D,
+  tile: number,
+  dx: number,
+  dy: number,
+  size: number,
+): void {
+  const [ox, oy] = tileOrigin(tile);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(getAtlasCanvas(), ox, oy, TILE_PX, TILE_PX, dx, dy, size, size);
 }

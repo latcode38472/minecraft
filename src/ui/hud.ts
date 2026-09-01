@@ -1,71 +1,112 @@
-// DOM overlay: hotbar with atlas-drawn icons, FPS counter, debug panel, toasts.
+// Bottom-of-screen HUD: hotbar (driven by the inventory), FPS counter, debug
+// panel, toasts, and the underwater tint.
 
-import { BLOCKS, HOTBAR_BLOCKS } from '../blocks';
-import { TILE_PX, ATLAS_TILES, getAtlasCanvas } from '../textures';
+import type { Inventory } from '../items/inventory';
+import { HOTBAR_SIZE } from '../items/inventory';
+import { getItem } from '../items/items';
+import { drawTileTo } from '../textures';
+
+const ICON_PX = 32;
 
 export class Hud {
-  selectedSlot = 0;
-
   private readonly slots: HTMLElement[] = [];
+  private readonly icons: HTMLCanvasElement[] = [];
+  private readonly counts: HTMLElement[] = [];
+  private readonly durabilities: HTMLElement[] = [];
   private readonly fpsEl = document.getElementById('fps')!;
   private readonly debugEl = document.getElementById('debug')!;
   private readonly toastEl = document.getElementById('toast')!;
+  private readonly nameEl = document.getElementById('held-name')!;
   private readonly waterOverlayEl = document.getElementById('water-overlay')!;
   private toastTimer = 0;
+  private nameTimer = 0;
   private frameTimes: number[] = [];
   private debugVisible = false;
+  private lastVersion = -1;
+  private lastNamed = '';
 
-  constructor() {
+  constructor(
+    private readonly inventory: Inventory,
+    onSlotPicked: (index: number) => void,
+  ) {
     const hotbar = document.getElementById('hotbar')!;
-    const atlas = getAtlasCanvas();
-    HOTBAR_BLOCKS.forEach((blockId, i) => {
+    for (let i = 0; i < HOTBAR_SIZE; i++) {
       const slot = document.createElement('div');
       slot.className = 'slot';
+
       const icon = document.createElement('canvas');
-      icon.width = TILE_PX;
-      icon.height = TILE_PX;
-      const ctx = icon.getContext('2d')!;
-      const tile = BLOCKS[blockId].tiles.side;
-      ctx.drawImage(
-        atlas,
-        (tile % ATLAS_TILES) * TILE_PX,
-        Math.floor(tile / ATLAS_TILES) * TILE_PX,
-        TILE_PX,
-        TILE_PX,
-        0,
-        0,
-        TILE_PX,
-        TILE_PX,
-      );
+      icon.width = ICON_PX;
+      icon.height = ICON_PX;
+
       const key = document.createElement('span');
       key.className = 'key';
       key.textContent = String(i + 1);
-      slot.append(icon, key);
-      slot.title = BLOCKS[blockId].name;
+
+      const count = document.createElement('span');
+      count.className = 'count';
+
+      const durability = document.createElement('span');
+      durability.className = 'durability';
+
+      slot.append(icon, key, count, durability);
       slot.addEventListener('pointerdown', (e) => {
         e.preventDefault();
-        this.selectSlot(i);
+        onSlotPicked(i);
       });
       hotbar.append(slot);
+
       this.slots.push(slot);
-    });
-    this.selectSlot(0);
+      this.icons.push(icon);
+      this.counts.push(count);
+      this.durabilities.push(durability);
+    }
+    this.refresh();
   }
 
-  selectSlot(index: number): void {
-    if (index < 0 || index >= this.slots.length) return;
-    this.slots[this.selectedSlot].classList.remove('selected');
-    this.selectedSlot = index;
-    this.slots[index].classList.add('selected');
-  }
+  /** Redraw the hotbar only when the inventory actually changed. */
+  refresh(): void {
+    if (this.inventory.version === this.lastVersion) return;
+    this.lastVersion = this.inventory.version;
 
-  cycleSlot(delta: number): void {
-    const n = this.slots.length;
-    this.selectSlot((this.selectedSlot + delta + n * 100) % n);
-  }
+    for (let i = 0; i < HOTBAR_SIZE; i++) {
+      const stack = this.inventory.slots[i];
+      const ctx = this.icons[i].getContext('2d')!;
+      ctx.clearRect(0, 0, ICON_PX, ICON_PX);
 
-  get selectedBlock(): number {
-    return HOTBAR_BLOCKS[this.selectedSlot];
+      this.slots[i].classList.toggle('selected', i === this.inventory.selected);
+
+      if (!stack) {
+        this.counts[i].textContent = '';
+        this.durabilities[i].style.display = 'none';
+        continue;
+      }
+
+      const def = getItem(stack.id);
+      if (def) drawTileTo(ctx, def.tile, 0, 0, ICON_PX);
+      this.counts[i].textContent = stack.count > 1 ? String(stack.count) : '';
+
+      const tool = def?.tool;
+      if (tool && stack.damage) {
+        const left = 1 - stack.damage / tool.durability;
+        this.durabilities[i].style.display = 'block';
+        this.durabilities[i].style.width = `${Math.max(0, left) * 100}%`;
+        this.durabilities[i].style.background =
+          left > 0.5 ? '#5ee45e' : left > 0.25 ? '#e4d15e' : '#e45e5e';
+      } else {
+        this.durabilities[i].style.display = 'none';
+      }
+    }
+
+    // Name the held item briefly when the selection changes, like Minecraft.
+    const held = this.inventory.selectedStack;
+    const name = held ? (getItem(held.id)?.name ?? '') : '';
+    if (name !== this.lastNamed) {
+      this.lastNamed = name;
+      this.nameEl.textContent = name;
+      this.nameEl.style.opacity = name ? '1' : '0';
+      clearTimeout(this.nameTimer);
+      this.nameTimer = window.setTimeout(() => (this.nameEl.style.opacity = '0'), 1600);
+    }
   }
 
   toggleDebug(): void {
@@ -93,4 +134,13 @@ export class Hud {
     }
     if (this.debugVisible) this.debugEl.textContent = debugText;
   }
+}
+
+/** Shared helper for drawing an item into any slot-sized canvas. */
+export function drawItemIcon(canvas: HTMLCanvasElement, itemId: string | null): void {
+  const ctx = canvas.getContext('2d')!;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!itemId) return;
+  const def = getItem(itemId);
+  if (def) drawTileTo(ctx, def.tile, 0, 0, canvas.width);
 }

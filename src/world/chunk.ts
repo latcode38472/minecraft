@@ -11,6 +11,7 @@ export class Chunk {
   readonly data: Uint8Array;
   dirty = true; // needs (re)meshing
   opaqueMesh: THREE.Mesh | null = null;
+  cutoutMesh: THREE.Mesh | null = null;
   waterMesh: THREE.Mesh | null = null;
 
   constructor(cx: number, cz: number) {

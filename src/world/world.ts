@@ -8,7 +8,12 @@ import {
   WORLD_HEIGHT,
 } from '../constants';
 import { Chunk } from './chunk';
-import { buildChunkGeometry, getOpaqueMaterial, getWaterMaterial } from './mesher';
+import {
+  buildChunkGeometry,
+  getCutoutMaterial,
+  getOpaqueMaterial,
+  getWaterMaterial,
+} from './mesher';
 import { TerrainGenerator } from './terrain';
 
 /** Sparse per-chunk map of player edits: voxel index -> block id. */
@@ -179,12 +184,17 @@ export class World {
 
   private remesh(chunk: Chunk): void {
     this.disposeChunkMeshes(chunk);
-    const { opaque, water } = buildChunkGeometry(chunk, this.meshSampler);
+    const { opaque, cutout, water } = buildChunkGeometry(chunk, this.meshSampler);
     const origin = new THREE.Vector3(chunk.cx * CHUNK_SIZE, 0, chunk.cz * CHUNK_SIZE);
     if (opaque) {
       chunk.opaqueMesh = new THREE.Mesh(opaque, getOpaqueMaterial());
       chunk.opaqueMesh.position.copy(origin);
       this.scene.add(chunk.opaqueMesh);
+    }
+    if (cutout) {
+      chunk.cutoutMesh = new THREE.Mesh(cutout, getCutoutMaterial());
+      chunk.cutoutMesh.position.copy(origin);
+      this.scene.add(chunk.cutoutMesh);
     }
     if (water) {
       chunk.waterMesh = new THREE.Mesh(water, getWaterMaterial());
@@ -196,13 +206,14 @@ export class World {
   }
 
   private disposeChunkMeshes(chunk: Chunk): void {
-    for (const mesh of [chunk.opaqueMesh, chunk.waterMesh]) {
+    for (const mesh of [chunk.opaqueMesh, chunk.cutoutMesh, chunk.waterMesh]) {
       if (mesh) {
         this.scene.remove(mesh);
         mesh.geometry.dispose();
       }
     }
     chunk.opaqueMesh = null;
+    chunk.cutoutMesh = null;
     chunk.waterMesh = null;
   }
 

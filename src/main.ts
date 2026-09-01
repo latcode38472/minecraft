@@ -1,30 +1,52 @@
+// Bootstrap and frame loop. Systems live in their own modules; this file wires
+// them together and owns the play/paused/dead state machine.
+
 import * as THREE from 'three';
-import { initAudio, playBreak, playPlace, playStep } from './audio';
-import { BLOCKS, Block } from './blocks';
 import {
-  BREAK_REPEAT_MS,
+  initAudio,
+  playAttack,
+  playBreak,
+  playEat,
+  playHurt,
+  playMobDeath,
+  playPickup,
+  playPlace,
+  playStep,
+} from './audio';
+import { AutoQuality } from './autoquality';
+import {
   CHUNK_SIZE,
   DEFAULT_VIEW_DISTANCE,
+  KNOCKBACK_LIFT,
+  KNOCKBACK_SPEED,
+  MAX_HEALTH,
+  MAX_HUNGER,
   MAX_TIMESTEP,
   MAX_VIEW_DISTANCE,
   MIN_VIEW_DISTANCE,
-  PLACE_REPEAT_MS,
-  REACH_DISTANCE,
+  RESPAWN_SEARCH_RADIUS,
   SAVE_INTERVAL_MS,
   TOUCH_DEFAULT_VIEW_DISTANCE,
   TOUCH_LOOK_SENSITIVITY,
   TOUCH_MAX_CHUNK_GENS_PER_FRAME,
   TOUCH_MESH_BUDGET_MS,
 } from './constants';
+import { BLOCKS } from './blocks';
+import type { EntityContext } from './entities/entity';
+import { EntityManager, isNightTime } from './entities/manager';
+import { Interaction, breakTimeFor, canHarvest } from './game/interaction';
+import { Inventory, type ItemStack } from './items/inventory';
+import { RECIPES, craft, type Station } from './items/crafting';
 import { Input } from './input';
 import { MouseLook } from './player/camera';
 import { Player, type MoveInput } from './player/player';
-import { AutoQuality } from './autoquality';
-import { TouchControls, isTouchDevice } from './ui/touch';
-import { raycastVoxel, type RayHit } from './raycast';
+import { Survival } from './player/survival';
 import { SaveStore, type SaveMeta } from './save';
 import { Sky } from './sky';
 import { Hud } from './ui/hud';
+import { InventoryUi } from './ui/inventoryui';
+import { StatusUi } from './ui/statusui';
+import { TouchControls, isTouchDevice } from './ui/touch';
 import { World } from './world/world';
 
 const STEP_INTERVAL_BLOCKS = 2.2;
@@ -98,25 +120,44 @@ async function boot(): Promise<void> {
     camera.updateProjectionMatrix();
   });
 
-  // --- Game objects ---
+  // --- Game systems ---
   const savedEdits = await store.loadAllEdits();
   const world = new World(seed, scene, savedEdits);
   const sky = new Sky(scene);
   const input = new Input();
   const look = new MouseLook(camera, renderer.domElement);
   const player = new Player(world);
-  const hud = new Hud();
+  const inventory = new Inventory();
+  const entities = new EntityManager(scene, world);
 
+  const survival = new Survival({
+    onHurt: () => playHurt(),
+    onDeath: () => onPlayerDied(),
+  });
+
+  const hud = new Hud(inventory, (index) => inventory.selectSlot(index));
+  const statusUi = new StatusUi(() => respawn());
+  const inventoryUi = new InventoryUi(inventory, () => hud.refresh());
+
+  const spawnPoint = new THREE.Vector3();
   if (meta) {
     player.position.set(meta.player.x, meta.player.y, meta.player.z);
     look.yaw = meta.player.yaw;
     look.pitch = meta.player.pitch;
     sky.timeOfDay = meta.timeOfDay;
-    hud.selectSlot(meta.selectedSlot);
+    inventory.load(meta.inventory, meta.selectedSlot);
+    if (meta.health !== undefined && meta.hunger !== undefined) {
+      survival.load(meta.health, meta.hunger);
+    }
+    const s = meta.spawn;
+    if (s) spawnPoint.set(s.x, s.y, s.z);
+    else spawnPoint.copy(player.position);
   } else {
     const spawn = world.terrain.findSpawnColumn();
     player.position.set(spawn.x + 0.5, spawn.y + 2, spawn.z + 0.5);
+    spawnPoint.copy(player.position);
   }
+  hud.refresh();
 
   // Targeted-block outline.
   const highlight = new THREE.LineSegments(
@@ -126,22 +167,43 @@ async function boot(): Promise<void> {
   highlight.visible = false;
   scene.add(highlight);
 
-  // --- Play state: pointer lock on desktop, an explicit flag on touch ---
+  const interaction = new Interaction(world, player, inventory, entities, {
+    onBreakBlock: (def) => playBreak(def.sound),
+    onPlaceBlock: (def) => playPlace(def.sound),
+    onAttack: () => playAttack(),
+    tryEat: (hunger) => {
+      if (!survival.eat(hunger)) return false;
+      playEat();
+      return true;
+    },
+    onOpenStation: (station) => openInventory(station),
+    toast: (msg) => hud.toast(msg),
+  });
+
+  // --- Play state ---
   const menu = document.getElementById('menu')!;
   let touchPlaying = false;
-  const isPlaying = (): boolean => (touchDevice ? touchPlaying : look.locked);
+  const root = document.documentElement;
+
+  /** True when the world should simulate and accept look/move input. */
+  const isPlaying = (): boolean =>
+    !survival.dead && !inventoryUi.open && (touchDevice ? touchPlaying : look.locked);
+
+  function refreshPlayingClass(): void {
+    root.classList.toggle('playing', isPlaying());
+  }
 
   const touch = touchDevice ? new TouchControls(document.getElementById('app')!) : null;
   if (touch) {
     touch.onPause = () => {
       touchPlaying = false;
       menu.style.display = 'flex';
+      refreshPlayingClass();
       flushSave();
     };
+    touch.onInventory = () => toggleInventory();
   }
 
-  // Adaptive quality on touch: phone GPUs vary a lot, so track the real frame
-  // rate and trade render resolution / view distance for smoothness.
   const autoQuality = touchDevice
     ? new AutoQuality(viewDistance, {
         setViewDistance: (v) => {
@@ -154,6 +216,7 @@ async function boot(): Promise<void> {
     : null;
 
   menu.addEventListener('pointerup', () => {
+    if (survival.dead) return;
     initAudio();
     if (touchDevice) {
       touchPlaying = true;
@@ -161,82 +224,97 @@ async function boot(): Promise<void> {
     } else {
       look.requestLock();
     }
-  });
-  document.addEventListener('pointerlockchange', () => {
-    if (!touchDevice) menu.style.display = look.locked ? 'none' : 'flex';
+    refreshPlayingClass();
   });
 
-  // --- Mouse actions (hold to repeat) ---
-  let breakHeld = false;
-  let placeHeld = false;
-  let nextActionAt = 0;
+  document.addEventListener('pointerlockchange', () => {
+    // Only the menu path un-pauses; the inventory and death screens manage
+    // their own overlays and must not be replaced by the main menu.
+    if (touchDevice) return;
+    const showMenu = !look.locked && !inventoryUi.open && !survival.dead;
+    menu.style.display = showMenu ? 'flex' : 'none';
+    refreshPlayingClass();
+  });
+
+  function openInventory(station: Station): void {
+    inventoryUi.show(station);
+    menu.style.display = 'none';
+    if (!touchDevice && look.locked) document.exitPointerLock();
+    refreshPlayingClass();
+  }
+
+  function toggleInventory(): void {
+    if (inventoryUi.open) {
+      inventoryUi.close();
+      hud.refresh();
+      if (!touchDevice && !survival.dead) look.requestLock();
+      refreshPlayingClass();
+    } else if (!survival.dead) {
+      openInventory('none');
+    }
+  }
+
+  function onPlayerDied(): void {
+    inventoryUi.close();
+    menu.style.display = 'none';
+    statusUi.showDeath(entities.mobCount > 0 ? 'The night was not kind.' : 'Better luck next time.');
+    if (!touchDevice && look.locked) document.exitPointerLock();
+    refreshPlayingClass();
+    flushSave();
+  }
+
+  function respawn(): void {
+    // Drop the player at the recorded spawn, on top of whatever is there now.
+    const sx = Math.floor(spawnPoint.x);
+    const sz = Math.floor(spawnPoint.z);
+    let y = Math.floor(spawnPoint.y);
+    for (let dy = RESPAWN_SEARCH_RADIUS; dy >= -RESPAWN_SEARCH_RADIUS; dy--) {
+      const candidate = Math.floor(spawnPoint.y) + dy;
+      if (world.isSolidAt(sx, candidate - 1, sz) && !world.isSolidAt(sx, candidate, sz)) {
+        y = candidate;
+        break;
+      }
+    }
+    player.position.set(sx + 0.5, y + 0.5, sz + 0.5);
+    player.reset();
+    survival.respawn();
+    statusUi.hideDeath();
+    entities.clear();
+    if (!touchDevice) look.requestLock();
+    else touchPlaying = true;
+    refreshPlayingClass();
+  }
+
+  // --- Mouse actions ---
+  let mineHeld = false;
+  let useHeld = false;
+  let mouseUseTaps = 0;
   document.addEventListener('mousedown', (e) => {
-    if (!look.locked) return;
-    if (e.button === 0) breakHeld = true;
-    if (e.button === 2) placeHeld = true;
-    nextActionAt = 0; // act immediately
+    if (!isPlaying()) return;
+    if (e.button === 0) mineHeld = true;
+    if (e.button === 2) {
+      useHeld = true;
+      mouseUseTaps++;
+    }
   });
   document.addEventListener('mouseup', (e) => {
-    if (e.button === 0) breakHeld = false;
-    if (e.button === 2) placeHeld = false;
+    if (e.button === 0) mineHeld = false;
+    if (e.button === 2) useHeld = false;
   });
 
   const eye = new THREE.Vector3();
   const lookDir = new THREE.Vector3();
 
-  function currentTarget(): RayHit | null {
-    player.eyePosition(eye);
-    look.direction(lookDir);
-    return raycastVoxel(world, eye, lookDir, REACH_DISTANCE);
-  }
-
-  function breakAt(hit: RayHit): void {
-    if (!BLOCKS[hit.id].breakable) return;
-    world.setBlock(hit.x, hit.y, hit.z, Block.Air);
-    playBreak(BLOCKS[hit.id].sound);
-  }
-
-  function placeAt(hit: RayHit): boolean {
-    const px = hit.x + hit.normal[0];
-    const py = hit.y + hit.normal[1];
-    const pz = hit.z + hit.normal[2];
-    const id = hud.selectedBlock;
-    const occupied = world.getBlock(px, py, pz);
-    if (occupied !== Block.Air && occupied !== Block.Water) return false;
-    if (BLOCKS[id].solid && player.intersectsBlock(px, py, pz)) return false;
-    if (!world.setBlock(px, py, pz, id)) return false;
-    playPlace(BLOCKS[id].sound);
-    return true;
-  }
-
-  function handleActions(nowMs: number): void {
-    const taps = touch?.takeBreakTaps() ?? 0;
-    if (!isPlaying()) return;
-
-    // Touch taps break immediately, bypassing the hold-repeat timer.
-    if (taps > 0) {
-      const tapHit = currentTarget();
-      if (tapHit) breakAt(tapHit);
-    }
-
-    const wantBreak = breakHeld;
-    const wantPlace = placeHeld || (touch?.placeHeld ?? false);
-    if ((!wantBreak && !wantPlace) || nowMs < nextActionAt) return;
-    const hit = currentTarget();
-    if (!hit) return;
-    if (wantBreak) {
-      breakAt(hit);
-      nextActionAt = nowMs + BREAK_REPEAT_MS;
-    } else if (wantPlace && placeAt(hit)) {
-      nextActionAt = nowMs + PLACE_REPEAT_MS;
-    }
-  }
-
   function handleKeys(): void {
     for (const code of input.takePresses()) {
       if (code.startsWith('Digit')) {
         const n = Number(code.slice(5));
-        if (n >= 1 && n <= 9) hud.selectSlot(n - 1);
+        if (n >= 1 && n <= 9) {
+          inventory.selectSlot(n - 1);
+          hud.refresh();
+        }
+      } else if (code === 'KeyE') {
+        toggleInventory();
       } else if (code === 'F3') {
         hud.toggleDebug();
       } else if (code === 'KeyT') {
@@ -251,22 +329,65 @@ async function boot(): Promise<void> {
       }
     }
     const wheel = input.takeWheelSteps();
-    if (wheel !== 0 && isPlaying()) hud.cycleSlot(wheel);
+    if (wheel !== 0 && isPlaying()) {
+      inventory.cycleSelection(wheel);
+      hud.refresh();
+    }
   }
+
+  /** Shove the player away from a damage source. */
+  function knockbackPlayer(fromX: number, fromZ: number): void {
+    const dx = player.position.x - fromX;
+    const dz = player.position.z - fromZ;
+    const len = Math.hypot(dx, dz) || 1;
+    player.velocity.x = (dx / len) * KNOCKBACK_SPEED * 0.6;
+    player.velocity.z = (dz / len) * KNOCKBACK_SPEED * 0.6;
+    if (player.onGround) player.velocity.y = KNOCKBACK_LIFT * 0.6;
+  }
+
+  const entityContext: EntityContext = {
+    world,
+    dt: 0,
+    playerPos: player.position,
+    isNight: false,
+    damagePlayer: (amount, fromX, fromZ) => {
+      if (!isPlaying()) return;
+      survival.damage(amount);
+      knockbackPlayer(fromX, fromZ);
+    },
+    spawnDrop: (id, count, x, y, z) => entities.spawnDrop(id, count, x, y, z),
+    collectItem: (id, count, damage) => {
+      const leftover = inventory.add(id, count, damage);
+      if (leftover < count) {
+        playPickup();
+        hud.refresh();
+      }
+      return leftover;
+    },
+    onMobDeath: () => playMobDeath(),
+  };
 
   // --- Persistence ---
   function flushSave(): void {
+    // Saving mid-death would reload the player, still dead, where they fell.
+    // Persist the post-respawn state instead so the world reopens playable.
+    const dead = survival.dead;
+    const pos = dead ? spawnPoint : player.position;
     const metaOut: SaveMeta = {
       seed,
       timeOfDay: sky.timeOfDay,
       player: {
-        x: player.position.x,
-        y: player.position.y,
-        z: player.position.z,
+        x: pos.x,
+        y: pos.y,
+        z: pos.z,
         yaw: look.yaw,
         pitch: look.pitch,
       },
-      selectedSlot: hud.selectedSlot,
+      selectedSlot: inventory.selected,
+      inventory: inventory.serialize(),
+      health: dead ? MAX_HEALTH : survival.health,
+      hunger: dead ? MAX_HUNGER : survival.hunger,
+      spawn: { x: spawnPoint.x, y: spawnPoint.y, z: spawnPoint.z },
     };
     void store.saveMeta(metaOut);
     for (const key of world.unsavedEditKeys) {
@@ -288,8 +409,27 @@ async function boot(): Promise<void> {
     look,
     touch,
     autoQuality,
+    inventory,
+    survival,
+    entities,
+    interaction,
+    inventoryUi,
+    respawn,
     getViewDistance: () => viewDistance,
+    // Thin wrappers over the real rules, so automated tests exercise the same
+    // code paths the game does rather than reimplementing them.
+    __breakTime: (blockId: number, stack: ItemStack | null) =>
+      breakTimeFor(BLOCKS[blockId], stack),
+    __canHarvest: (blockId: number, stack: ItemStack | null) =>
+      canHarvest(BLOCKS[blockId], stack),
+    __craftAt: (recipeId: string, station: Station) => {
+      const recipe = RECIPES.find((r) => r.id === recipeId);
+      if (!recipe || (recipe.station !== 'none' && recipe.station !== station)) return false;
+      return craft(inventory, recipe);
+    },
   };
+
+  refreshPlayingClass();
 
   // --- Main loop ---
   let lastTime = performance.now();
@@ -297,13 +437,13 @@ async function boot(): Promise<void> {
     const nowMs = performance.now();
     const dt = Math.min((nowMs - lastTime) / 1000, MAX_TIMESTEP);
     lastTime = nowMs;
+    const playing = isPlaying();
 
     handleKeys();
-    handleActions(nowMs);
 
     if (touch) {
       const [lookDx, lookDy] = touch.takeLookDelta();
-      if (isPlaying()) look.rotate(lookDx, lookDy, TOUCH_LOOK_SENSITIVITY);
+      if (playing) look.rotate(lookDx, lookDy, TOUCH_LOOK_SENSITIVITY);
     }
 
     const clamp1 = (v: number): number => Math.max(-1, Math.min(1, v));
@@ -315,10 +455,12 @@ async function boot(): Promise<void> {
         (input.isDown('KeyD') ? 1 : 0) - (input.isDown('KeyA') ? 1 : 0) + (touch?.moveStrafe ?? 0),
       ),
       jump: input.isDown('Space') || (touch?.jumpHeld ?? false),
-      sneak:
-        input.isDown('ShiftLeft') || input.isDown('ShiftRight') || (touch?.sneakOn ?? false),
+      sneak: input.isDown('ShiftLeft') || input.isDown('ShiftRight') || (touch?.sneakOn ?? false),
     };
-    if (isPlaying()) player.update(dt, move, look.yaw);
+
+    if (playing) player.update(dt, move, look.yaw);
+    survival.update(dt, player);
+
     world.update(
       player.position.x,
       player.position.z,
@@ -327,20 +469,43 @@ async function boot(): Promise<void> {
       touchDevice ? TOUCH_MESH_BUDGET_MS : undefined,
     );
     sky.update(dt);
-    if (isPlaying()) autoQuality?.update(dt);
+    if (playing) autoQuality?.update(dt);
+
+    // Entities keep simulating while paused would be surprising; freeze them.
+    if (playing) {
+      entityContext.dt = dt;
+      entityContext.isNight = isNightTime(sky.timeOfDay);
+      entities.update(entityContext, sky.timeOfDay);
+    }
 
     if (player.stepAccumulator > STEP_INTERVAL_BLOCKS) {
       player.stepAccumulator = 0;
       playStep();
     }
 
-    const hit = isPlaying() ? currentTarget() : null;
+    player.eyePosition(eye);
+    look.direction(lookDir);
+
+    // Touch taps and mouse right-clicks both feed the same edge-triggered path.
+    const useTaps = (touch?.takeTaps() ?? 0) + mouseUseTaps;
+    mouseUseTaps = 0;
+    if (playing) {
+      interaction.update(dt, nowMs, eye, lookDir, {
+        mining: mineHeld || (touch?.holdActive ?? false),
+        using: useHeld,
+        useTaps,
+      });
+    }
+
+    const hit = playing ? interaction.target : null;
     highlight.visible = hit !== null;
     if (hit) highlight.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
 
-    player.eyePosition(eye);
     look.apply(eye);
     hud.setUnderwater(player.eyeInWater);
+    hud.refresh();
+    statusUi.update(survival, playing ? interaction.breakProgress : 0);
+    inventoryUi.render();
 
     hud.updateFrameStats(
       dt,
@@ -348,8 +513,10 @@ async function boot(): Promise<void> {
         `pos ${player.position.x.toFixed(1)} ${player.position.y.toFixed(1)} ${player.position.z.toFixed(1)}`,
         `chunk ${Math.floor(player.position.x / CHUNK_SIZE)},${Math.floor(player.position.z / CHUNK_SIZE)}`,
         `chunks ${world.chunks.size} (pending mesh ${world.pendingMeshCount})`,
+        `entities ${entities.entities.length} (mobs ${entities.mobCount})`,
+        `hp ${survival.health.toFixed(0)}  food ${survival.hunger.toFixed(1)}`,
         `draw calls ${renderer.info.render.calls}  tris ${renderer.info.render.triangles}`,
-        `seed ${seed}  time ${(sky.timeOfDay * 24).toFixed(1)}h`,
+        `seed ${seed}  time ${(sky.timeOfDay * 24).toFixed(1)}h ${isNightTime(sky.timeOfDay) ? '(night)' : '(day)'}`,
         `view ${viewDistance} chunks  render ${Math.round(pixelScale * 100)}%`,
       ].join('\n'),
     );
