@@ -60,7 +60,13 @@ jobs:
         env:
           VITE_MULTIPLAYER_URL: ${{ vars.MULTIPLAYER_URL }}
         run: npm run build
+      # enablement turns Pages on for the repo if it is off, so a fresh clone
+      # deploys without anyone first visiting Settings -> Pages. It needs the
+      # repo to be eligible for Pages at all: public, or private on a paid
+      # plan. On a private free repo this step fails with "Not Found".
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

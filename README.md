@@ -187,10 +187,17 @@ machine is on — fine for one evening.
 
 1. **Server** — on [render.com](https://render.com): New → Blueprint → pick this
    repo. It reads `render.yaml` and gives you `https://voxelcraft-server-xxxx.onrender.com`.
-2. **Client** — in the repo: Settings → Pages → Source: **GitHub Actions**. Then
-   Settings → Secrets and variables → Actions → Variables → New variable named
-   `MULTIPLAYER_URL`, set to your server's URL with `https` swapped for `wss`
-   (`wss://voxelcraft-server-xxxx.onrender.com`).
+2. **Client** — Settings → Secrets and variables → Actions → Variables → New
+   variable named `MULTIPLAYER_URL`, set to your server's URL with `https`
+   swapped for `wss` (`wss://voxelcraft-server-xxxx.onrender.com`). The
+   workflow enables Pages itself, so there is nothing to switch on by hand.
+
+   **The repository must be public**, unless you are on a paid GitHub plan:
+   Pages is not available for private repos on the free tier, and the deploy
+   fails with a bare `Not Found`. If you want to keep the code private, host
+   the client on Netlify, Vercel or Cloudflare Pages instead — all three build
+   private repos free. Point them at `npm run build`, publish `dist`, and set
+   `VITE_MULTIPLAYER_URL` in their environment settings.
 3. Push to `main` (or run the workflow by hand). Your link is
    `https://<your-username>.github.io/minecraft/`.
 
