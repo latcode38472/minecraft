@@ -94,6 +94,14 @@ export class Inventory {
     return count - remaining;
   }
 
+  /**
+   * Equipped armour as one tier per slot (0 = empty), in ARMOR_ORDER.
+   * This is what gets sent to other players so they can draw the gear.
+   */
+  equipmentTiers(): number[] {
+    return this.armor.map((stack) => (stack ? (getItem(stack.id)?.armor?.tier ?? 0) : 0));
+  }
+
   /** Total armour points from equipped pieces (0 = unarmoured). */
   armorPoints(): number {
     let total = 0;

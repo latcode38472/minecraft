@@ -42,6 +42,8 @@ export interface InteractionHooks {
   onHitPlayer(id: string, damage: number): void;
   /** Fire an arrow from the eye along `dir`, with the given draw strength. */
   fireArrow(origin: THREE.Vector3, dir: THREE.Vector3, charge: number): void;
+  /** Our own network id, so mob kills can be credited. */
+  localPlayerId(): string;
   /** Feed the player; returns false when already full so the food is kept. */
   tryEat(hunger: number): boolean;
   onOpenStation(station: Station): void;
@@ -269,6 +271,7 @@ export class Interaction {
     const damage = attack?.damage ?? FIST_DAMAGE;
     this.attackCooldown = attack?.cooldown ?? FIST_COOLDOWN_S;
 
+    mob.lastAttackerId = this.hooks.localPlayerId();
     mob.takeDamage(damage, this.player.position.x, this.player.position.z);
     if (stack && getItem(stack.id)?.tool) {
       if (this.inventory.damageSelected()) this.hooks.toast('Your weapon broke!');

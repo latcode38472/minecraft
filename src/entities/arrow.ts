@@ -72,6 +72,20 @@ export class Arrow extends Entity {
     this.object.position.copy(origin);
   }
 
+  /**
+   * Replay `seconds` of flight immediately, so an arrow that spent time on the
+   * wire appears where it truly is rather than lagging behind the shooter.
+   */
+  fastForward(seconds: number, ctx: EntityContext): void {
+    const step = 1 / 60;
+    let remaining = Math.min(seconds, 2);
+    while (remaining > 0 && !this.dead && !this.stuck) {
+      const dt = Math.min(step, remaining);
+      remaining -= dt;
+      this.update({ ...ctx, dt });
+    }
+  }
+
   update(ctx: EntityContext): void {
     this.age += ctx.dt;
     if (this.age > ARROW_LIFETIME_S) {
@@ -109,7 +123,13 @@ export class Arrow extends Entity {
     for (const entity of ctx.entities) {
       if (!(entity instanceof Mob) || entity.dead) continue;
       if (!this.insideBox(entity.position, entity.shape.halfWidth, entity.shape.height)) continue;
-      entity.takeDamage(this.damage, this.position.x - this.velocity.x, this.position.z - this.velocity.z);
+      // Credit the shooter so a kill's loot reaches them, not the ground.
+      entity.lastAttackerId = this.ownerId;
+      entity.takeDamage(
+        this.damage,
+        this.position.x - this.velocity.x,
+        this.position.z - this.velocity.z,
+      );
       this.dead = true;
       return true;
     }

@@ -131,12 +131,14 @@ and player counts for monitoring.
 | Synchronised | Not synchronised |
 | --- | --- |
 | Player position, yaw, pitch, movement/jump/sneak flags | Inventory and hotbar contents |
-| Joins, leaves, display names, room roster | Hunger |
-| Block breaks and placements (server-authoritative) | Time of day |
-| Player health and death (server-authoritative) | Item drops (each player collects their own) |
+| Joins, leaves, display names, room roster | Time of day |
+| Block breaks and placements (server-authoritative) | Block-break drops (each player collects their own) |
+| Player health, hunger and death (server-authoritative) | |
+| Worn armour, drawn on other players' bodies | |
 | PvP damage from melee and arrows | |
 | Mobs, including position, health and death | |
-| Arrows fired by any player | |
+| Mob loot, awarded to whoever landed the killing blow | |
+| Arrows fired by any player, latency-compensated | |
 
 **Combat authority.** The server arbitrates player-vs-player damage: it knows
 every player's last reported position and rejects a hit thrown from beyond
@@ -170,7 +172,9 @@ interpolate. A guest's hit on a mob is forwarded to the host, which applies it.
 - **Armour**: leather, iron and diamond in four slots (head/chest/legs/feet).
   Each point removes 4% damage, capped at 80%; pieces wear out and break
 - **Shield**: hold use to raise it — absorbs 66% of a hit and slows you down
-- **PvP**: in multiplayer you can hit other players with melee or arrows
+- **PvP**: in multiplayer you can hit other players with melee or arrows.
+  Worn armour is drawn on other players' bodies, and a small health bar appears
+  under their name once they are hurt
 
 **Items and building**
 - Mining takes time based on block hardness and the tool you hold; the wrong
@@ -340,19 +344,16 @@ protocol is identical on both platforms.
   and there is no drop-item-from-inventory action.
 - Dying keeps your inventory (deliberate for now). No shovels yet — `ToolKind`
   already includes `'shovel'` as the extension point.
-- Armour has no visual representation on player models; it only shows in the
-  inventory screen and in the damage numbers.
-- Arrows fired by remote players are rendered and simulated locally for the
-  visuals, but only the shooter's client reports hits, so damage is never
-  double-applied. That means a remote arrow's visual path can drift slightly
-  from the path that actually registered the hit.
+- Only the shooter's client reports arrow hits, so damage is never
+  double-applied. Remote arrows are spawned with the elapsed network time
+  replayed, so they appear where they actually are rather than trailing the
+  shot — but a hit still registers on the shooter's view of the world, so at
+  high latency a very near-miss can differ between screens.
 - **Multiplayer:** mobs are *host*-authoritative rather than server-authoritative
   — the server cannot simulate them because it does not generate terrain. If
   the host's tab is backgrounded, mob updates slow for everyone.
-- **Multiplayer:** inventory is per-client, so you cannot hand someone an item.
-  Health is shared, but hunger is not.
-- **Multiplayer:** a guest's mob kill grants loot to the host's world, not the
-  guest — mob drops spawn where the host simulates them.
+- **Multiplayer:** inventory is per-client, so you cannot hand someone an item
+  or trade. Health, hunger and worn armour are shared.
 - **Multiplayer:** worlds are not saved. A room's edits live in server memory
   and are gone when the host leaves. Hook: persist `Room.edits` in
   `server/index.ts`.

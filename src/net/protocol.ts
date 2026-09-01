@@ -66,12 +66,17 @@ export interface PlayerInfo {
   isHost: boolean;
   /** Stable 0-based index used to pick a body colour. */
   colorIndex: number;
+  /** Armour tier per slot (head, chest, legs, feet); 0 = nothing worn. */
+  equipment: number[];
 }
+
+export const ARMOR_SLOTS_ON_WIRE = 4;
 
 /** Server-tracked combat state, broadcast so everyone sees the same health. */
 export interface PlayerVitals {
   id: string;
   health: number;
+  hunger: number;
   dead: boolean;
 }
 
@@ -130,13 +135,20 @@ export type ClientMessage =
   | { t: 'ping'; time: number }
   // Combat
   | { t: 'attack_player'; target: string; damage: number }
-  | { t: 'player_vitals'; health: number; dead: boolean }
+  | { t: 'player_vitals'; health: number; hunger: number; dead: boolean }
+  | { t: 'equipment'; gear: number[] }
+  | { t: 'loot_grant'; to: string; items: { id: string; count: number }[] }
   | { t: 'respawn' }
   // Host-authoritative mobs
   | { t: 'mob_state'; mobs: MobStateData[] }
   | { t: 'mob_removed'; ids: number[] }
   | { t: 'attack_mob'; mob: number; damage: number }
-  | { t: 'arrow_spawn'; x: number; y: number; z: number; dx: number; dy: number; dz: number; speed: number };
+  | {
+      t: 'arrow_spawn';
+      x: number; y: number; z: number;
+      dx: number; dy: number; dz: number;
+      speed: number;
+    };
 
 // --- Server -> client ---
 export type ServerMessage =
@@ -154,6 +166,8 @@ export type ServerMessage =
   | { t: 'error'; message: string }
   // Combat
   | { t: 'player_hurt'; id: string; damage: number; by: string; health: number; dead: boolean }
+  | { t: 'player_equipment'; id: string; gear: number[] }
+  | { t: 'loot_grant'; items: { id: string; count: number }[] }
   | { t: 'player_vitals'; vitals: PlayerVitals[] }
   | { t: 'player_respawned'; id: string }
   // Host-authoritative mobs
@@ -166,6 +180,8 @@ export type ServerMessage =
       x: number; y: number; z: number;
       dx: number; dy: number; dz: number;
       speed: number;
+      /** Server receive time, so receivers can fast-forward out the latency. */
+      sentAt: number;
     };
 
 export function encodeMessage(msg: ClientMessage | ServerMessage): string {
@@ -271,6 +287,31 @@ export function sanitizeMobState(raw: unknown): MobStateData | null {
     yaw: wrapAngle(m.yaw),
     hp: Math.max(0, Math.min(200, m.hp)),
   };
+}
+
+/** Armour tiers arrive as four small ints; anything else is discarded. */
+export function sanitizeEquipment(raw: unknown): number[] | null {
+  if (!Array.isArray(raw) || raw.length !== ARMOR_SLOTS_ON_WIRE) return null;
+  const out: number[] = [];
+  for (const v of raw) {
+    if (!Number.isInteger(v) || (v as number) < 0 || (v as number) > 3) return null;
+    out.push(v as number);
+  }
+  return out;
+}
+
+/** Mob loot forwarded to the player who landed the killing blow. */
+export function sanitizeLoot(raw: unknown): { id: string; count: number }[] | null {
+  if (!Array.isArray(raw) || raw.length > 8) return null;
+  const out: { id: string; count: number }[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) return null;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.id !== 'string' || e.id.length > 40) return null;
+    if (!Number.isInteger(e.count) || (e.count as number) < 1 || (e.count as number) > 64) return null;
+    out.push({ id: e.id, count: e.count as number });
+  }
+  return out;
 }
 
 /** Damage values are clamped, never trusted verbatim. */

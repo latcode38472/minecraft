@@ -49,12 +49,17 @@ export interface SessionEvents {
   onDamaged(amount: number, byName: string): void;
   /** The host is told a guest hit one of its mobs. */
   onMobAttacked(mobId: number, damage: number, byId: string): void;
-  /** Someone else fired an arrow; spawn a visual/physical copy locally. */
+  /**
+   * Someone else fired an arrow; spawn a copy locally. `ageMs` is how long ago
+   * the server saw it, so the receiver can fast-forward out the latency.
+   */
   onRemoteArrow(
     x: number, y: number, z: number,
     dx: number, dy: number, dz: number,
-    speed: number, ownerId: string,
+    speed: number, ownerId: string, ageMs: number,
   ): void;
+  /** Loot the host awarded us for a mob we killed. */
+  onLootGranted(items: { id: string; count: number }[]): void;
 }
 
 export class MultiplayerSession {
@@ -74,6 +79,7 @@ export class MultiplayerSession {
   private lastMobSyncAt = 0;
   private lastVitalsSentAt = 0;
   private pendingMobRemovals: number[] = [];
+  private lastEquipmentSent = '';
   private readonly lastSent = { x: NaN, y: NaN, z: NaN, yaw: NaN, pitch: NaN, flags: -1 };
   /** Chunks we've already asked the server about, so we ask at most once each. */
   private readonly requestedChunks = new Set<string>();
@@ -101,6 +107,7 @@ export class MultiplayerSession {
     assertProtocolMatchesGame();
 
     this.remotePlayers.sync(players, self.id);
+    for (const p of players) this.remotePlayers.applyEquipment(p.id, p.equipment);
     this.events.onRosterChange(players);
 
     // Local edits go out; remote edits come back in through onMessage.
@@ -261,11 +268,25 @@ export class MultiplayerSession {
     });
   }
 
-  /** Report our own health so the room agrees (falls, mobs, starvation). */
-  sendVitals(now: number, health: number, dead: boolean): void {
+  /** Report our own health and hunger so the room agrees. */
+  sendVitals(now: number, health: number, hunger: number, dead: boolean): void {
     if (now - this.lastVitalsSentAt < 250) return;
     this.lastVitalsSentAt = now;
-    this.net.send({ t: 'player_vitals', health, dead });
+    this.net.send({ t: 'player_vitals', health, hunger, dead });
+  }
+
+  /** Publish worn armour; only sent when it actually changes. */
+  sendEquipment(gear: number[]): void {
+    const key = gear.join(',');
+    if (key === this.lastEquipmentSent) return;
+    this.lastEquipmentSent = key;
+    this.net.send({ t: 'equipment', gear });
+  }
+
+  /** Host only: hand a dead mob's loot to the guest that killed it. */
+  grantLoot(toId: string, items: { id: string; count: number }[]): void {
+    if (!this.isHost || items.length === 0) return;
+    this.net.send({ t: 'loot_grant', to: toId, items });
   }
 
   sendRespawn(): void {
@@ -338,6 +359,7 @@ export class MultiplayerSession {
       case 'player_joined': {
         this.players = msg.players;
         this.remotePlayers.sync(msg.players, this.self.id);
+        for (const p of msg.players) this.remotePlayers.applyEquipment(p.id, p.equipment);
         this.events.onRosterChange(msg.players);
         this.events.onNotice(`${msg.player.name} joined the world.`);
         return;
@@ -368,9 +390,14 @@ export class MultiplayerSession {
         return;
       }
       case 'player_hurt': {
-        for (const v of [{ id: msg.id, health: msg.health, dead: msg.dead }]) {
-          this.vitals.set(v.id, v);
-        }
+        const existing = this.vitals.get(msg.id);
+        this.vitals.set(msg.id, {
+          id: msg.id,
+          health: msg.health,
+          hunger: existing?.hunger ?? 20,
+          dead: msg.dead,
+        });
+        this.remotePlayers.applyHealth(msg.id, msg.health);
         if (msg.id === this.self.id) {
           const attacker = this.players.find((p) => p.id === msg.by);
           this.events.onDamaged(msg.damage, attacker?.name ?? 'someone');
@@ -378,11 +405,15 @@ export class MultiplayerSession {
         return;
       }
       case 'player_vitals': {
-        for (const v of msg.vitals) this.vitals.set(v.id, v);
+        for (const v of msg.vitals) {
+          this.vitals.set(v.id, v);
+          this.remotePlayers.applyHealth(v.id, v.health);
+        }
         return;
       }
       case 'player_respawned': {
-        this.vitals.set(msg.id, { id: msg.id, health: 20, dead: false });
+        this.vitals.set(msg.id, { id: msg.id, health: 20, hunger: 20, dead: false });
+        this.remotePlayers.applyHealth(msg.id, 20);
         return;
       }
       case 'mob_state': {
@@ -399,7 +430,20 @@ export class MultiplayerSession {
         return;
       }
       case 'arrow_spawn': {
-        this.events.onRemoteArrow(msg.x, msg.y, msg.z, msg.dx, msg.dy, msg.dz, msg.speed, msg.by);
+        // Fast-forward by the trip time so the arrow appears where it really is
+        // rather than trailing the shooter's view by a round trip.
+        const age = Math.max(0, Math.min(2000, Date.now() - msg.sentAt));
+        this.events.onRemoteArrow(
+          msg.x, msg.y, msg.z, msg.dx, msg.dy, msg.dz, msg.speed, msg.by, age,
+        );
+        return;
+      }
+      case 'player_equipment': {
+        this.remotePlayers.applyEquipment(msg.id, msg.gear);
+        return;
+      }
+      case 'loot_grant': {
+        this.events.onLootGranted(msg.items);
         return;
       }
       case 'room_closed': {

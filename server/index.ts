@@ -34,6 +34,8 @@ import {
   isValidChunkKey,
   normalizeRoomCode,
   sanitizeDamage,
+  sanitizeEquipment,
+  sanitizeLoot,
   sanitizeMobState,
   sanitizeName,
   sanitizePlayerState,
@@ -70,11 +72,15 @@ interface Client {
   pos: { x: number; y: number; z: number };
   /** Server-owned combat state — clients never set this directly. */
   health: number;
+  hunger: number;
   dead: boolean;
+  /** Armour tier per slot, mirrored so late joiners see worn gear. */
+  equipment: number[];
   buckets: { state: RateBucket; edits: RateBucket; other: RateBucket; combat: RateBucket };
 }
 
 const MAX_HEALTH = 20;
+const MAX_HUNGER = 20;
 
 interface Room {
   code: string;
@@ -128,7 +134,12 @@ function broadcast(room: Room, msg: ServerMessage, exceptId?: string): void {
 }
 
 function vitals(client: Client): PlayerVitals {
-  return { id: client.id, health: client.health, dead: client.dead };
+  return {
+    id: client.id,
+    health: client.health,
+    hunger: client.hunger,
+    dead: client.dead,
+  };
 }
 
 function roomVitals(room: Room): PlayerVitals[] {
@@ -141,6 +152,7 @@ function playerInfo(client: Client): PlayerInfo {
     name: client.name,
     isHost: client.isHost,
     colorIndex: client.colorIndex,
+    equipment: client.equipment,
   };
 }
 
@@ -297,7 +309,9 @@ function handleMessage(client: Client, raw: string): void {
       client.isHost = true;
       client.colorIndex = 0;
       client.health = MAX_HEALTH;
+      client.hunger = MAX_HUNGER;
       client.dead = false;
+      client.equipment = [0, 0, 0, 0];
       client.room = room;
       room.clients.set(client.id, client);
       rooms.set(room.code, room);
@@ -341,7 +355,9 @@ function handleMessage(client: Client, raw: string): void {
       client.isHost = false;
       client.colorIndex = pickColorIndex(room);
       client.health = MAX_HEALTH;
+      client.hunger = MAX_HUNGER;
       client.dead = false;
+      client.equipment = [0, 0, 0, 0];
       client.room = room;
       room.clients.set(client.id, client);
       room.emptySince = null;
@@ -443,6 +459,9 @@ function handleMessage(client: Client, raw: string): void {
       if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
       if (!isFiniteNumber(msg.health)) return;
       client.health = Math.max(0, Math.min(MAX_HEALTH, msg.health));
+      if (isFiniteNumber(msg.hunger)) {
+        client.hunger = Math.max(0, Math.min(MAX_HUNGER, msg.hunger));
+      }
       client.dead = client.health <= 0 || msg.dead === true;
       broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
       return;
@@ -453,9 +472,33 @@ function handleMessage(client: Client, raw: string): void {
       if (!room) return;
       if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
       client.health = MAX_HEALTH;
+      client.hunger = MAX_HUNGER;
       client.dead = false;
       broadcast(room, { t: 'player_respawned', id: client.id });
       broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
+      return;
+    }
+
+    case 'equipment': {
+      const room = client.room;
+      if (!room) return;
+      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
+      const gear = sanitizeEquipment(msg.gear);
+      if (!gear) return;
+      client.equipment = gear;
+      broadcast(room, { t: 'player_equipment', id: client.id, gear }, client.id);
+      return;
+    }
+
+    case 'loot_grant': {
+      // Only the host awards loot, and only to a player in its room.
+      const room = client.room;
+      if (!room || !client.isHost) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      const items = sanitizeLoot(msg.items);
+      const target = typeof msg.to === 'string' ? room.clients.get(msg.to) : undefined;
+      if (!items || !target || target.id === client.id) return;
+      send(target, { t: 'loot_grant', items });
       return;
     }
 
@@ -510,6 +553,7 @@ function handleMessage(client: Client, raw: string): void {
           x: x as number, y: y as number, z: z as number,
           dx: dx as number, dy: dy as number, dz: dz as number,
           speed: Math.min(200, Math.max(0, speed as number)),
+          sentAt: Date.now(),
         },
         client.id,
       );
@@ -564,7 +608,9 @@ wss.on('connection', (socket: WebSocket) => {
     lastSeen: Date.now(),
     pos: { x: 0, y: 0, z: 0 },
     health: MAX_HEALTH,
+    hunger: MAX_HUNGER,
     dead: false,
+    equipment: [0, 0, 0, 0],
     buckets: {
       state: newBucket(RATE_LIMIT_STATE_PER_SEC),
       edits: newBucket(RATE_LIMIT_EDITS_PER_SEC),

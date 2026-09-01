@@ -26,6 +26,8 @@ export interface ArmorStats {
   /** Armour points; 20 points is full protection (80% reduction). */
   points: number;
   durability: number;
+  /** 1 leather, 2 iron, 3 diamond — sent over the network to draw the piece. */
+  tier: number;
 }
 
 export interface ItemDef {
@@ -219,6 +221,7 @@ ARMOR_TIERS.forEach((tier, tierIndex) => {
         slot: slot.slot,
         points: Math.round(slot.base * tier.mult),
         durability: tier.durability,
+        tier: tierIndex + 1,
       },
     });
   }

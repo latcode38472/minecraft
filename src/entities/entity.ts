@@ -27,6 +27,11 @@ export interface EntityContext {
   players: PlayerTarget[];
   /** Id used for the local player in `players`. */
   localPlayerId: string;
+  /**
+   * Set while a dead mob's loot is being spawned, to the player who killed it.
+   * Lets the host hand loot to a guest instead of dropping it out of reach.
+   */
+  lootRecipientId: string | null;
   /** Live entity list, so projectiles can test hits. */
   entities: readonly Entity[];
   isNight: boolean;
@@ -79,6 +84,8 @@ export abstract class Mob extends Entity {
   attackCooldown = 0;
   /** Facing angle, applied to the model each frame. */
   yaw = 0;
+  /** Network id of whoever last damaged this mob; decides who gets the loot. */
+  lastAttackerId: string | null = null;
   readonly mesh: THREE.Mesh;
 
   constructor(geometry: THREE.BufferGeometry, maxHealth: number) {
@@ -117,12 +124,20 @@ export abstract class Mob extends Entity {
     this.mesh.material = this.hurtTime > 0 ? getMobHurtMaterial() : getMobMaterial();
   }
 
-  /** Spawn this mob's loot where it died. */
+  /** Spawn this mob's loot where it died, or hand it to a remote killer. */
   dropLoot(ctx: EntityContext): void {
-    for (const entry of this.loot()) {
-      if (entry.count > 0) {
-        ctx.spawnDrop(entry.id, entry.count, this.position.x, this.position.y + 0.4, this.position.z);
+    ctx.lootRecipientId = this.lastAttackerId;
+    try {
+      for (const entry of this.loot()) {
+        if (entry.count > 0) {
+          ctx.spawnDrop(
+            entry.id, entry.count,
+            this.position.x, this.position.y + 0.4, this.position.z,
+          );
+        }
       }
+    } finally {
+      ctx.lootRecipientId = null;
     }
   }
 

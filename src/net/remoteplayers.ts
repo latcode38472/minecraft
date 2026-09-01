@@ -29,10 +29,15 @@ interface Snapshot {
   flags: number;
 }
 
-function playerParts(color: number): BoxPart[] {
+/** Armour tier colours, indexed 1..3 (0 = nothing worn). */
+const ARMOR_COLORS = [0, 0xa06a3c, 0xd8d8d8, 0x5cdbd5];
+/** How far armour boxes are inflated past the body, so they read as worn. */
+const ARMOR_PAD = 0.06;
+
+function playerParts(color: number, gear: number[]): BoxPart[] {
   const skin = 0xd8b18a;
   const legs = 0x394a6b;
-  return [
+  const parts: BoxPart[] = [
     { pos: [0, 1.62, 0], size: [0.5, 0.5, 0.5], color: skin }, // head
     { pos: [0, 1.0, 0], size: [0.55, 0.7, 0.28], color }, // torso
     { pos: [-0.4, 1.0, 0], size: [0.24, 0.7, 0.24], color }, // arms
@@ -40,15 +45,61 @@ function playerParts(color: number): BoxPart[] {
     { pos: [-0.14, 0.32, 0], size: [0.26, 0.65, 0.26], color: legs }, // legs
     { pos: [0.14, 0.32, 0], size: [0.26, 0.65, 0.26], color: legs },
   ];
+
+  // Worn armour is drawn as slightly larger shells over the body parts, so a
+  // glance tells you how well protected another player is.
+  const [head, chest, legsTier, feet] = gear;
+  const inflate = (p: BoxPart, tier: number, scale = 1): BoxPart => ({
+    pos: p.pos,
+    size: [p.size[0] + ARMOR_PAD, p.size[1] * scale + ARMOR_PAD * 0.5, p.size[2] + ARMOR_PAD],
+    color: ARMOR_COLORS[tier],
+  });
+
+  if (head > 0) parts.push(inflate(parts[0], head));
+  if (chest > 0) {
+    parts.push(inflate(parts[1], chest));
+    // Pauldrons: the upper half of each arm.
+    for (const armIndex of [2, 3]) {
+      const arm = parts[armIndex];
+      parts.push({
+        pos: [arm.pos[0], arm.pos[1] + 0.18, arm.pos[2]],
+        size: [arm.size[0] + ARMOR_PAD, 0.3, arm.size[2] + ARMOR_PAD],
+        color: ARMOR_COLORS[chest],
+      });
+    }
+  }
+  if (legsTier > 0) {
+    for (const legIndex of [4, 5]) {
+      const leg = parts[legIndex];
+      parts.push({
+        pos: [leg.pos[0], leg.pos[1] + 0.14, leg.pos[2]],
+        size: [leg.size[0] + ARMOR_PAD, 0.42, leg.size[2] + ARMOR_PAD],
+        color: ARMOR_COLORS[legsTier],
+      });
+    }
+  }
+  if (feet > 0) {
+    for (const legIndex of [4, 5]) {
+      const leg = parts[legIndex];
+      parts.push({
+        pos: [leg.pos[0], leg.pos[1] - 0.22, leg.pos[2]],
+        size: [leg.size[0] + ARMOR_PAD, 0.2, leg.size[2] + ARMOR_PAD * 2],
+        color: ARMOR_COLORS[feet],
+      });
+    }
+  }
+  return parts;
 }
 
-const geometryCache = new Map<number, THREE.BufferGeometry>();
+// Keyed by colour + gear, so two players in identical armour share one buffer.
+const geometryCache = new Map<string, THREE.BufferGeometry>();
 
-function bodyGeometry(colorIndex: number): THREE.BufferGeometry {
-  let geo = geometryCache.get(colorIndex);
+function bodyGeometry(colorIndex: number, gear: number[]): THREE.BufferGeometry {
+  const key = `${colorIndex}|${gear.join(',')}`;
+  let geo = geometryCache.get(key);
   if (!geo) {
-    geo = buildBoxGeometry(playerParts(BODY_COLORS[colorIndex % BODY_COLORS.length]));
-    geometryCache.set(colorIndex, geo);
+    geo = buildBoxGeometry(playerParts(BODY_COLORS[colorIndex % BODY_COLORS.length], gear));
+    geometryCache.set(key, geo);
   }
   return geo;
 }
@@ -92,15 +143,38 @@ export class RemotePlayer {
 
   private readonly body: THREE.Mesh;
   private readonly label: THREE.Sprite;
+  private readonly healthBar: THREE.Mesh;
   private readonly snapshots: Snapshot[] = [];
   private bobPhase = 0;
+  private gear: number[];
 
   constructor(info: PlayerInfo) {
     this.info = info;
-    this.body = new THREE.Mesh(bodyGeometry(info.colorIndex), getMobMaterial());
+    this.gear = normalizeGear(info.equipment);
+    this.body = new THREE.Mesh(bodyGeometry(info.colorIndex, this.gear), getMobMaterial());
     this.label = makeNameLabel(info.name);
-    this.group.add(this.body, this.label);
+    this.healthBar = makeHealthBar();
+    this.group.add(this.body, this.label, this.healthBar);
     this.group.visible = false; // until the first snapshot arrives
+  }
+
+  /** Swap in new armour; geometry is shared per (colour, gear) combination. */
+  setEquipment(gear: number[]): void {
+    const next = normalizeGear(gear);
+    if (next.join(',') === this.gear.join(',')) return;
+    this.gear = next;
+    this.body.geometry = bodyGeometry(this.info.colorIndex, next);
+  }
+
+  /** Show a small bar under the name when the player is hurt. */
+  setHealth(health: number, maxHealth = 20): void {
+    const fraction = Math.max(0, Math.min(1, health / maxHealth));
+    this.healthBar.visible = fraction < 1;
+    this.healthBar.scale.x = Math.max(0.001, fraction);
+    // Slide the shrinking bar so it drains from the right, not the centre.
+    this.healthBar.position.x = -(1 - fraction) * HEALTH_BAR_WIDTH * 0.5;
+    const mat = this.healthBar.material as THREE.MeshBasicMaterial;
+    mat.color.setHex(fraction > 0.5 ? 0x4ad24a : fraction > 0.25 ? 0xd2c94a : 0xd24a4a);
   }
 
   pushState(state: PlayerStateData, now: number): void {
@@ -169,13 +243,45 @@ export class RemotePlayer {
     this.body.position.y = bob + (jumping ? 0.05 : 0);
     this.body.rotation.x = Math.max(-0.5, Math.min(0.5, pitch)) * 0.15;
     this.label.position.y = PLAYER_HEIGHT + 0.45 + bob;
+    this.healthBar.position.y = PLAYER_HEIGHT + 0.24 + bob;
   }
 
   dispose(): void {
-    // Geometry is shared per colour; only the label is per-player.
+    // Body geometry is shared per (colour, gear); these two are per-player.
     this.label.material.map?.dispose();
     this.label.material.dispose();
+    this.healthBar.geometry.dispose();
+    (this.healthBar.material as THREE.Material).dispose();
   }
+}
+
+const HEALTH_BAR_WIDTH = 0.7;
+
+/** A flat quad that always faces the camera, used as a tiny health bar. */
+function makeHealthBar(): THREE.Mesh {
+  const geo = new THREE.PlaneGeometry(HEALTH_BAR_WIDTH, 0.08);
+  const mesh = new THREE.Mesh(
+    geo,
+    new THREE.MeshBasicMaterial({ color: 0x4ad24a, depthTest: false, transparent: true }),
+  );
+  mesh.position.y = PLAYER_HEIGHT + 0.24;
+  mesh.renderOrder = 2;
+  mesh.visible = false;
+  mesh.onBeforeRender = (_r, _s, camera) => {
+    // Billboard: copy the camera's orientation each frame.
+    mesh.quaternion.copy(camera.quaternion);
+  };
+  return mesh;
+}
+
+function normalizeGear(gear: number[] | undefined): number[] {
+  const out = [0, 0, 0, 0];
+  if (!Array.isArray(gear)) return out;
+  for (let i = 0; i < 4; i++) {
+    const v = gear[i];
+    out[i] = Number.isInteger(v) && v >= 0 && v <= 3 ? v : 0;
+  }
+  return out;
 }
 
 function shortestAngle(from: number, to: number): number {
@@ -220,6 +326,18 @@ export class RemotePlayerManager {
 
   applyState(id: string, state: PlayerStateData, now: number): void {
     this.players.get(id)?.pushState(state, now);
+  }
+
+  applyEquipment(id: string, gear: number[]): void {
+    this.players.get(id)?.setEquipment(gear);
+  }
+
+  applyHealth(id: string, health: number): void {
+    this.players.get(id)?.setHealth(health);
+  }
+
+  get(id: string): RemotePlayer | undefined {
+    return this.players.get(id);
   }
 
   update(now: number, dt: number): void {

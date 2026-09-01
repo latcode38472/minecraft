@@ -219,6 +219,7 @@ async function boot(choice: StartChoice): Promise<void> {
     toast: (msg) => hud.toast(msg),
     combatTargets: () => (session ? networkedTargets(session) : []),
     onHitPlayer: (id, damage) => hitNetworkedTarget(id, damage),
+    localPlayerId: () => selfNetId(),
     fireArrow: (origin, dir, charge) => {
       const speed = ARROW_SPEED * (0.35 + charge * 0.65);
       const damage = Math.max(1, Math.round(2 + charge * 7));
@@ -273,7 +274,7 @@ async function boot(choice: StartChoice): Promise<void> {
     speed: number,
     damage: number,
     ownerId: string,
-  ): void {
+  ): Arrow {
     const arrow = new Arrow(origin, dir, speed, damage, ownerId, {
       // The shooter's own id is filtered inside Arrow; include everyone else.
       targets: () => (session ? networkedTargets(session) : []),
@@ -282,6 +283,7 @@ async function boot(choice: StartChoice): Promise<void> {
     // Start slightly ahead of the eye so it doesn't clip the shooter.
     arrow.position.addScaledVector(dir, 0.4);
     entities.add(arrow);
+    return arrow;
   }
 
   // --- Play state ---
@@ -456,6 +458,7 @@ async function boot(choice: StartChoice): Promise<void> {
     playerPos: player.position,
     players: [],
     localPlayerId: 'local',
+    lootRecipientId: null,
     entities: entities.entities,
     isNight: false,
     damagePlayer: (id, amount, fromX, fromZ) => {
@@ -468,7 +471,16 @@ async function boot(choice: StartChoice): Promise<void> {
         session?.attackPlayer(id, amount);
       }
     },
-    spawnDrop: (id, count, x, y, z) => entities.spawnDrop(id, count, x, y, z),
+    spawnDrop: (id, count, x, y, z) => {
+      // A guest that landed the killing blow gets the loot directly; dropping
+      // it in the host's world would leave it unreachable for them.
+      const killer = entityContext.lootRecipientId;
+      if (killer && session && killer !== entityContext.localPlayerId) {
+        session.grantLoot(killer, [{ id, count }]);
+        return;
+      }
+      entities.spawnDrop(id, count, x, y, z);
+    },
     collectItem: (id, count, damage) => {
       const leftover = inventory.add(id, count, damage);
       if (leftover < count) {
@@ -568,14 +580,25 @@ async function boot(choice: StartChoice): Promise<void> {
           const attacker = session?.remotePlayers.all.find((p) => p.info.id === byId);
           const from = attacker?.position ?? player.position;
           mob.hurtTime = 0; // the guest's client already paced the swing
+          mob.lastAttackerId = byId; // so the loot goes to whoever lands the kill
           mob.takeDamage(damage, from.x, from.z);
         },
-        onRemoteArrow: (x, y, z, dx, dy, dz, speed, ownerId) => {
+        onRemoteArrow: (x, y, z, dx, dy, dz, speed, ownerId, ageMs) => {
           const origin = new THREE.Vector3(x, y, z);
           const dir = new THREE.Vector3(dx, dy, dz);
           // Remote arrows are visual + physical locally, but only the shooter's
           // client reports hits, so damage is never applied twice.
-          spawnArrow(origin, dir, speed, 0, ownerId);
+          const arrow = spawnArrow(origin, dir, speed, 0, ownerId);
+          // Catch the arrow up to where it actually is: replay the flight time
+          // that elapsed while the packet was in transit.
+          arrow.fastForward(ageMs / 1000, entityContext);
+        },
+        onLootGranted: (items) => {
+          for (const entry of items) inventory.add(entry.id, entry.count);
+          hud.refresh();
+          playPickup();
+          const names = items.map((e) => `${e.count} ${getItem(e.id)?.name ?? e.id}`);
+          if (names.length) mpHud.notice(`Picked up ${names.join(', ')}`);
         },
       },
     );
@@ -724,7 +747,8 @@ async function boot(choice: StartChoice): Promise<void> {
         for (const id of entities.removedMobIds.splice(0)) session.noteMobRemoved(id);
         session.syncMobs(nowMs, entities.mobSnapshot());
       }
-      session.sendVitals(nowMs, survival.health, survival.dead);
+      session.sendVitals(nowMs, survival.health, survival.hunger, survival.dead);
+      session.sendEquipment(inventory.equipmentTiers());
       mpHud.setPing(session.ping, session.status === 'connected' ? 'Ping: —' : session.status);
     }
 
