@@ -34,6 +34,24 @@ export const enum ItemTile {
   RawPorkchop = 43,
   CookedPorkchop = 44,
   RottenFlesh = 45,
+  Bow = 46,
+  Arrow = 47,
+  Shield = 48,
+  LeatherHelmet = 49,
+  LeatherChestplate = 50,
+  LeatherLeggings = 51,
+  LeatherBoots = 52,
+  IronHelmet = 53,
+  IronChestplate = 54,
+  IronLeggings = 55,
+  IronBoots = 56,
+  DiamondHelmet = 57,
+  DiamondChestplate = 58,
+  DiamondLeggings = 59,
+  DiamondBoots = 60,
+  Leather = 61,
+  String = 62,
+  Flint = 63,
 }
 
 /** Deterministic per-pixel hash so the atlas looks identical every run. */
@@ -182,7 +200,113 @@ const MEAT = [
   '........',
 ];
 
+const HELMET = [
+  '..HHHH..',
+  '.HHHHHH.',
+  'HHHHHHHH',
+  'HHH..HHH',
+  'HH....HH',
+  '........',
+  '........',
+  '........',
+];
+const CHESTPLATE = [
+  '.H.HH.H.',
+  'HHHHHHHH',
+  'HHHHHHHH',
+  'HHHHHHHH',
+  '.HHHHHH.',
+  '.HHHHHH.',
+  '.HH..HH.',
+  '........',
+];
+const LEGGINGS = [
+  '........',
+  '.HHHHHH.',
+  '.HHHHHH.',
+  '.HHHHHH.',
+  '.HH..HH.',
+  '.HH..HH.',
+  '.HH..HH.',
+  '........',
+];
+const BOOTS = [
+  '........',
+  '........',
+  '........',
+  '.HH..HH.',
+  '.HH..HH.',
+  '.HH..HH.',
+  'HHH..HHH',
+  'HHHHHHHH',
+];
+const BOW = [
+  '.....HH.',
+  '...HH..H',
+  '..H.S..H',
+  '..H..S.H',
+  '..H.S..H',
+  '...HH..H',
+  '.....HH.',
+  '........',
+];
+const ARROW = [
+  '......DH',
+  '.....DHD',
+  '....DS..',
+  '...DS...',
+  '..FS....',
+  '.FFS....',
+  'FF......',
+  '........',
+];
+const HIDE = [
+  '........',
+  '.HHHHHH.',
+  'HHHHHHHH',
+  'HHHDDHHH',
+  'HHHDDHHH',
+  'HHHHHHHH',
+  '.HHHHHH.',
+  '........',
+];
+const STRING_SPRITE = [
+  '..HH....',
+  '.H..H...',
+  'H....H..',
+  '.H....H.',
+  '..H....H',
+  '...H..H.',
+  '....HH..',
+  '........',
+];
+const FLINT = [
+  '........',
+  '...HH...',
+  '..HHHH..',
+  '.HHHHDH.',
+  '.HHHDDH.',
+  '..HHDH..',
+  '...HH...',
+  '........',
+];
+const SHIELD = [
+  '.HHHHHH.',
+  '.HDDDDH.',
+  '.HDSSDH.',
+  '.HDSSDH.',
+  '.HDDDDH.',
+  '..HDDH..',
+  '...HH...',
+  '........',
+];
+
 const STICK_COLOR: RGB = [122, 88, 51];
+const ARMOR_TIERS: Record<string, RGB> = {
+  leather: [160, 106, 60],
+  iron: [216, 216, 216],
+  diamond: [92, 219, 213],
+};
 const TIER_COLORS: Record<string, RGB> = {
   wood: [156, 118, 70],
   stone: [130, 130, 130],
@@ -356,6 +480,37 @@ function buildAtlas(): HTMLCanvasElement {
   drawSprite(ctx, ItemTile.RawPorkchop, MEAT, { H: [238, 154, 150], D: [214, 112, 108] });
   drawSprite(ctx, ItemTile.CookedPorkchop, MEAT, { H: [190, 130, 74], D: [150, 96, 50] });
   drawSprite(ctx, ItemTile.RottenFlesh, MEAT, { H: [130, 110, 72], D: [96, 80, 52] });
+
+  // Bow, arrow and shield.
+  drawSprite(ctx, ItemTile.Bow, BOW, { H: [154, 107, 63], S: [225, 225, 210] });
+  drawSprite(ctx, ItemTile.Arrow, ARROW, {
+    H: [190, 190, 190], D: [140, 140, 140], S: STICK_COLOR, F: [235, 235, 235],
+  });
+  drawSprite(ctx, ItemTile.Shield, SHIELD, {
+    H: [122, 84, 46], D: [154, 107, 63], S: [200, 200, 200],
+  });
+
+  drawSprite(ctx, ItemTile.Leather, HIDE, { H: [178, 128, 84], D: [148, 102, 64] });
+  drawSprite(ctx, ItemTile.String, STRING_SPRITE, { H: [232, 232, 226] });
+  drawSprite(ctx, ItemTile.Flint, FLINT, { H: [72, 68, 68], D: [44, 42, 42] });
+
+  // Armour: one shape per slot, recoloured per tier.
+  const armorPieces: [number[], string[]][] = [
+    [[ItemTile.LeatherHelmet, ItemTile.IronHelmet, ItemTile.DiamondHelmet], HELMET],
+    [[ItemTile.LeatherChestplate, ItemTile.IronChestplate, ItemTile.DiamondChestplate], CHESTPLATE],
+    [[ItemTile.LeatherLeggings, ItemTile.IronLeggings, ItemTile.DiamondLeggings], LEGGINGS],
+    [[ItemTile.LeatherBoots, ItemTile.IronBoots, ItemTile.DiamondBoots], BOOTS],
+  ];
+  const tierOrder = ['leather', 'iron', 'diamond'];
+  for (const [tiles, shape] of armorPieces) {
+    tiles.forEach((tile, i) => {
+      const base = ARMOR_TIERS[tierOrder[i]];
+      drawSprite(ctx, tile, shape, {
+        H: base,
+        D: [base[0] * 0.72, base[1] * 0.72, base[2] * 0.72],
+      });
+    });
+  }
 
   return canvas;
 }

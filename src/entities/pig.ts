@@ -22,7 +22,10 @@ export class Pig extends Mob {
   }
 
   protected loot(): { id: string; count: number }[] {
-    return [{ id: 'raw_porkchop', count: 1 + Math.floor(Math.random() * 2) }];
+    return [
+      { id: 'raw_porkchop', count: 1 + Math.floor(Math.random() * 2) },
+      { id: 'leather', count: Math.random() < 0.7 ? 1 : 2 },
+    ];
   }
 
   takeDamage(amount: number, fromX: number, fromZ: number): void {

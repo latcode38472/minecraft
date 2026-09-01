@@ -7,6 +7,10 @@ import { getItem } from './items';
 export const HOTBAR_SIZE = 9;
 export const INVENTORY_ROWS = 3;
 export const INVENTORY_SIZE = HOTBAR_SIZE + INVENTORY_ROWS * HOTBAR_SIZE;
+/** Armour lives in its own four slots, indexed by ARMOR_ORDER. */
+export const ARMOR_ORDER = ['head', 'chest', 'legs', 'feet'] as const;
+export type ArmorSlotName = (typeof ARMOR_ORDER)[number];
+export const ARMOR_SLOT_COUNT = ARMOR_ORDER.length;
 
 export interface ItemStack {
   id: string;
@@ -17,6 +21,8 @@ export interface ItemStack {
 
 export class Inventory {
   readonly slots: (ItemStack | null)[] = new Array(INVENTORY_SIZE).fill(null);
+  /** Equipped armour, parallel to ARMOR_ORDER. */
+  readonly armor: (ItemStack | null)[] = new Array(ARMOR_SLOT_COUNT).fill(null);
   selected = 0;
   /** Bumped on every mutation so UIs can re-render only when needed. */
   version = 0;
@@ -88,6 +94,66 @@ export class Inventory {
     return count - remaining;
   }
 
+  /** Total armour points from equipped pieces (0 = unarmoured). */
+  armorPoints(): number {
+    let total = 0;
+    for (const stack of this.armor) {
+      if (!stack) continue;
+      total += getItem(stack.id)?.armor?.points ?? 0;
+    }
+    return total;
+  }
+
+  /**
+   * Equip a piece from an inventory slot, swapping out whatever it replaces.
+   * Returns false if the item isn't armour.
+   */
+  equipFromSlot(slotIndex: number): boolean {
+    const stack = this.slots[slotIndex];
+    const armor = stack ? getItem(stack.id)?.armor : undefined;
+    if (!stack || !armor) return false;
+    const target = ARMOR_ORDER.indexOf(armor.slot);
+    if (target < 0) return false;
+    const previous = this.armor[target];
+    this.armor[target] = stack;
+    this.slots[slotIndex] = previous;
+    this.version++;
+    return true;
+  }
+
+  /** Move an equipped piece back into the first free inventory slot. */
+  unequip(armorIndex: number): boolean {
+    const stack = this.armor[armorIndex];
+    if (!stack) return false;
+    const free = this.slots.indexOf(null);
+    if (free < 0) return false;
+    this.slots[free] = stack;
+    this.armor[armorIndex] = null;
+    this.version++;
+    return true;
+  }
+
+  /**
+   * Wear down armour when damage is taken; pieces break and vanish at zero.
+   * Returns the ids of any pieces that broke.
+   */
+  damageArmor(amount = 1): string[] {
+    const broken: string[] = [];
+    for (let i = 0; i < this.armor.length; i++) {
+      const stack = this.armor[i];
+      if (!stack) continue;
+      const def = getItem(stack.id);
+      if (!def?.armor) continue;
+      stack.damage = (stack.damage ?? 0) + amount;
+      if (stack.damage >= def.armor.durability) {
+        broken.push(stack.id);
+        this.armor[i] = null;
+      }
+    }
+    if (this.armor.some(Boolean) || broken.length) this.version++;
+    return broken;
+  }
+
   /** Consume one of the selected stack (placing a block, eating). */
   consumeSelected(): void {
     const slot = this.slots[this.selected];
@@ -140,6 +206,7 @@ export class Inventory {
 
   clear(): void {
     this.slots.fill(null);
+    this.armor.fill(null);
     this.version++;
   }
 
@@ -147,11 +214,29 @@ export class Inventory {
     return this.slots.map((s) => (s ? { ...s } : null));
   }
 
-  load(data: (ItemStack | null)[] | undefined, selected = 0): void {
-    if (!data) return;
-    for (let i = 0; i < this.slots.length; i++) {
-      const entry = data[i];
-      this.slots[i] = entry && getItem(entry.id) ? { ...entry } : null;
+  serializeArmor(): (ItemStack | null)[] {
+    return this.armor.map((s) => (s ? { ...s } : null));
+  }
+
+  load(
+    data: (ItemStack | null)[] | undefined,
+    selected = 0,
+    armor?: (ItemStack | null)[],
+  ): void {
+    if (data) {
+      for (let i = 0; i < this.slots.length; i++) {
+        const entry = data[i];
+        this.slots[i] = entry && getItem(entry.id) ? { ...entry } : null;
+      }
+    }
+    if (armor) {
+      for (let i = 0; i < this.armor.length; i++) {
+        const entry = armor[i];
+        // Only accept a piece that actually belongs in this slot.
+        const def = entry ? getItem(entry.id) : undefined;
+        const fits = def?.armor && ARMOR_ORDER.indexOf(def.armor.slot) === i;
+        this.armor[i] = fits && entry ? { ...entry } : null;
+      }
     }
     this.selected = Math.max(0, Math.min(HOTBAR_SIZE - 1, selected));
     this.version++;

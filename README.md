@@ -52,6 +52,8 @@ no build step — Node runs the TypeScript directly.
 | Right click | place block, eat food, use a crafting table or furnace |
 | E | inventory & crafting |
 | 1–9 / mouse wheel | select hotbar slot |
+| Right click (bow) | hold to draw, release to fire |
+| Right click (shield) | hold to block |
 | `[` / `]` | decrease / increase view distance |
 | T | skip time forward (test day/night) |
 | F3 | debug overlay |
@@ -67,6 +69,8 @@ landscape):
 | Drag anywhere else | look |
 | Hold | mine the targeted block / attack a mob |
 | Tap | place block, eat food, use a crafting table or furnace |
+| Hold with a bow | draw; release to fire |
+| Hold with a shield | raise it to block |
 | ▲ button | jump / swim up (hold) |
 | ▼ button | sneak / swim down (toggle) |
 | Tap hotbar | select item |
@@ -126,10 +130,20 @@ and player counts for monitoring.
 
 | Synchronised | Not synchronised |
 | --- | --- |
-| Player position, yaw, pitch, movement/jump/sneak flags | Mobs (disabled in multiplayer) |
-| Joins, leaves, display names, room roster | Inventory and hotbar contents |
-| Block breaks and placements (server-authoritative) | Health, hunger, damage |
-| World seed and spawn | Time of day |
+| Player position, yaw, pitch, movement/jump/sneak flags | Inventory and hotbar contents |
+| Joins, leaves, display names, room roster | Hunger |
+| Block breaks and placements (server-authoritative) | Time of day |
+| Player health and death (server-authoritative) | Item drops (each player collects their own) |
+| PvP damage from melee and arrows | |
+| Mobs, including position, health and death | |
+| Arrows fired by any player | |
+
+**Combat authority.** The server arbitrates player-vs-player damage: it knows
+every player's last reported position and rejects a hit thrown from beyond
+melee/arrow range, so a modified client cannot snipe across the map. Mobs are
+simulated by the **host** — one simulation means everyone agrees who is alive —
+and relayed through the server at 10 snapshots a second, which guests
+interpolate. A guest's hit on a mob is forwarded to the host, which applies it.
 
 ## What's in the game
 
@@ -141,13 +155,22 @@ and player counts for monitoring.
 - 20 block types including gravel, bricks, glass, crafting table and furnace
 - Trees, water, day/night cycle driving sun, sky and fog
 
-**Survival**
+**Survival and combat**
 - 20 health, 20 hunger; hunger drains with time and distance, regenerates health
   when full, and starves you when empty
 - Fall damage, mob damage with knockback and invulnerability frames
 - Death screen and respawn at your world spawn point
-- Passive pigs and hostile zombies; zombies chase and attack at night, both take
-  damage, die, and drop loot
+- Passive pigs and hostile zombies; zombies chase and attack the nearest player,
+  take damage, die, and drop loot
+- **Melee**: swords, axes and pickaxes in four tiers, each with its own damage
+  and attack cooldown; bare fists do 1
+- **Bow and arrows**: hold to draw (a charge bar fills), release to fire.
+  Damage and speed scale with draw; arrows are swept against the voxel grid so
+  they cannot tunnel through walls, and they hit mobs and players
+- **Armour**: leather, iron and diamond in four slots (head/chest/legs/feet).
+  Each point removes 4% damage, capped at 80%; pieces wear out and break
+- **Shield**: hold use to raise it — absorbs 66% of a hit and slows you down
+- **PvP**: in multiplayer you can hit other players with melee or arrows
 
 **Items and building**
 - Mining takes time based on block hardness and the tool you hold; the wrong
@@ -179,6 +202,7 @@ src/
     crafting.ts      recipes and stations (hand / table / furnace)
   entities/
     entity.ts        Entity + Mob base: gravity, knockback, hurt state
+    arrow.ts         swept projectile: block, mob and player hits
     models.ts        merged box geometry per mob type (one draw call each)
     zombie.ts        hostile AI: chase, attack, wander
     pig.ts           passive AI: wander, flee when hit
@@ -192,6 +216,7 @@ src/
     client.ts        socket lifecycle, reconnect backoff, ping/RTT
     session.ts       roster, state throttling, applying remote edits
     remoteplayers.ts remote bodies, name labels, snapshot interpolation
+    remotemobs.ts    guest-side view of the host's mobs, interpolated
 server/
   index.ts           authoritative room server (rooms, cap, edits, relay)
   world/
@@ -313,13 +338,21 @@ protocol is identical on both platforms.
   worker boundary (both are already pure functions of chunk data).
 - Inventory is click-to-pick-up/click-to-place rather than true drag-and-drop,
   and there is no drop-item-from-inventory action.
-- Dying keeps your inventory (deliberate for now); no armour, no bow, no
-  shovels — `ToolKind` already includes `'shovel'` as the extension point.
-- **Multiplayer:** mobs are disabled in rooms, because each client would
-  simulate its own and they would disagree. Hook: make `EntityManager`
-  host-authoritative and relay mob state.
-- **Multiplayer:** inventory, health and hunger are per-client, so you cannot
-  hand someone an item or see their health.
+- Dying keeps your inventory (deliberate for now). No shovels yet — `ToolKind`
+  already includes `'shovel'` as the extension point.
+- Armour has no visual representation on player models; it only shows in the
+  inventory screen and in the damage numbers.
+- Arrows fired by remote players are rendered and simulated locally for the
+  visuals, but only the shooter's client reports hits, so damage is never
+  double-applied. That means a remote arrow's visual path can drift slightly
+  from the path that actually registered the hit.
+- **Multiplayer:** mobs are *host*-authoritative rather than server-authoritative
+  — the server cannot simulate them because it does not generate terrain. If
+  the host's tab is backgrounded, mob updates slow for everyone.
+- **Multiplayer:** inventory is per-client, so you cannot hand someone an item.
+  Health is shared, but hunger is not.
+- **Multiplayer:** a guest's mob kill grants loot to the host's world, not the
+  guest — mob drops spawn where the host simulates them.
 - **Multiplayer:** worlds are not saved. A room's edits live in server memory
   and are gone when the host leaves. Hook: persist `Room.edits` in
   `server/index.ts`.
@@ -342,6 +375,6 @@ protocol is identical on both platforms.
 4. **Biomes and structures** — swap the single terrain function for a biome
    table (desert, forest, snow) and scatter simple structures; the chunk
    pipeline already supports it via `TerrainGenerator.generate`.
-5. **Server-authoritative mobs and multiplayer persistence** — move mob
-   simulation and room world-saving onto the server so rooms have shared
-   creatures and survive a host leaving.
+5. **Multiplayer persistence and shared loot** — save a room's edits on the
+   server so worlds survive the host leaving, and sync item drops so a guest
+   collects what it kills.

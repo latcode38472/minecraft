@@ -32,6 +32,8 @@ export class StatusUi {
   private readonly deathMsgEl = document.getElementById('death-msg')!;
   private readonly progressEl = document.getElementById('break-progress')!;
   private readonly progressBarEl = document.getElementById('break-progress-bar')!;
+  private readonly bowEl = document.getElementById('bow-charge')!;
+  private readonly bowBarEl = document.getElementById('bow-charge-bar')!;
   private lastVersion = -1;
 
   constructor(onRespawn: () => void) {
@@ -41,7 +43,7 @@ export class StatusUi {
     document.getElementById('respawn-btn')!.addEventListener('click', onRespawn);
   }
 
-  update(survival: Survival, breakProgress: number): void {
+  update(survival: Survival, breakProgress: number, bowCharge = 0): void {
     if (survival.version !== this.lastVersion) {
       this.lastVersion = survival.version;
       setBar(this.hearts, survival.health);
@@ -53,6 +55,14 @@ export class StatusUi {
     const mining = breakProgress > 0 && breakProgress < 1;
     this.progressEl.style.display = mining ? 'block' : 'none';
     if (mining) this.progressBarEl.style.width = `${Math.min(1, breakProgress) * 100}%`;
+
+    const drawing = bowCharge > 0;
+    this.bowEl.style.display = drawing ? 'block' : 'none';
+    if (drawing) {
+      this.bowBarEl.style.width = `${Math.min(1, bowCharge) * 100}%`;
+      // Green once the shot is worth taking.
+      this.bowBarEl.style.background = bowCharge > 0.85 ? '#6fd36f' : '#d3c46f';
+    }
   }
 
   showDeath(message: string): void {

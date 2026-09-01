@@ -44,6 +44,22 @@
         background: rgba(0, 0, 0, 0.55); border: 1px solid #000; border-radius: 2px;
       }
       #break-progress-bar { height: 100%; width: 0; background: #ddd; }
+      #bow-charge {
+        left: 50%; top: calc(50% + 32px); transform: translateX(-50%);
+        width: 70px; height: 6px; display: none;
+        background: rgba(0, 0, 0, 0.55); border: 1px solid #000; border-radius: 2px;
+      }
+      #bow-charge-bar { height: 100%; width: 0; background: #6fd36f; }
+      .inv-body { display: flex; gap: 12px; align-items: flex-start; }
+      .inv-armor-col { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+      #inv-armor { display: flex; flex-direction: column; gap: 3px; }
+      .armor-slot { position: relative; }
+      .armor-slot .armor-hint {
+        position: absolute; inset: 0; display: flex; align-items: center;
+        justify-content: center; font-size: 9px; color: #8d8d8d; pointer-events: none;
+      }
+      .armor-slot.filled .armor-hint { display: none; }
+      #inv-armor-points { font-size: 11px; color: #bdbdbd; }
 
       /* --- Survival bars --- */
       #status {
@@ -282,6 +298,7 @@
     <div id="hurt-flash" class="hud"></div>
     <div id="crosshair" class="hud">+</div>
     <div id="break-progress" class="hud"><div id="break-progress-bar"></div></div>
+    <div id="bow-charge" class="hud"><div id="bow-charge-bar"></div></div>
     <div id="fps" class="hud"></div>
     <div id="debug" class="hud"></div>
     <div id="toast" class="hud"></div>
@@ -299,8 +316,16 @@
             <span id="inv-title">Inventory</span>
             <button id="inv-close" type="button">Close (E)</button>
           </div>
-          <div id="inv-grid"></div>
-          <div id="inv-hotbar"></div>
+          <div class="inv-body">
+            <div class="inv-armor-col">
+              <div id="inv-armor"></div>
+              <span id="inv-armor-points">No armour</span>
+            </div>
+            <div>
+              <div id="inv-grid"></div>
+              <div id="inv-hotbar"></div>
+            </div>
+          </div>
         </div>
         <div class="inv-right">
           <h3>CRAFTING</h3>

@@ -31,8 +31,14 @@ export function isNightTime(timeOfDay: number): boolean {
   return timeOfDay >= NIGHT_START || timeOfDay < NIGHT_END;
 }
 
+let nextMobId = 1;
+
 export class EntityManager {
   readonly entities: Entity[] = [];
+  /** Network ids for mobs, so guests can address the host's mobs. */
+  readonly mobIds = new WeakMap<Mob, number>();
+  /** Ids removed since the last drain, for the host's mob_removed message. */
+  readonly removedMobIds: number[] = [];
   private spawnTimer = 0;
 
   constructor(
@@ -42,7 +48,36 @@ export class EntityManager {
 
   add(entity: Entity): void {
     this.entities.push(entity);
+    if (entity instanceof Mob) this.mobIds.set(entity, nextMobId++);
     this.scene.add(entity.object);
+  }
+
+  /** Find a mob by its network id (host side, when a guest reports a hit). */
+  mobById(id: number): Mob | null {
+    for (const entity of this.entities) {
+      if (entity instanceof Mob && this.mobIds.get(entity) === id) return entity;
+    }
+    return null;
+  }
+
+  /** Snapshot of live mobs for the network, in protocol-friendly shape. */
+  mobSnapshot(): { id: number; kind: 'zombie' | 'pig'; x: number; y: number; z: number; yaw: number; hp: number }[] {
+    const out = [];
+    for (const entity of this.entities) {
+      if (!(entity instanceof Mob) || entity.dead) continue;
+      const id = this.mobIds.get(entity);
+      if (id === undefined) continue;
+      out.push({
+        id,
+        kind: entity instanceof Zombie ? ('zombie' as const) : ('pig' as const),
+        x: entity.position.x,
+        y: entity.position.y,
+        z: entity.position.z,
+        yaw: entity.yaw,
+        hp: entity.health,
+      });
+    }
+    return out;
   }
 
   spawnDrop(id: string, count: number, x: number, y: number, z: number, damage?: number): void {
@@ -59,14 +94,32 @@ export class EntityManager {
     const index = this.entities.indexOf(entity);
     if (index === -1) return;
     this.entities.splice(index, 1);
+    if (entity instanceof Mob) {
+      const id = this.mobIds.get(entity);
+      if (id !== undefined) this.removedMobIds.push(id);
+    }
     this.scene.remove(entity.object);
     entity.dispose();
   }
 
   update(ctx: EntityContext, timeOfDay: number): void {
     for (const entity of this.entities) entity.update(ctx);
+    this.reapDead(ctx);
 
-    // Reap dead and far-away entities (iterate backwards: we splice as we go).
+    this.spawnTimer -= ctx.dt;
+    if (this.spawnTimer <= 0) {
+      this.spawnTimer = MOB_SPAWN_INTERVAL_S;
+      this.trySpawnMob(ctx.playerPos, isNightTime(timeOfDay));
+    }
+  }
+
+  /**
+   * Remove dead and far-away entities, dropping loot for dead mobs.
+   * Split out of `update` so multiplayer guests — which do not simulate mobs —
+   * can still retire their own arrows and item drops.
+   */
+  reapDead(ctx: EntityContext): void {
+    // Iterate backwards: we splice as we go.
     for (let i = this.entities.length - 1; i >= 0; i--) {
       const entity = this.entities[i];
       const far =
@@ -81,12 +134,6 @@ export class EntityManager {
       } else if (far) {
         this.remove(entity);
       }
-    }
-
-    this.spawnTimer -= ctx.dt;
-    if (this.spawnTimer <= 0) {
-      this.spawnTimer = MOB_SPAWN_INTERVAL_S;
-      this.trySpawnMob(ctx.playerPos, isNightTime(timeOfDay));
     }
   }
 

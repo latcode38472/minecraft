@@ -34,8 +34,12 @@ import {
 import { BLOCKS } from './blocks';
 import type { EntityContext } from './entities/entity';
 import { EntityManager, isNightTime } from './entities/manager';
+import { Arrow } from './entities/arrow';
+import type { CombatTarget } from './game/interaction';
+import { ARROW_SPEED, BLOCK_SLOWDOWN, PLAYER_HALF_WIDTH, PLAYER_HEIGHT } from './constants';
 import { Interaction, breakTimeFor, canHarvest } from './game/interaction';
 import { Inventory, type ItemStack } from './items/inventory';
+import { getItem } from './items/items';
 import { RECIPES, craft, type Station } from './items/crafting';
 import { Input } from './input';
 import { MouseLook } from './player/camera';
@@ -140,6 +144,28 @@ async function boot(choice: StartChoice): Promise<void> {
   const survival = new Survival({
     onHurt: () => playHurt(),
     onDeath: () => onPlayerDied(),
+    armorPoints: () => inventory.armorPoints(),
+    // `interaction` is created below; guard for the first frames.
+    isBlocking: () => interaction?.blocking === true,
+    onAbsorb: (blocked) => {
+      // Gear that soaked a hit wears down.
+      for (const id of inventory.damageArmor(1)) {
+        hud.toast(`Your ${getItem(id)?.name ?? 'armour'} broke!`);
+      }
+      if (blocked) {
+        const held = inventory.selectedStack;
+        if (held && getItem(held.id)?.blocking) {
+          const def = getItem(held.id)!.blocking!;
+          held.damage = (held.damage ?? 0) + 1;
+          if (held.damage >= def.durability) {
+            inventory.slots[inventory.selected] = null;
+            hud.toast('Your shield broke!');
+          }
+          inventory.version++;
+        }
+      }
+      hud.refresh();
+    },
   });
 
   const hud = new Hud(inventory, (index) => inventory.selectSlot(index));
@@ -152,7 +178,7 @@ async function boot(choice: StartChoice): Promise<void> {
     look.yaw = meta.player.yaw;
     look.pitch = meta.player.pitch;
     sky.timeOfDay = meta.timeOfDay;
-    inventory.load(meta.inventory, meta.selectedSlot);
+    inventory.load(meta.inventory, meta.selectedSlot, meta.armor);
     if (meta.health !== undefined && meta.hunger !== undefined) {
       survival.load(meta.health, meta.hunger);
     }
@@ -191,7 +217,72 @@ async function boot(choice: StartChoice): Promise<void> {
     },
     onOpenStation: (station) => openInventory(station),
     toast: (msg) => hud.toast(msg),
+    combatTargets: () => (session ? networkedTargets(session) : []),
+    onHitPlayer: (id, damage) => hitNetworkedTarget(id, damage),
+    fireArrow: (origin, dir, charge) => {
+      const speed = ARROW_SPEED * (0.35 + charge * 0.65);
+      const damage = Math.max(1, Math.round(2 + charge * 7));
+      spawnArrow(origin, dir, speed, damage, selfNetId());
+      session?.sendArrow(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, speed);
+    },
   });
+
+  /** Our own network id, or a stable local id in singleplayer. */
+  function selfNetId(): string {
+    return session?.self.id ?? 'local';
+  }
+
+  /**
+   * Everything networked the local player can hit: live remote players, plus
+   * (on a guest) the host's mobs. Mob entries carry a "mob:" id prefix so a
+   * single target list drives both melee and arrows.
+   */
+  function networkedTargets(active: MultiplayerSession): CombatTarget[] {
+    const targets: CombatTarget[] = active.remotePlayers.all
+      // `visible` is only set once a snapshot has arrived; without it the body
+      // still sits at the origin and could be "hit" by aiming at 0,0,0.
+      .filter((p) => p.group.visible && !active.vitals.get(p.info.id)?.dead)
+      .map((p) => ({
+        id: p.info.id,
+        position: p.position,
+        halfWidth: PLAYER_HALF_WIDTH,
+        height: PLAYER_HEIGHT,
+      }));
+    if (!active.isHost) {
+      for (const mob of active.remoteMobs.all) {
+        targets.push({
+          id: `mob:${mob.id}`,
+          position: mob.position,
+          halfWidth: mob.halfWidth,
+          height: mob.height,
+        });
+      }
+    }
+    return targets;
+  }
+
+  /** Route a hit to the right server message based on the target id. */
+  function hitNetworkedTarget(id: string, damage: number): void {
+    if (id.startsWith('mob:')) session?.attackMob(Number(id.slice(4)), damage);
+    else session?.attackPlayer(id, damage);
+  }
+
+  function spawnArrow(
+    origin: THREE.Vector3,
+    dir: THREE.Vector3,
+    speed: number,
+    damage: number,
+    ownerId: string,
+  ): void {
+    const arrow = new Arrow(origin, dir, speed, damage, ownerId, {
+      // The shooter's own id is filtered inside Arrow; include everyone else.
+      targets: () => (session ? networkedTargets(session) : []),
+      onHitTarget: (id, dmg) => hitNetworkedTarget(id, dmg),
+    });
+    // Start slightly ahead of the eye so it doesn't clip the shooter.
+    arrow.position.addScaledVector(dir, 0.4);
+    entities.add(arrow);
+  }
 
   // --- Play state ---
   const menu = document.getElementById('menu')!;
@@ -293,6 +384,7 @@ async function boot(choice: StartChoice): Promise<void> {
     survival.respawn();
     statusUi.hideDeath();
     entities.clear();
+    session?.sendRespawn();
     if (!touchDevice) look.requestLock();
     else touchPlaying = true;
     refreshPlayingClass();
@@ -362,11 +454,19 @@ async function boot(choice: StartChoice): Promise<void> {
     world,
     dt: 0,
     playerPos: player.position,
+    players: [],
+    localPlayerId: 'local',
+    entities: entities.entities,
     isNight: false,
-    damagePlayer: (amount, fromX, fromZ) => {
-      if (!isPlaying()) return;
-      survival.damage(amount);
-      knockbackPlayer(fromX, fromZ);
+    damagePlayer: (id, amount, fromX, fromZ) => {
+      if (id === entityContext.localPlayerId) {
+        if (!isPlaying()) return;
+        survival.damage(amount);
+        knockbackPlayer(fromX, fromZ);
+      } else {
+        // A mob hit a remote player: the host reports it to the server.
+        session?.attackPlayer(id, amount);
+      }
     },
     spawnDrop: (id, count, x, y, z) => entities.spawnDrop(id, count, x, y, z),
     collectItem: (id, count, damage) => {
@@ -401,6 +501,7 @@ async function boot(choice: StartChoice): Promise<void> {
       },
       selectedSlot: inventory.selected,
       inventory: inventory.serialize(),
+      armor: inventory.serializeArmor(),
       health: dead ? MAX_HEALTH : survival.health,
       hunger: dead ? MAX_HUNGER : survival.hunger,
       spawn: { x: spawnPoint.x, y: spawnPoint.y, z: spawnPoint.z },
@@ -455,6 +556,27 @@ async function boot(choice: StartChoice): Promise<void> {
           if (status === 'reconnecting') mpHud.notice('Connection lost — reconnecting…');
         },
         onNotice: (message) => mpHud.notice(message),
+        onDamaged: (amount, byName) => {
+          // The server already arbitrated the hit; apply it locally.
+          survival.damage(amount);
+          mpHud.notice(`${byName} hit you.`);
+        },
+        onMobAttacked: (mobId, damage, byId) => {
+          // Host side: a guest hit one of our mobs.
+          const mob = entities.mobById(mobId);
+          if (!mob) return;
+          const attacker = session?.remotePlayers.all.find((p) => p.info.id === byId);
+          const from = attacker?.position ?? player.position;
+          mob.hurtTime = 0; // the guest's client already paced the swing
+          mob.takeDamage(damage, from.x, from.z);
+        },
+        onRemoteArrow: (x, y, z, dx, dy, dz, speed, ownerId) => {
+          const origin = new THREE.Vector3(x, y, z);
+          const dir = new THREE.Vector3(dx, dy, dz);
+          // Remote arrows are visual + physical locally, but only the shooter's
+          // client reports hits, so damage is never applied twice.
+          spawnArrow(origin, dir, speed, 0, ownerId);
+        },
       },
     );
     mpHud.show(multiplayer.code);
@@ -482,6 +604,26 @@ async function boot(choice: StartChoice): Promise<void> {
     getViewDistance: () => viewDistance,
     // Thin wrappers over the real rules, so automated tests exercise the same
     // code paths the game does rather than reimplementing them.
+    getItemDef: (id: string) => getItem(id),
+    /** Fire an arrow with plain numbers, so tests need no THREE in page scope. */
+    spawnTestArrow: (
+      ox: number, oy: number, oz: number,
+      dx: number, dy: number, dz: number,
+      speed: number, damage: number,
+    ) =>
+      spawnArrow(
+        new THREE.Vector3(ox, oy, oz),
+        new THREE.Vector3(dx, dy, dz),
+        speed,
+        damage,
+        selfNetId(),
+      ),
+    /** Drive one interaction tick with the live camera ray. */
+    tickInteraction: (dt: number, mining: boolean, using: boolean, taps: number) => {
+      player.eyePosition(eye);
+      look.direction(lookDir);
+      interaction.update(dt, performance.now(), eye, lookDir, { mining, using, useTaps: taps });
+    },
     __breakTime: (blockId: number, stack: ItemStack | null) =>
       breakTimeFor(BLOCKS[blockId], stack),
     __canHarvest: (blockId: number, stack: ItemStack | null) =>
@@ -522,6 +664,11 @@ async function boot(choice: StartChoice): Promise<void> {
       sneak: input.isDown('ShiftLeft') || input.isDown('ShiftRight') || (touch?.sneakOn ?? false),
     };
 
+    // Raising a shield slows you down, as it does in Minecraft.
+    if (interaction.blocking) {
+      move.forward *= BLOCK_SLOWDOWN;
+      move.strafe *= BLOCK_SLOWDOWN;
+    }
     if (playing) player.update(dt, move, look.yaw);
     survival.update(dt, player);
 
@@ -536,17 +683,48 @@ async function boot(choice: StartChoice): Promise<void> {
     if (playing) autoQuality?.update(dt);
 
     // Entities keep simulating while paused would be surprising; freeze them.
-    // Mobs are disabled in multiplayer until they are server-authoritative.
-    if (playing && !multiplayer) {
+    // In multiplayer only the HOST simulates mobs; guests render its snapshots,
+    // so there is exactly one simulation and everyone agrees who is alive.
+    const simulateMobs = playing && (!session || session.isHost);
+    if (playing) {
       entityContext.dt = dt;
       entityContext.isNight = isNightTime(sky.timeOfDay);
-      entities.update(entityContext, sky.timeOfDay);
+      entityContext.localPlayerId = selfNetId();
+      // Mobs chase the nearest player, local or remote.
+      entityContext.players = [
+        {
+          id: entityContext.localPlayerId,
+          position: player.position,
+          halfWidth: PLAYER_HALF_WIDTH,
+          height: PLAYER_HEIGHT,
+        },
+        ...(session?.remotePlayers.all ?? [])
+          .filter((p) => p.group.visible && !session!.vitals.get(p.info.id)?.dead)
+          .map((p) => ({
+            id: p.info.id,
+            position: p.position,
+            halfWidth: PLAYER_HALF_WIDTH,
+            height: PLAYER_HEIGHT,
+          })),
+      ];
+      if (simulateMobs) {
+        entities.update(entityContext, sky.timeOfDay);
+      } else {
+        // Guests still tick projectiles and item drops, just not mobs.
+        for (const entity of [...entities.entities]) entity.update(entityContext);
+        entities.reapDead(entityContext);
+      }
     }
 
     if (session) {
       // Camera yaw/pitch is the shared abstraction: keyboard+mouse and touch
       // both feed it, so both platforms emit identical network state.
       session.update(nowMs, dt, look.yaw, look.pitch, playing);
+      if (session.isHost) {
+        for (const id of entities.removedMobIds.splice(0)) session.noteMobRemoved(id);
+        session.syncMobs(nowMs, entities.mobSnapshot());
+      }
+      session.sendVitals(nowMs, survival.health, survival.dead);
       mpHud.setPing(session.ping, session.status === 'connected' ? 'Ping: —' : session.status);
     }
 
@@ -576,7 +754,11 @@ async function boot(choice: StartChoice): Promise<void> {
     look.apply(eye);
     hud.setUnderwater(player.eyeInWater);
     hud.refresh();
-    statusUi.update(survival, playing ? interaction.breakProgress : 0);
+    statusUi.update(
+      survival,
+      playing ? interaction.breakProgress : 0,
+      playing ? interaction.bowCharge : 0,
+    );
     inventoryUi.render();
 
     hud.updateFrameStats(

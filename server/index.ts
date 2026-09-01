@@ -19,21 +19,28 @@ import {
   MAX_PLAYERS,
   PROTOCOL_VERSION,
   RATE_LIMIT_EDITS_PER_SEC,
+  MAX_ATTACK_RANGE,
+  MAX_MOBS_PER_MESSAGE,
+  RATE_LIMIT_COMBAT_PER_SEC,
   RATE_LIMIT_OTHER_PER_SEC,
   RATE_LIMIT_STATE_PER_SEC,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
   decodeMessage,
   encodeMessage,
+  isFiniteNumber,
   isValidBlockCoord,
   isValidBlockId,
   isValidChunkKey,
   normalizeRoomCode,
+  sanitizeDamage,
+  sanitizeMobState,
   sanitizeName,
   sanitizePlayerState,
   type ChunkEditEntry,
   type JoinErrorReason,
   type PlayerInfo,
+  type PlayerVitals,
   type ServerMessage,
   type WorldInfo,
 } from '../src/net/protocol.ts';
@@ -59,8 +66,15 @@ interface Client {
   isHost: boolean;
   colorIndex: number;
   lastSeen: number;
-  buckets: { state: RateBucket; edits: RateBucket; other: RateBucket };
+  /** Last position the client reported, used to validate attack range. */
+  pos: { x: number; y: number; z: number };
+  /** Server-owned combat state — clients never set this directly. */
+  health: number;
+  dead: boolean;
+  buckets: { state: RateBucket; edits: RateBucket; other: RateBucket; combat: RateBucket };
 }
+
+const MAX_HEALTH = 20;
 
 interface Room {
   code: string;
@@ -111,6 +125,14 @@ function broadcast(room: Room, msg: ServerMessage, exceptId?: string): void {
   for (const client of room.clients.values()) {
     if (client.id !== exceptId) send(client, msg);
   }
+}
+
+function vitals(client: Client): PlayerVitals {
+  return { id: client.id, health: client.health, dead: client.dead };
+}
+
+function roomVitals(room: Room): PlayerVitals[] {
+  return [...room.clients.values()].map(vitals);
 }
 
 function playerInfo(client: Client): PlayerInfo {
@@ -274,6 +296,8 @@ function handleMessage(client: Client, raw: string): void {
       client.name = sanitizeName(msg.name);
       client.isHost = true;
       client.colorIndex = 0;
+      client.health = MAX_HEALTH;
+      client.dead = false;
       client.room = room;
       room.clients.set(client.id, client);
       rooms.set(room.code, room);
@@ -316,6 +340,8 @@ function handleMessage(client: Client, raw: string): void {
       client.name = sanitizeName(msg.name);
       client.isHost = false;
       client.colorIndex = pickColorIndex(room);
+      client.health = MAX_HEALTH;
+      client.dead = false;
       client.room = room;
       room.clients.set(client.id, client);
       room.emptySince = null;
@@ -345,6 +371,10 @@ function handleMessage(client: Client, raw: string): void {
       if (!allow(client.buckets.state, RATE_LIMIT_STATE_PER_SEC)) return;
       const state = sanitizePlayerState(msg.s);
       if (!state) return;
+      // Remember where they claim to be, so attack range can be checked.
+      client.pos.x = state.x;
+      client.pos.y = state.y;
+      client.pos.z = state.z;
       broadcast(client.room, { t: 'player_state', id: client.id, s: state }, client.id);
       return;
     }
@@ -367,6 +397,122 @@ function handleMessage(client: Client, raw: string): void {
         return;
       }
       broadcast(room, { t: 'block_update', x: bx, y: by, z: bz, id, by: client.id }, client.id);
+      return;
+    }
+
+    case 'player_state': {
+      // (handled above; kept for exhaustiveness)
+      return;
+    }
+
+    case 'attack_player': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      const targetId = typeof msg.target === 'string' ? msg.target : '';
+      const victim = room.clients.get(targetId);
+      const damage = sanitizeDamage(msg.damage);
+      if (!victim || victim.id === client.id || victim.dead || damage === null) return;
+
+      // Server-side reach check: the attacker cannot hit from across the map.
+      const dist = Math.hypot(
+        victim.pos.x - client.pos.x,
+        victim.pos.y - client.pos.y,
+        victim.pos.z - client.pos.z,
+      );
+      if (dist > MAX_ATTACK_RANGE) return;
+
+      victim.health = Math.max(0, victim.health - damage);
+      if (victim.health <= 0) victim.dead = true;
+      broadcast(room, {
+        t: 'player_hurt',
+        id: victim.id,
+        damage,
+        by: client.id,
+        health: victim.health,
+        dead: victim.dead,
+      });
+      return;
+    }
+
+    case 'player_vitals': {
+      // A client reports damage it took locally (falls, mobs, starvation).
+      // The server records it so everyone agrees, but clamps the values.
+      const room = client.room;
+      if (!room) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      if (!isFiniteNumber(msg.health)) return;
+      client.health = Math.max(0, Math.min(MAX_HEALTH, msg.health));
+      client.dead = client.health <= 0 || msg.dead === true;
+      broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
+      return;
+    }
+
+    case 'respawn': {
+      const room = client.room;
+      if (!room) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      client.health = MAX_HEALTH;
+      client.dead = false;
+      broadcast(room, { t: 'player_respawned', id: client.id });
+      broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
+      return;
+    }
+
+    case 'mob_state': {
+      // Only the host simulates mobs; everyone else's snapshots are ignored.
+      const room = client.room;
+      if (!room || !client.isHost) return;
+      if (!allow(client.buckets.state, RATE_LIMIT_STATE_PER_SEC)) return;
+      if (!Array.isArray(msg.mobs)) return;
+      const mobs = msg.mobs
+        .slice(0, MAX_MOBS_PER_MESSAGE)
+        .map(sanitizeMobState)
+        .filter((m): m is NonNullable<typeof m> => m !== null);
+      broadcast(room, { t: 'mob_state', mobs }, client.id);
+      return;
+    }
+
+    case 'mob_removed': {
+      const room = client.room;
+      if (!room || !client.isHost) return;
+      if (!allow(client.buckets.state, RATE_LIMIT_STATE_PER_SEC)) return;
+      if (!Array.isArray(msg.ids)) return;
+      const ids = msg.ids.filter(Number.isInteger).slice(0, MAX_MOBS_PER_MESSAGE);
+      if (ids.length > 0) broadcast(room, { t: 'mob_removed', ids }, client.id);
+      return;
+    }
+
+    case 'attack_mob': {
+      // A guest hit a mob: forward to the host, which owns mob health.
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      const damage = sanitizeDamage(msg.damage);
+      if (damage === null || !Number.isInteger(msg.mob)) return;
+      const host = room.clients.get(room.hostId);
+      if (!host || host.id === client.id) return;
+      send(host, { t: 'attack_mob', mob: msg.mob as number, damage, by: client.id });
+      return;
+    }
+
+    case 'arrow_spawn': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      const { x, y, z, dx, dy, dz, speed } = msg as Record<string, unknown>;
+      for (const v of [x, y, z, dx, dy, dz, speed]) if (!isFiniteNumber(v)) return;
+      broadcast(
+        room,
+        {
+          t: 'arrow_spawn',
+          by: client.id,
+          x: x as number, y: y as number, z: z as number,
+          dx: dx as number, dy: dy as number, dz: dz as number,
+          speed: Math.min(200, Math.max(0, speed as number)),
+        },
+        client.id,
+      );
       return;
     }
 
@@ -416,10 +562,14 @@ wss.on('connection', (socket: WebSocket) => {
     isHost: false,
     colorIndex: 0,
     lastSeen: Date.now(),
+    pos: { x: 0, y: 0, z: 0 },
+    health: MAX_HEALTH,
+    dead: false,
     buckets: {
       state: newBucket(RATE_LIMIT_STATE_PER_SEC),
       edits: newBucket(RATE_LIMIT_EDITS_PER_SEC),
       other: newBucket(RATE_LIMIT_OTHER_PER_SEC),
+      combat: newBucket(RATE_LIMIT_COMBAT_PER_SEC),
     },
   };
 

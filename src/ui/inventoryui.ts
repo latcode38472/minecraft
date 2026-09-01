@@ -3,7 +3,7 @@
 // a stack up, click again to drop it — the same gesture works with a mouse or
 // a finger.
 
-import { HOTBAR_SIZE, INVENTORY_SIZE, type Inventory } from '../items/inventory';
+import { ARMOR_SLOT_COUNT, HOTBAR_SIZE, INVENTORY_SIZE, type Inventory } from '../items/inventory';
 import { canCraft, craft, recipesFor, type Recipe, type Station } from '../items/crafting';
 import { getItem } from '../items/items';
 import { drawItemIcon } from './hud';
@@ -20,6 +20,8 @@ export class InventoryUi {
   private readonly recipesEl = document.getElementById('recipe-list')!;
   private readonly titleEl = document.getElementById('inv-title')!;
   private readonly slotEls: HTMLElement[] = [];
+  private readonly armorEls: HTMLElement[] = [];
+  private readonly armorCanvases: HTMLCanvasElement[] = [];
   private readonly slotCanvases: HTMLCanvasElement[] = [];
   private readonly slotCounts: HTMLElement[] = [];
   /** Index of the slot the player picked up from, or -1. */
@@ -34,6 +36,7 @@ export class InventoryUi {
     // matching where they appear on screen.
     for (let i = HOTBAR_SIZE; i < INVENTORY_SIZE; i++) this.buildSlot(i, this.gridEl);
     for (let i = 0; i < HOTBAR_SIZE; i++) this.buildSlot(i, this.hotbarEl);
+    this.buildArmorSlots();
     document.getElementById('inv-close')!.addEventListener('click', () => this.close());
   }
 
@@ -55,6 +58,37 @@ export class InventoryUi {
     this.slotEls[index] = el;
     this.slotCanvases[index] = canvas;
     this.slotCounts[index] = count;
+  }
+
+  private buildArmorSlots(): void {
+    const parent = document.getElementById('inv-armor')!;
+    const labels = ['Head', 'Body', 'Legs', 'Feet'];
+    for (let i = 0; i < ARMOR_SLOT_COUNT; i++) {
+      const el = document.createElement('div');
+      el.className = 'inv-slot armor-slot';
+      el.title = `${labels[i]} armour`;
+      const canvas = document.createElement('canvas');
+      canvas.width = SLOT_ICON_PX;
+      canvas.height = SLOT_ICON_PX;
+      const hint = document.createElement('span');
+      hint.className = 'armor-hint';
+      hint.textContent = labels[i];
+      el.append(canvas, hint);
+      el.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        // Click a held piece in to equip it, or click the slot to take it off.
+        if (this.heldSlot !== -1) {
+          if (this.inventory.equipFromSlot(this.heldSlot)) this.heldSlot = -1;
+        } else {
+          this.inventory.unequip(i);
+        }
+        this.render(true);
+        this.onChange();
+      });
+      parent.append(el);
+      this.armorEls.push(el);
+      this.armorCanvases.push(canvas);
+    }
   }
 
   private clickSlot(index: number): void {
@@ -103,6 +137,15 @@ export class InventoryUi {
       this.slotEls[i].classList.toggle('hotbar-slot', i < HOTBAR_SIZE);
       this.slotEls[i].title = stack ? (getItem(stack.id)?.name ?? '') : '';
     }
+
+    for (let i = 0; i < ARMOR_SLOT_COUNT; i++) {
+      const stack = this.inventory.armor[i];
+      drawItemIcon(this.armorCanvases[i], stack?.id ?? null);
+      this.armorEls[i].classList.toggle('filled', stack !== null);
+    }
+    const points = this.inventory.armorPoints();
+    document.getElementById('inv-armor-points')!.textContent =
+      points > 0 ? `Armour: ${points}` : 'No armour';
 
     this.renderRecipes();
   }

@@ -24,20 +24,36 @@ export class Zombie extends Mob {
   }
 
   protected loot(): { id: string; count: number }[] {
-    return [{ id: 'rotten_flesh', count: Math.random() < 0.6 ? 1 : 0 }];
+    return [
+      { id: 'rotten_flesh', count: Math.random() < 0.6 ? 1 : 0 },
+      // String from zombies keeps bows reachable without a spider mob.
+      { id: 'string', count: Math.random() < 0.5 ? 1 : 0 },
+    ];
   }
 
   update(ctx: EntityContext): void {
-    const dx = ctx.playerPos.x - this.position.x;
-    const dz = ctx.playerPos.z - this.position.z;
-    const dy = ctx.playerPos.y - this.position.y;
-    const distSq = dx * dx + dz * dz;
+    // Pick the closest player in range; in multiplayer that may be a remote one.
+    let target = null as (typeof ctx.players)[number] | null;
+    let bestSq = ZOMBIE_DETECT_RANGE * ZOMBIE_DETECT_RANGE;
+    for (const candidate of ctx.players) {
+      const ddx = candidate.position.x - this.position.x;
+      const ddz = candidate.position.z - this.position.z;
+      const ddy = candidate.position.y - this.position.y;
+      const sq = ddx * ddx + ddz * ddz;
+      if (sq < bestSq && Math.abs(ddy) < 8) {
+        bestSq = sq;
+        target = candidate;
+      }
+    }
 
-    if (distSq < ZOMBIE_DETECT_RANGE * ZOMBIE_DETECT_RANGE && Math.abs(dy) < 8) {
+    if (target) {
+      const dx = target.position.x - this.position.x;
+      const dz = target.position.z - this.position.z;
+      const dy = target.position.y - this.position.y;
       this.walkToward(ctx, dx, dz, SPEED);
-      const dist = Math.sqrt(distSq);
+      const dist = Math.sqrt(bestSq);
       if (dist < ATTACK_RANGE && Math.abs(dy) < 2 && this.attackCooldown === 0) {
-        ctx.damagePlayer(ATTACK_DAMAGE, this.position.x, this.position.z);
+        ctx.damagePlayer(target.id, ATTACK_DAMAGE, this.position.x, this.position.z);
         this.attackCooldown = ATTACK_COOLDOWN_S;
       }
     } else {

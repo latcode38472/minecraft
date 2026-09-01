@@ -18,6 +18,7 @@ export interface SaveMeta {
   selectedSlot: number;
   // Survival state — optional so worlds saved before survival existed still load.
   inventory?: (ItemStack | null)[];
+  armor?: (ItemStack | null)[];
   health?: number;
   hunger?: number;
   spawn?: { x: number; y: number; z: number };

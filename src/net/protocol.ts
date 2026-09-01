@@ -68,6 +68,38 @@ export interface PlayerInfo {
   colorIndex: number;
 }
 
+/** Server-tracked combat state, broadcast so everyone sees the same health. */
+export interface PlayerVitals {
+  id: string;
+  health: number;
+  dead: boolean;
+}
+
+/** Compact mob snapshot broadcast by the host. */
+export interface MobStateData {
+  /** Host-assigned mob id, unique within the room. */
+  i: number;
+  /** Mob kind: 0 zombie, 1 pig. */
+  k: number;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  /** Current health, so guests can show hurt flashes and remove corpses. */
+  hp: number;
+}
+
+export const MOB_KIND_ZOMBIE = 0;
+export const MOB_KIND_PIG = 1;
+/** Host mob-snapshot rate; guests interpolate between these. */
+export const MOB_SYNC_HZ = 10;
+export const MAX_MOBS_PER_MESSAGE = 40;
+/** Server-side sanity bound on a single damage packet. */
+export const MAX_DAMAGE_PER_HIT = 40;
+/** Melee/arrow hits are rejected beyond this range from the attacker. */
+export const MAX_ATTACK_RANGE = 24;
+export const RATE_LIMIT_COMBAT_PER_SEC = 20;
+
 export interface PlayerStateData {
   x: number;
   y: number;
@@ -95,7 +127,16 @@ export type ClientMessage =
   | { t: 'block_break'; x: number; y: number; z: number }
   | { t: 'block_place'; x: number; y: number; z: number; id: number }
   | { t: 'chunk_edits_request'; keys: string[] }
-  | { t: 'ping'; time: number };
+  | { t: 'ping'; time: number }
+  // Combat
+  | { t: 'attack_player'; target: string; damage: number }
+  | { t: 'player_vitals'; health: number; dead: boolean }
+  | { t: 'respawn' }
+  // Host-authoritative mobs
+  | { t: 'mob_state'; mobs: MobStateData[] }
+  | { t: 'mob_removed'; ids: number[] }
+  | { t: 'attack_mob'; mob: number; damage: number }
+  | { t: 'arrow_spawn'; x: number; y: number; z: number; dx: number; dy: number; dz: number; speed: number };
 
 // --- Server -> client ---
 export type ServerMessage =
@@ -110,7 +151,22 @@ export type ServerMessage =
   | { t: 'chunk_edits'; entries: ChunkEditEntry[]; done: boolean }
   | { t: 'room_closed'; reason: 'host_left' | 'server_shutdown'; message: string }
   | { t: 'pong'; time: number }
-  | { t: 'error'; message: string };
+  | { t: 'error'; message: string }
+  // Combat
+  | { t: 'player_hurt'; id: string; damage: number; by: string; health: number; dead: boolean }
+  | { t: 'player_vitals'; vitals: PlayerVitals[] }
+  | { t: 'player_respawned'; id: string }
+  // Host-authoritative mobs
+  | { t: 'mob_state'; mobs: MobStateData[] }
+  | { t: 'mob_removed'; ids: number[] }
+  | { t: 'attack_mob'; mob: number; damage: number; by: string }
+  | {
+      t: 'arrow_spawn';
+      by: string;
+      x: number; y: number; z: number;
+      dx: number; dy: number; dz: number;
+      speed: number;
+    };
 
 export function encodeMessage(msg: ClientMessage | ServerMessage): string {
   return JSON.stringify(msg);
@@ -195,6 +251,32 @@ export function normalizeRoomCode(raw: unknown): string | null {
   if (code.length !== ROOM_CODE_LENGTH) return null;
   for (const ch of code) if (!ROOM_CODE_ALPHABET.includes(ch)) return null;
   return code;
+}
+
+/** Validate and clamp a mob snapshot from the host. */
+export function sanitizeMobState(raw: unknown): MobStateData | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const m = raw as Record<string, unknown>;
+  if (!Number.isInteger(m.i) || !Number.isInteger(m.k)) return null;
+  if (!isFiniteNumber(m.x) || !isFiniteNumber(m.y) || !isFiniteNumber(m.z)) return null;
+  if (!isFiniteNumber(m.yaw) || !isFiniteNumber(m.hp)) return null;
+  if (Math.abs(m.x) > MAX_HORIZONTAL_COORD || Math.abs(m.z) > MAX_HORIZONTAL_COORD) return null;
+  if (m.y < -64 || m.y > WORLD_HEIGHT_LIMIT + 64) return null;
+  return {
+    i: m.i as number,
+    k: (m.k as number) === MOB_KIND_PIG ? MOB_KIND_PIG : MOB_KIND_ZOMBIE,
+    x: m.x,
+    y: m.y,
+    z: m.z,
+    yaw: wrapAngle(m.yaw),
+    hp: Math.max(0, Math.min(200, m.hp)),
+  };
+}
+
+/** Damage values are clamped, never trusted verbatim. */
+export function sanitizeDamage(raw: unknown): number | null {
+  if (!isFiniteNumber(raw) || raw <= 0) return null;
+  return Math.min(MAX_DAMAGE_PER_HIT, raw);
 }
 
 /** Chunk keys are "cx,cz" — validated so they can safely index server maps. */

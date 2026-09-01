@@ -55,6 +55,16 @@ export const FIST_DAMAGE = 1;
 export const FIST_COOLDOWN_S = 0.35;
 export const KNOCKBACK_SPEED = 6;
 export const KNOCKBACK_LIFT = 3.2;
+/** Fraction of damage a raised shield absorbs. */
+export const BLOCK_DAMAGE_REDUCTION = 0.66;
+/** Movement multiplier while blocking. */
+export const BLOCK_SLOWDOWN = 0.45;
+
+// Ranged combat
+export const ARROW_SPEED = 42; // blocks/second at full draw
+export const ARROW_GRAVITY = 18;
+export const ARROW_LIFETIME_S = 12;
+export const ARROW_MIN_CHARGE = 0.18; // below this the shot is cancelled
 
 // Mobs
 export const MAX_MOBS = 24;

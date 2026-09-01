@@ -4,6 +4,7 @@
 import * as THREE from 'three';
 import { BLOCKS, Block, type BlockDef } from '../blocks';
 import {
+  ARROW_MIN_CHARGE,
   FIST_COOLDOWN_S,
   FIST_DAMAGE,
   PLACE_REPEAT_MS,
@@ -19,10 +20,28 @@ import type { Player } from '../player/player';
 import { raycastVoxel, type RayHit } from '../raycast';
 import type { World } from '../world/world';
 
+/** A networked player the local player can shoot or hit. */
+export interface CombatTarget {
+  id: string;
+  position: THREE.Vector3;
+  halfWidth: number;
+  height: number;
+}
+
 export interface InteractionHooks {
   onBreakBlock(def: BlockDef): void;
   onPlaceBlock(def: BlockDef): void;
   onAttack(): void;
+  /**
+   * Everything networked that can be hit: remote players, and (on a guest)
+   * the host's mobs. Mob ids are prefixed "mob:" so one list serves both.
+   * Empty in singleplayer.
+   */
+  combatTargets(): CombatTarget[];
+  /** Melee or arrow hit on a networked target — routed through the server. */
+  onHitPlayer(id: string, damage: number): void;
+  /** Fire an arrow from the eye along `dir`, with the given draw strength. */
+  fireArrow(origin: THREE.Vector3, dir: THREE.Vector3, charge: number): void;
   /** Feed the player; returns false when already full so the food is kept. */
   tryEat(hunger: number): boolean;
   onOpenStation(station: Station): void;
@@ -65,10 +84,15 @@ export class Interaction {
   target: RayHit | null = null;
   /** 0..1 progress on the block being mined. */
   breakProgress = 0;
+  /** 0..1 bow draw, for the HUD indicator. */
+  bowCharge = 0;
+  /** True while a shield is raised (slows movement, absorbs damage). */
+  blocking = false;
 
   private miningKey = '';
   private attackCooldown = 0;
   private nextUseAt = 0;
+  private drawingBow = false;
 
   private readonly eye = new THREE.Vector3();
   private readonly dir = new THREE.Vector3();
@@ -95,13 +119,31 @@ export class Interaction {
 
     this.target = raycastVoxel(this.world, this.eye, this.dir, REACH_DISTANCE);
 
-    // A mob in front of the block takes the hit instead of the block.
-    const mobHit = this.entities.raycastMob(this.eye, this.dir, PLAYER_ATTACK_RANGE);
-    const blockDist = this.target ? this.eye.distanceTo(this.targetCentre(this.target)) : Infinity;
-    const mobInFront = mobHit !== null && mobHit.distance < blockDist;
+    const held = this.inventory.selectedStack;
+    const heldDef = held ? getItem(held.id) : undefined;
 
-    if (input.mining && mobInFront) {
-      this.attack(mobHit.mob);
+    // --- Shield: holding "use" raises it instead of placing ---
+    this.blocking = heldDef?.blocking !== undefined && input.using;
+
+    // --- Bow: holding "use" draws it; releasing fires ---
+    if (heldDef?.ranged) {
+      this.updateBow(dt, heldDef.ranged, input.using);
+    } else if (this.drawingBow) {
+      this.cancelBow();
+    }
+
+    // A mob or player in front of the block takes the hit instead of the block.
+    const mobHit = this.entities.raycastMob(this.eye, this.dir, PLAYER_ATTACK_RANGE);
+    const playerHit = this.raycastPlayers();
+    const blockDist = this.target ? this.eye.distanceTo(this.targetCentre(this.target)) : Infinity;
+    const mobDist = mobHit?.distance ?? Infinity;
+    const playerDist = playerHit?.distance ?? Infinity;
+    const nearestCombat = Math.min(mobDist, playerDist);
+    const combatInFront = nearestCombat < blockDist;
+
+    if (input.mining && combatInFront) {
+      if (playerDist <= mobDist && playerHit) this.attackPlayer(playerHit.target);
+      else if (mobHit) this.attack(mobHit.mob);
       this.resetMining();
     } else if (input.mining && this.target) {
       this.tickMining(dt, this.target);
@@ -109,14 +151,74 @@ export class Interaction {
       this.resetMining();
     }
 
+    // A drawn bow or a raised shield owns the use button; don't also place.
+    if (heldDef?.ranged || heldDef?.blocking) return;
+
     const wantUse = input.useTaps > 0 || (input.using && nowMs >= this.nextUseAt);
     if (wantUse) {
-      if (mobInFront && input.useTaps > 0) {
-        this.attack(mobHit.mob);
+      if (combatInFront && input.useTaps > 0) {
+        if (playerDist <= mobDist && playerHit) this.attackPlayer(playerHit.target);
+        else if (mobHit) this.attack(mobHit.mob);
       } else if (this.tryUse()) {
         this.nextUseAt = nowMs + PLACE_REPEAT_MS;
       }
     }
+  }
+
+  /** Charge while held, fire on release. Cancels if the shot is too weak. */
+  private updateBow(
+    dt: number,
+    ranged: NonNullable<ReturnType<typeof getItem>>['ranged'] & object,
+    held: boolean,
+  ): void {
+    if (held) {
+      if (this.inventory.count(ranged.ammo) === 0) {
+        this.bowCharge = 0;
+        this.drawingBow = false;
+        return;
+      }
+      this.drawingBow = true;
+      this.bowCharge = Math.min(1, this.bowCharge + dt / ranged.drawTime);
+      return;
+    }
+    if (!this.drawingBow) return;
+
+    const charge = this.bowCharge;
+    this.cancelBow();
+    if (charge < ARROW_MIN_CHARGE) return;
+    if (this.inventory.remove(ranged.ammo, 1) === 0) return;
+
+    this.hooks.fireArrow(this.eye, this.dir, charge);
+    if (this.inventory.damageSelected()) this.hooks.toast('Your bow broke!');
+  }
+
+  private cancelBow(): void {
+    this.drawingBow = false;
+    this.bowCharge = 0;
+  }
+
+  /** Nearest remote player under the crosshair, within melee reach. */
+  private raycastPlayers(): { target: CombatTarget; distance: number } | null {
+    let best: { target: CombatTarget; distance: number } | null = null;
+    for (const target of this.hooks.combatTargets()) {
+      const t = rayHitsBox(this.eye, this.dir, target, PLAYER_ATTACK_RANGE);
+      if (t !== null && (!best || t < best.distance)) best = { target, distance: t };
+    }
+    return best;
+  }
+
+  private attackPlayer(target: CombatTarget): void {
+    if (this.attackCooldown > 0) return;
+    const stack = this.inventory.selectedStack;
+    const attack = stack ? getItem(stack.id)?.attack : undefined;
+    const damage = attack?.damage ?? FIST_DAMAGE;
+    this.attackCooldown = attack?.cooldown ?? FIST_COOLDOWN_S;
+
+    this.hooks.onHitPlayer(target.id, damage);
+    if (stack && getItem(stack.id)?.tool) {
+      if (this.inventory.damageSelected()) this.hooks.toast('Your weapon broke!');
+    }
+    this.hooks.onAttack();
   }
 
   private targetCentre(hit: RayHit): THREE.Vector3 {
@@ -219,4 +321,43 @@ export class Interaction {
     this.hooks.onPlaceBlock(BLOCKS[block]);
     return true;
   }
+}
+
+
+/** Slab-method ray/AABB test, shared by melee targeting and arrows. */
+function rayHitsBox(
+  origin: THREE.Vector3,
+  dir: THREE.Vector3,
+  target: CombatTarget,
+  maxDist: number,
+): number | null {
+  const pad = 0.1;
+  const min = [
+    target.position.x - target.halfWidth - pad,
+    target.position.y - pad,
+    target.position.z - target.halfWidth - pad,
+  ];
+  const max = [
+    target.position.x + target.halfWidth + pad,
+    target.position.y + target.height + pad,
+    target.position.z + target.halfWidth + pad,
+  ];
+  const o = [origin.x, origin.y, origin.z];
+  const d = [dir.x, dir.y, dir.z];
+  let tMin = 0;
+  let tMax = maxDist;
+  for (let axis = 0; axis < 3; axis++) {
+    if (Math.abs(d[axis]) < 1e-8) {
+      if (o[axis] < min[axis] || o[axis] > max[axis]) return null;
+      continue;
+    }
+    const inv = 1 / d[axis];
+    let t1 = (min[axis] - o[axis]) * inv;
+    let t2 = (max[axis] - o[axis]) * inv;
+    if (t1 > t2) [t1, t2] = [t2, t1];
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+    if (tMin > tMax) return null;
+  }
+  return tMin;
 }

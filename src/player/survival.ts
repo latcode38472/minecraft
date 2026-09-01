@@ -5,6 +5,7 @@
 
 import * as THREE from 'three';
 import {
+  BLOCK_DAMAGE_REDUCTION,
   FALL_DAMAGE_THRESHOLD,
   HUNGER_DRAIN_PER_BLOCK,
   HUNGER_DRAIN_PER_S,
@@ -21,6 +22,12 @@ import type { Player } from './player';
 export interface SurvivalHooks {
   onHurt(amount: number): void;
   onDeath(): void;
+  /** Armour points currently worn (0-20); scales damage reduction. */
+  armorPoints(): number;
+  /** True while a shield is raised. */
+  isBlocking(): boolean;
+  /** Wear down gear that absorbed a hit. */
+  onAbsorb(blocked: boolean): void;
 }
 
 export class Survival {
@@ -99,11 +106,35 @@ export class Survival {
     }
   }
 
-  /** Apply damage. `ignoreInvulnerability` is for damage-over-time like starving. */
+  /**
+   * Reduce incoming damage by armour and an active block.
+   * Armour follows Minecraft's curve: each point removes 4%, capped at 80%.
+   * Blocking is applied after armour, so a shield helps even when unarmoured.
+   */
+  mitigate(amount: number): { final: number; blocked: boolean } {
+    const armor = Math.max(0, Math.min(20, this.hooks.armorPoints()));
+    let result = amount * (1 - armor * 0.04);
+    const blocked = this.hooks.isBlocking();
+    if (blocked) result *= 1 - BLOCK_DAMAGE_REDUCTION;
+    // Any hit that got through should still cost at least half a heart.
+    return { final: result > 0 ? Math.max(0.5, result) : 0, blocked };
+  }
+
+  /**
+   * Apply damage. `ignoreInvulnerability` is for damage-over-time like starving,
+   * which also bypasses armour (you cannot armour against hunger).
+   */
   damage(amount: number, ignoreInvulnerability = false): void {
     if (this.dead || amount <= 0) return;
     if (this.invulnerable > 0 && !ignoreInvulnerability) return;
     if (!ignoreInvulnerability) this.invulnerable = HURT_INVULN_S;
+
+    if (!ignoreInvulnerability) {
+      const { final, blocked } = this.mitigate(amount);
+      if (final < amount) this.hooks.onAbsorb(blocked);
+      amount = final;
+      if (amount <= 0) return;
+    }
 
     this.health = Math.max(0, this.health - amount);
     this.hurtFlash = 0.35;

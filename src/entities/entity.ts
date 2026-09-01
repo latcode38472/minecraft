@@ -9,14 +9,28 @@ import { moveWithCollision, type BodyShape } from '../physics';
 import type { World } from '../world/world';
 import { getMobHurtMaterial, getMobMaterial } from './models';
 
+/** A player a mob can chase and hit — the local one, or a remote one. */
+export interface PlayerTarget {
+  id: string;
+  position: THREE.Vector3;
+  halfWidth: number;
+  height: number;
+}
+
 /** Everything a mob needs to know about the world on a given tick. */
 export interface EntityContext {
   world: World;
   dt: number;
-  /** Player feet position. */
+  /** Local player feet position (spawning and despawning are centred on it). */
   playerPos: THREE.Vector3;
+  /** Every player a mob may target: the local player plus any remotes. */
+  players: PlayerTarget[];
+  /** Id used for the local player in `players`. */
+  localPlayerId: string;
+  /** Live entity list, so projectiles can test hits. */
+  entities: readonly Entity[];
   isNight: boolean;
-  damagePlayer(amount: number, fromX: number, fromZ: number): void;
+  damagePlayer(id: string, amount: number, fromX: number, fromZ: number): void;
   spawnDrop(id: string, count: number, x: number, y: number, z: number): void;
   /** Try to put an item in the player's inventory; returns the leftover count. */
   collectItem(id: string, count: number, damage?: number): number;

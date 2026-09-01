@@ -51,6 +51,26 @@ export const RECIPES: Recipe[] = [
   r('iron_sword', i('iron_sword'), [i('iron_ingot', 2), i('stick')], 'table'),
   r('diamond_sword', i('diamond_sword'), [i('diamond', 2), i('stick')], 'table'),
 
+  // Combat gear
+  r('bow', i('bow'), [i('stick', 3), i('string', 3)], 'table'),
+  r('flint', i('flint'), [i('gravel', 2)], 'table'),
+  r('arrows', i('arrow', 4), [i('stick'), i('flint')], 'table'),
+  r('shield', i('shield'), [i('planks', 6), i('iron_ingot')], 'table'),
+
+  // Armour: leather from hunting, iron and diamond from mining.
+  r('leather_helmet', i('leather_helmet'), [i('leather', 5)], 'table'),
+  r('leather_chestplate', i('leather_chestplate'), [i('leather', 8)], 'table'),
+  r('leather_leggings', i('leather_leggings'), [i('leather', 7)], 'table'),
+  r('leather_boots', i('leather_boots'), [i('leather', 4)], 'table'),
+  r('iron_helmet', i('iron_helmet'), [i('iron_ingot', 5)], 'table'),
+  r('iron_chestplate', i('iron_chestplate'), [i('iron_ingot', 8)], 'table'),
+  r('iron_leggings', i('iron_leggings'), [i('iron_ingot', 7)], 'table'),
+  r('iron_boots', i('iron_boots'), [i('iron_ingot', 4)], 'table'),
+  r('diamond_helmet', i('diamond_helmet'), [i('diamond', 5)], 'table'),
+  r('diamond_chestplate', i('diamond_chestplate'), [i('diamond', 8)], 'table'),
+  r('diamond_leggings', i('diamond_leggings'), [i('diamond', 7)], 'table'),
+  r('diamond_boots', i('diamond_boots'), [i('diamond', 4)], 'table'),
+
   // Furnace — coal is the fuel, consumed with the input.
   r('iron_ingot', i('iron_ingot'), [i('raw_iron'), i('coal')], 'furnace'),
   r('gold_ingot', i('gold_ingot'), [i('raw_gold'), i('coal')], 'furnace'),

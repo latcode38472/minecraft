@@ -18,6 +18,16 @@ export interface ToolStats {
   durability: number;
 }
 
+/** Which body slot a piece of armour occupies. */
+export type ArmorSlot = 'head' | 'chest' | 'legs' | 'feet';
+
+export interface ArmorStats {
+  slot: ArmorSlot;
+  /** Armour points; 20 points is full protection (80% reduction). */
+  points: number;
+  durability: number;
+}
+
 export interface ItemDef {
   id: string;
   name: string;
@@ -27,6 +37,11 @@ export interface ItemDef {
   tool?: ToolStats;
   attack?: { damage: number; cooldown: number };
   food?: { hunger: number };
+  armor?: ArmorStats;
+  /** Ranged weapon: charges up, then fires the named ammo item. */
+  ranged?: { ammo: string; maxDamage: number; drawTime: number; durability: number };
+  /** Held to block: reduces incoming damage while raised. */
+  blocking?: { reduction: number; durability: number };
 }
 
 const items = new Map<string, ItemDef>();
@@ -99,6 +114,9 @@ material('raw_gold', 'Raw Gold', ItemTile.RawGold);
 material('iron_ingot', 'Iron Ingot', ItemTile.IronIngot);
 material('gold_ingot', 'Gold Ingot', ItemTile.GoldIngot);
 material('diamond', 'Diamond', ItemTile.Diamond);
+material('leather', 'Leather', ItemTile.Leather);
+material('string', 'String', ItemTile.String);
+material('flint', 'Flint', ItemTile.Flint);
 
 // --- Food ---
 register({
@@ -149,6 +167,61 @@ TOOL_TIERS.forEach((t, i) => {
     tool: { kind: 'sword', tier: t.tier, speed: 1.5, durability: t.durability },
     attack: { damage: 3 + t.tier, cooldown: 0.35 },
   });
+});
+
+// --- Combat gear ---
+register({
+  id: 'bow',
+  name: 'Bow',
+  tile: ItemTile.Bow,
+  maxStack: 1,
+  ranged: { ammo: 'arrow', maxDamage: 9, drawTime: 1.0, durability: 384 },
+  attack: { damage: 1, cooldown: 0.5 },
+});
+material('arrow', 'Arrow', ItemTile.Arrow);
+register({
+  id: 'shield',
+  name: 'Shield',
+  tile: ItemTile.Shield,
+  maxStack: 1,
+  blocking: { reduction: 0.66, durability: 336 },
+});
+
+const ARMOR_TIERS = [
+  { key: 'leather', name: 'Leather', mult: 1, durability: 80 },
+  { key: 'iron', name: 'Iron', mult: 2.4, durability: 240 },
+  { key: 'diamond', name: 'Diamond', mult: 3.4, durability: 528 },
+] as const;
+
+// Base points per slot; a chestplate protects most, boots least.
+const ARMOR_SLOTS = [
+  { slot: 'head' as ArmorSlot, piece: 'helmet', name: 'Helmet', base: 1.5 },
+  { slot: 'chest' as ArmorSlot, piece: 'chestplate', name: 'Chestplate', base: 2.4 },
+  { slot: 'legs' as ArmorSlot, piece: 'leggings', name: 'Leggings', base: 2.0 },
+  { slot: 'feet' as ArmorSlot, piece: 'boots', name: 'Boots', base: 1.3 },
+];
+
+const ARMOR_TILES: Record<string, number[]> = {
+  helmet: [ItemTile.LeatherHelmet, ItemTile.IronHelmet, ItemTile.DiamondHelmet],
+  chestplate: [ItemTile.LeatherChestplate, ItemTile.IronChestplate, ItemTile.DiamondChestplate],
+  leggings: [ItemTile.LeatherLeggings, ItemTile.IronLeggings, ItemTile.DiamondLeggings],
+  boots: [ItemTile.LeatherBoots, ItemTile.IronBoots, ItemTile.DiamondBoots],
+};
+
+ARMOR_TIERS.forEach((tier, tierIndex) => {
+  for (const slot of ARMOR_SLOTS) {
+    register({
+      id: `${tier.key}_${slot.piece}`,
+      name: `${tier.name} ${slot.name}`,
+      tile: ARMOR_TILES[slot.piece][tierIndex],
+      maxStack: 1,
+      armor: {
+        slot: slot.slot,
+        points: Math.round(slot.base * tier.mult),
+        durability: tier.durability,
+      },
+    });
+  }
 });
 
 export function getItem(id: string): ItemDef | undefined {
