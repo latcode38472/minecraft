@@ -226,9 +226,13 @@ async function boot(choice: StartChoice): Promise<void> {
     },
   );
   const statusUi = new StatusUi(() => respawn());
+  // Every way of leaving the screen lands here — the E key, the Close button,
+  // Escape — so the grid is handed back and the mouse recaptured in exactly
+  // one place, and no route out can forget one of the two.
   const inventoryUi = new InventoryUi(invCtl, () => {
     invCtl.close();
     hud.refresh();
+    resumePlay();
   });
 
   const spawnPoint = new THREE.Vector3();
@@ -513,26 +517,61 @@ async function boot(choice: StartChoice): Promise<void> {
     refreshPlayingClass();
   });
 
+  /** Catches a lock request the browser never granted and never reported. */
+  let lockFallbackTimer = 0;
+
   document.addEventListener('pointerlockchange', () => {
     // Only the menu path un-pauses; the inventory, sleep and death screens
     // manage their own overlays and must not be replaced by the main menu.
     if (touchDevice) return;
+    if (look.locked) clearTimeout(lockFallbackTimer);
     const showMenu = !look.locked && !inventoryUi.open && !survival.dead && !sleeping;
     menu.style.display = showMenu ? 'flex' : 'none';
     refreshPlayingClass();
   });
 
+  /**
+   * The browser refused to give the mouse back. Put the menu up so a click
+   * resumes play, rather than leaving a free cursor over a world that no
+   * longer responds to it.
+   */
+  document.addEventListener('pointerlockerror', () => offerMenu());
+
+  function offerMenu(): void {
+    if (touchDevice || look.locked || inventoryUi.open || survival.dead || sleeping) return;
+    menu.style.display = 'flex';
+    refreshPlayingClass();
+  }
+
+  /**
+   * Hand the mouse back to the game after a screen closes.
+   *
+   * The request can be refused — Chrome rejects one made too soon after the
+   * last lock ended, which is exactly what closing a screen you only just
+   * opened does. `pointerlockerror` covers the browsers that report it; the
+   * timer covers the rest. Either way the player ends up with the menu and a
+   * click away from playing, never stranded with a cursor and no way back in.
+   */
+  function resumePlay(): void {
+    if (touchDevice || survival.dead || sleeping || inventoryUi.open) return;
+    look.requestLock();
+    clearTimeout(lockFallbackTimer);
+    lockFallbackTimer = window.setTimeout(offerMenu, 400);
+  }
+
   /** Show the inventory screen in whatever state the controller is in. */
   function openScreen(): void {
     inventoryUi.show();
     menu.style.display = 'none';
+    clearTimeout(lockFallbackTimer);
     if (!touchDevice && look.locked) document.exitPointerLock();
     refreshPlayingClass();
   }
 
   function closeScreen(): void {
+    // The close itself hands the mouse back, through the InventoryUi callback
+    // below — so the Close button and the E key behave identically.
     inventoryUi.close();
-    if (!touchDevice && !survival.dead && !sleeping) look.requestLock();
     refreshPlayingClass();
   }
 
@@ -578,7 +617,7 @@ async function boot(choice: StartChoice): Promise<void> {
       if (!touchDevice && look.locked) document.exitPointerLock();
     } else {
       if (message) hud.toast(message);
-      if (!touchDevice && !survival.dead) look.requestLock();
+      resumePlay();
     }
     refreshPlayingClass();
   }
@@ -638,8 +677,8 @@ async function boot(choice: StartChoice): Promise<void> {
     statusUi.hideDeath();
     entities.clear();
     session?.sendRespawn();
-    if (!touchDevice) look.requestLock();
-    else touchPlaying = true;
+    if (touchDevice) touchPlaying = true;
+    else resumePlay();
     refreshPlayingClass();
   }
 

@@ -24,8 +24,20 @@ export class MouseLook {
     });
   }
 
+  /**
+   * Ask for the mouse back.
+   *
+   * The browser is free to refuse — Chrome rejects a request made too soon
+   * after the last lock was released, which is exactly what closing a screen
+   * and reopening it in a hurry does. Newer Chrome reports that by rejecting
+   * a promise, everything else by firing `pointerlockerror` on the document.
+   * The rejection is swallowed here so it is not an unhandled error; callers
+   * watch `locked` (or that event) and put the menu back up instead, so a
+   * refusal never leaves the player with a free cursor and nothing to click.
+   */
   requestLock(): void {
-    this.lockTarget.requestPointerLock();
+    const pending = this.lockTarget.requestPointerLock() as unknown;
+    if (pending instanceof Promise) pending.catch(() => {});
   }
 
   /** Apply a look delta in screen pixels — used by both mouse and touch input. */

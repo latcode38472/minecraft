@@ -910,6 +910,127 @@ try {
     await context.close();
   });
 
+  await testCase('closing a crafting table or furnace gives the mouse back', async () => {
+    // A real pointer lock, taken and given back the way a player does it.
+    // Losing it here is the difference between playing on and being stranded
+    // with a free cursor over a world that no longer answers to it.
+    const { context, page } = await openGame(browser);
+    await page.click('#mode-single');
+    await until(page, () => Boolean(window.__voxel), 30000, 'game boot');
+    await until(page, () => window.__voxel.world.chunks.size > 4, 30000, 'chunks');
+
+    await page.mouse.click(512, 350); // "Click to play"
+    await sleep(700);
+    const locked = await page.evaluate(() => window.__voxel.look.locked);
+    assert.ok(locked, 'this browser must grant pointer lock for the test to mean anything');
+
+    // A flat pocket with a crafting table right under the crosshair.
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -4; dz <= 0; dz++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, v.Block.Dirt);
+          for (let dy = 0; dy < 4; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      v.look.yaw = 0;
+      v.look.pitch = -0.62;
+    });
+    await sleep(1200);
+
+    const aimAtTable = async () => {
+      await page.evaluate(() => {
+        const v = window.__voxel;
+        v.look.yaw = 0;
+        v.look.pitch = -0.62;
+      });
+      await sleep(500);
+      await page.evaluate(() => {
+        const v = window.__voxel;
+        const t = v.interaction.target;
+        if (t) v.world.setBlock(t.x, t.y, t.z, v.Block.CraftingTable);
+      });
+      await sleep(400);
+    };
+
+    const state = () =>
+      page.evaluate(() => ({
+        locked: window.__voxel.look.locked,
+        menu: getComputedStyle(document.getElementById('menu')).display,
+        open: window.__voxel.inventoryUi.open,
+      }));
+
+    /** Either the camera is back, or the menu is up and a click brings it back. */
+    const assertNotStranded = async (how) => {
+      const s = await state();
+      assert.equal(s.open, false, `${how}: the screen should be closed`);
+      assert.ok(
+        s.locked || s.menu !== 'none',
+        `${how}: stranded — pointer unlocked with no menu to click (${JSON.stringify(s)})`,
+      );
+    };
+
+    const openTable = async () => {
+      if (!(await page.evaluate(() => window.__voxel.look.locked))) {
+        await page.mouse.click(512, 350);
+        await sleep(700);
+      }
+      await aimAtTable();
+      await page.mouse.click(512, 350, { button: 'right' });
+      await sleep(700);
+      const s = await state();
+      assert.ok(s.open, `the crafting table did not open: ${JSON.stringify(s)}`);
+      assert.equal(s.locked, false, 'opening a screen releases the mouse');
+    };
+
+    // 1. The E key.
+    await openTable();
+    await page.keyboard.press('KeyE');
+    await sleep(1200);
+    await assertNotStranded('closed with E');
+
+    // 2. The Close button, which is the same action to a player.
+    await openTable();
+    await page.click('#inv-close');
+    await sleep(1200);
+    await assertNotStranded('closed with the Close button');
+
+    // 3. Escape first (the browser drops the lock itself), then E — the case
+    //    where the browser refuses to hand the lock straight back.
+    await openTable();
+    await page.keyboard.press('Escape');
+    await sleep(300);
+    await page.keyboard.press('KeyE');
+    await sleep(1500);
+    await assertNotStranded('escaped, then closed with E');
+
+    // 4. Hammering the key, which is how a lock request gets refused.
+    await openTable();
+    for (let i = 0; i < 3; i++) {
+      await page.keyboard.press('KeyE');
+      await sleep(120);
+      await page.keyboard.press('KeyE');
+      await sleep(120);
+    }
+    await page.keyboard.press('KeyE');
+    await sleep(1500);
+    await assertNotStranded('opened and closed repeatedly');
+
+    // And the camera must actually answer the mouse again afterwards.
+    if ((await state()).locked) {
+      const before = await page.evaluate(() => window.__voxel.look.yaw);
+      await page.mouse.move(512, 350);
+      await page.mouse.move(712, 350);
+      await sleep(400);
+      const after = await page.evaluate(() => window.__voxel.look.yaw);
+      assert.notEqual(after, before, 'the camera must turn with the mouse again');
+    }
+    await context.close();
+  });
+
   await testCase('sleeping in a bed at night brings the morning', async () => {
     const { context, page } = await openGame(browser);
     await startSingleplayer(page);
