@@ -62,6 +62,14 @@ export class InventoryController {
   private seq = 0;
   private session: MultiplayerSession | null = null;
   private localSim: RoomSimulation | null = null;
+  /**
+   * Whether a server state has set the hotbar slot yet. Which slot is selected
+   * is the one part of the inventory the client owns outright — it is pure
+   * input — so only the first reply (a join, or a restored player) is allowed
+   * to set it. Otherwise an inventory update that happens to land just after a
+   * hotbar key would snap the selection back under the player's fingers.
+   */
+  private adoptedSelection = false;
   private readonly hooks: InventoryControllerHooks;
 
   constructor(inventory: Inventory, hooks: InventoryControllerHooks) {
@@ -217,9 +225,9 @@ export class InventoryController {
    */
   applyServerState(state: InventoryStateData): void {
     if (state.ack !== this.seq && state.ack !== 0) return;
-    this.inventory.load(state.slots, state.selected, state.armor);
-    // Selected slot is the one thing the local player owns outright.
-    if (state.ack === 0) this.inventory.selected = Math.max(0, Math.min(8, this.inventory.selected));
+    const keepSelected = this.adoptedSelection ? this.inventory.selected : state.selected;
+    this.adoptedSelection = true;
+    this.inventory.load(state.slots, keepSelected, state.armor);
     this.holding.cursor = clone(state.cursor);
     if (state.gridSize !== this.holding.gridSize) {
       this.holding.gridSize = state.gridSize;

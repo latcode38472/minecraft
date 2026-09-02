@@ -85,8 +85,10 @@ export const FLAG_HURT = 64;
 export const FLAG_DEAD = 128;
 /** In bed; the body lies flat on the bed block. */
 export const FLAG_SLEEPING = 256;
+/** Running: other clients widen the gait rather than guessing from speed. */
+export const FLAG_SPRINTING = 512;
 /** Mask applied to inbound flags — widen this when adding a flag above. */
-export const FLAG_MASK = 0x1ff;
+export const FLAG_MASK = 0x3ff;
 
 export interface WorldInfo {
   seed: number;
@@ -332,12 +334,13 @@ export type ClientMessage =
   | { t: 'block_place'; x: number; y: number; z: number; id: number }
   | { t: 'chunk_edits_request'; keys: string[] }
   | { t: 'ping'; time: number }
-  // Combat
-  | { t: 'attack_player'; target: string; damage: number }
+  // Combat. `ranged` marks an arrow hit, so the server knows to use the
+  // arrow's knockback rather than whatever is in the attacker's hand now.
+  | { t: 'attack_player'; target: string; damage: number; ranged?: boolean }
   | { t: 'player_vitals'; health: number; hunger: number; dead: boolean }
   | { t: 'respawn' }
   // Server-authoritative world
-  | { t: 'attack_mob'; mob: number; damage: number }
+  | { t: 'attack_mob'; mob: number; damage: number; ranged?: boolean }
   /** Use the held item on a mob: shears on a sheep. */
   | { t: 'use_on_mob'; mob: number }
   /** Throw the held stack (or one of it) into the world. */
@@ -400,8 +403,11 @@ export type ServerMessage =
   | { t: 'player_equipment'; id: string; gear: number[] }
   | { t: 'player_vitals'; vitals: PlayerVitals[] }
   | { t: 'player_respawned'; id: string }
-  /** A mob hit you: shove the local player away from it. */
-  | { t: 'knockback'; fromX: number; fromZ: number }
+  /**
+   * Something hit you: shove the local player away from it. `strength` is the
+   * weapon's knockback, so a diamond axe moves you further than a fist.
+   */
+  | { t: 'knockback'; fromX: number; fromZ: number; strength: number }
   // Server-authoritative world: one snapshot carries time, mobs and drops.
   | ({ t: 'world_state' } & WorldStateData)
   | {

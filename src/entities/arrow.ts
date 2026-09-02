@@ -48,6 +48,9 @@ export interface ArrowHooks {
   onHitTarget(id: string, damage: number, fromX: number, fromZ: number): void;
 }
 
+/** An arrow shoves with its own strength, not the shooter's held item. */
+export { arrowKnockback } from '../shared/combat';
+
 export class Arrow extends Entity {
   readonly shape: BodyShape = { halfWidth: SHAFT, height: SHAFT };
   readonly object: THREE.Mesh;

@@ -10,6 +10,7 @@ import {
   PLAYER_HALF_WIDTH,
   PLAYER_HEIGHT,
   SNEAK_SPEED,
+  SPRINT_SPEED,
   SWIM_UP_SPEED,
   TERMINAL_VELOCITY,
   WALK_SPEED,
@@ -17,6 +18,7 @@ import {
   WATER_SPEED_FACTOR,
   WATER_TERMINAL_VELOCITY,
 } from '../constants';
+import { clampKnockback, knockbackDecay, knockbackLift } from '../shared/combat';
 import { bodyOverlapsBlock, moveWithCollision, type BodyShape } from '../shared/voxel';
 import type { World } from '../world/world';
 
@@ -26,7 +28,12 @@ export interface MoveInput {
   strafe: number;
   jump: boolean;
   sneak: boolean;
+  /** Run. Ignored while sneaking or standing still. */
+  sprint: boolean;
 }
+
+/** A shove below this is over; it would move the body less than a pixel. */
+const KNOCKBACK_CUTOFF = 0.05;
 
 export class Player {
   /** Feet position (bottom centre of the AABB). */
@@ -38,6 +45,17 @@ export class Player {
   eyeInWater = false;
   /** Last frame's sneak intent, mirrored for multiplayer state packets. */
   sneaking = false;
+  /**
+   * Actually running — moving, not sneaking, and asked to. Read by the hunger
+   * model and sent to other players, so it is the state, not the intent.
+   */
+  sprinting = false;
+  /**
+   * An external shove: a hit landing. It is *added* to walking rather than
+   * replacing it and fades over about half a second, so being hit moves you
+   * without taking the controls away.
+   */
+  readonly knockback = new THREE.Vector3();
   /** Horizontal distance walked while grounded, consumed for footstep sounds. */
   stepAccumulator = 0;
 
@@ -61,8 +79,29 @@ export class Player {
   /** Drop all momentum and fall state (respawn, teleport). */
   reset(): void {
     this.velocity.set(0, 0, 0);
+    this.knockback.set(0, 0, 0);
+    this.sprinting = false;
     this.apexY = this.position.y;
     this.pendingFallDistance = 0;
+  }
+
+  /**
+   * Take a hit from (fromX, fromZ) and be shoved away from it.
+   *
+   * The lift only lands when the feet are down, so a player already in the air
+   * is pushed sideways rather than juggled.
+   */
+  applyKnockback(fromX: number, fromZ: number, strength: number): void {
+    const force = clampKnockback(strength);
+    if (force === 0) return;
+    const dx = this.position.x - fromX;
+    const dz = this.position.z - fromZ;
+    const len = Math.hypot(dx, dz);
+    // Hit from exactly where you stand: shove backwards rather than nowhere.
+    const nx = len > 1e-4 ? dx / len : 0;
+    const nz = len > 1e-4 ? dz / len : 1;
+    this.knockback.set(nx * force, 0, nz * force);
+    if (this.onGround) this.velocity.y = knockbackLift(force);
   }
 
   update(dt: number, move: MoveInput, yaw: number): void {
@@ -74,7 +113,10 @@ export class Player {
     let fwd = move.forward;
     let strafe = move.strafe;
     const len = Math.hypot(fwd, strafe);
-    let speed = move.sneak ? SNEAK_SPEED : WALK_SPEED;
+    // Sprinting is forwards only, and sneaking always wins: you cannot creep
+    // at a run.
+    this.sprinting = move.sprint && !move.sneak && len > 0 && move.forward > 0;
+    let speed = move.sneak ? SNEAK_SPEED : this.sprinting ? SPRINT_SPEED : WALK_SPEED;
     if (this.feetInWater) speed *= WATER_SPEED_FACTOR;
     if (len > 0) {
       if (len > 1) {
@@ -102,6 +144,14 @@ export class Player {
       if (move.jump && this.onGround) this.velocity.y = JUMP_SPEED;
       this.velocity.y -= GRAVITY * dt;
       this.velocity.y = Math.max(this.velocity.y, -TERMINAL_VELOCITY);
+    }
+
+    // A shove rides on top of whatever the player is doing, and fades.
+    if (this.knockback.lengthSq() > 0) {
+      this.velocity.x += this.knockback.x;
+      this.velocity.z += this.knockback.z;
+      this.knockback.multiplyScalar(knockbackDecay(dt));
+      if (this.knockback.length() < KNOCKBACK_CUTOFF) this.knockback.set(0, 0, 0);
     }
 
     const wasGrounded = this.onGround;

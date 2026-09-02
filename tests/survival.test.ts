@@ -20,6 +20,8 @@ import type { Player } from '../src/player/player.ts';
 class StubPlayer {
   position = new THREE.Vector3(0, 40, 0);
   eyeInWater = false;
+  feetInWater = false;
+  sprinting = false;
   private fall = 0;
   setFall(blocks: number): void {
     this.fall = blocks;

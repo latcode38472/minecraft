@@ -18,6 +18,7 @@ import {
   FLAG_MOVING,
   FLAG_SLEEPING,
   FLAG_SNEAKING,
+  FLAG_SPRINTING,
   FLAG_SWINGING,
   FLAG_USING,
   MAX_BLOCK_ID,
@@ -54,8 +55,8 @@ export interface SessionEvents {
   onDamaged(amount: number, byName: string): void;
   /** An authoritative world snapshot: time, mobs and dropped items. */
   onWorldState(state: WorldStateData): void;
-  /** A mob hit us; shove the local player away from it. */
-  onKnockback(fromX: number, fromZ: number): void;
+  /** Something hit us; shove the local player away from it. */
+  onKnockback(fromX: number, fromZ: number, strength: number): void;
   /**
    * Someone else fired an arrow; spawn a copy locally. `ageMs` is how long ago
    * the server saw it, so the receiver can fast-forward out the latency.
@@ -207,6 +208,7 @@ export class MultiplayerSession {
     if (!this.player.onGround) flags |= FLAG_JUMPING;
     if (this.player.onGround) flags |= FLAG_GROUNDED;
     if (this.player.sneaking) flags |= FLAG_SNEAKING;
+    if (this.player.sprinting) flags |= FLAG_SPRINTING;
     if (this.flags.swinging) flags |= FLAG_SWINGING;
     if (this.flags.using) flags |= FLAG_USING;
     if (this.flags.hurt) flags |= FLAG_HURT;
@@ -293,14 +295,18 @@ export class MultiplayerSession {
     this.net.send({ t: 'wake' });
   }
 
-  /** Melee or arrow hit on another player; the server arbitrates. */
-  attackPlayer(targetId: string, damage: number): void {
-    this.net.send({ t: 'attack_player', target: targetId, damage });
+  /**
+   * Melee or arrow hit on another player; the server arbitrates. `ranged`
+   * tells it the shove is an arrow's rather than the held item's — the server
+   * looks the strength itself up either way.
+   */
+  attackPlayer(targetId: string, damage: number, ranged = false): void {
+    this.net.send({ t: 'attack_player', target: targetId, damage, ...(ranged ? { ranged } : {}) });
   }
 
   /** Hit a mob; the server owns mob health and arbitrates the swing. */
-  attackMob(mobId: number, damage: number): void {
-    this.net.send({ t: 'attack_mob', mob: mobId, damage });
+  attackMob(mobId: number, damage: number, ranged = false): void {
+    this.net.send({ t: 'attack_mob', mob: mobId, damage, ...(ranged ? { ranged } : {}) });
   }
 
   /** Use the held item on a mob: shears on a sheep. */
@@ -477,7 +483,7 @@ export class MultiplayerSession {
         return;
       }
       case 'knockback': {
-        this.events.onKnockback(msg.fromX, msg.fromZ);
+        this.events.onKnockback(msg.fromX, msg.fromZ, msg.strength);
         return;
       }
       case 'arrow_spawn': {

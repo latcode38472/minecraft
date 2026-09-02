@@ -18,8 +18,10 @@ import { AutoQuality } from './autoquality';
 import {
   CHUNK_SIZE,
   DEFAULT_VIEW_DISTANCE,
-  KNOCKBACK_LIFT,
-  KNOCKBACK_SPEED,
+  SPRINT_DOUBLE_TAP_MS,
+  SPRINT_FOV_BOOST,
+  SPRINT_FOV_RATE,
+  SPRINT_MIN_HUNGER,
   MAX_HEALTH,
   MAX_HUNGER,
   MAX_TIMESTEP,
@@ -38,6 +40,7 @@ import type { EntityContext } from './entities/entity';
 import { EntityManager } from './entities/manager';
 import { RoomSimulation } from './shared/roomsim';
 import { MobSim, isNightTime, type MobKind, type SimPlayer } from './shared/mobsim';
+import { arrowKnockback, attackKnockback } from './shared/combat';
 import { blockDrops, breakTimeFor, canHarvest, wearsTool } from './shared/harvest';
 import { WorldView } from './game/worldview';
 import { Viewmodel } from './game/viewmodel';
@@ -109,6 +112,8 @@ async function boot(choice: StartChoice): Promise<void> {
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+  /** The resting field of view; sprinting widens it from here. */
+  const BASE_FOV = camera.fov;
   scene.fog = new THREE.Fog(0x87ceeb, 10, 100);
 
   const touchDevice = params.has('touch') || isTouchDevice();
@@ -271,10 +276,10 @@ async function boot(choice: StartChoice): Promise<void> {
   if (!multiplayer) {
     // Singleplayer: the client is its own authority, running the same code.
     localSim = new RoomSimulation(world, {
-      damagePlayer: (_id, amount, fromX, fromZ) => {
+      damagePlayer: (_id, amount, fromX, fromZ, knockback) => {
         if (!isPlaying() && !sleeping) return;
         survival.damage(amount);
-        knockbackPlayer(fromX, fromZ);
+        knockbackPlayer(fromX, fromZ, knockback);
         if (sleeping) wakeUp('You were attacked in your sleep!');
       },
       giveItems: (_id, itemId, count, damage) => {
@@ -410,15 +415,30 @@ async function boot(choice: StartChoice): Promise<void> {
     return targets;
   }
 
-  /** Route a hit to whichever simulation owns the target. */
-  function hitTarget(id: string, damage: number): void {
+  /**
+   * Route a hit to whichever simulation owns the target, along with the shove
+   * it carries. A melee blow pushes from where the player stands with the held
+   * weapon's strength; an arrow pushes from where the arrow is, with its own.
+   * In multiplayer the server looks the strength up again from its own copy of
+   * the hand — this is the prediction, not the authority.
+   */
+  function hitTarget(
+    id: string,
+    damage: number,
+    from: { x: number; z: number } = player.position,
+    ranged = false,
+  ): void {
+    const strength = ranged ? arrowKnockback() : attackKnockback(inventory.selectedStack);
     if (id.startsWith('mob:')) {
       const mobId = Number(id.slice(4));
-      if (localSim) localSim.damageMob(mobId, damage, selfNetId(), player.position);
-      else session?.attackMob(mobId, damage);
+      if (localSim) {
+        localSim.damageMob(mobId, damage, selfNetId(), { x: from.x, y: player.position.y, z: from.z }, strength);
+      } else {
+        session?.attackMob(mobId, damage, ranged);
+      }
       return;
     }
-    session?.attackPlayer(id, damage);
+    session?.attackPlayer(id, damage, ranged);
   }
 
   /** Play the death sound for any mob that died within earshot, and topple it. */
@@ -446,7 +466,8 @@ async function boot(choice: StartChoice): Promise<void> {
     const arrow = new Arrow(origin, dir, speed, damage, ownerId, {
       // The shooter's own id is filtered inside Arrow; include everyone else.
       targets: () => combatTargets(),
-      onHitTarget: (id, dmg) => hitTarget(id, dmg),
+      // The shove comes from where the arrow is, so it carries on through.
+      onHitTarget: (id, dmg, fromX, fromZ) => hitTarget(id, dmg, { x: fromX, z: fromZ }, true),
     });
     // Start slightly ahead of the eye so it doesn't clip the shooter.
     arrow.position.addScaledVector(dir, 0.4);
@@ -717,8 +738,27 @@ async function boot(choice: StartChoice): Promise<void> {
   const eye = new THREE.Vector3();
   const lookDir = new THREE.Vector3();
 
-  function handleKeys(): void {
-    for (const code of input.takePresses()) {
+  /**
+   * Double-tapping forward latches a sprint until the key is let go, the way
+   * Minecraft does it. Holding Ctrl is the other way in; both feed `move`.
+   */
+  let sprintLatched = false;
+  let lastForwardPressAt = -Infinity;
+
+  function updateSprintLatch(presses: string[], nowMs: number): void {
+    for (const code of presses) {
+      if (code !== 'KeyW') continue;
+      if (nowMs - lastForwardPressAt < SPRINT_DOUBLE_TAP_MS) sprintLatched = true;
+      lastForwardPressAt = nowMs;
+    }
+    // Letting go of forward ends the latch; Ctrl is unaffected.
+    if (!input.isDown('KeyW')) sprintLatched = false;
+  }
+
+  function handleKeys(nowMs: number): void {
+    const presses = input.takePresses();
+    updateSprintLatch(presses, nowMs);
+    for (const code of presses) {
       if (code.startsWith('Digit')) {
         const n = Number(code.slice(5));
         if (n >= 1 && n <= 9) invCtl.selectSlot(n - 1);
@@ -753,14 +793,9 @@ async function boot(choice: StartChoice): Promise<void> {
     hud.toast(`Dropped ${thrown.count} ${getItem(thrown.id)?.name ?? thrown.id}`);
   }
 
-  /** Shove the player away from a damage source. */
-  function knockbackPlayer(fromX: number, fromZ: number): void {
-    const dx = player.position.x - fromX;
-    const dz = player.position.z - fromZ;
-    const len = Math.hypot(dx, dz) || 1;
-    player.velocity.x = (dx / len) * KNOCKBACK_SPEED * 0.6;
-    player.velocity.z = (dz / len) * KNOCKBACK_SPEED * 0.6;
-    if (player.onGround) player.velocity.y = KNOCKBACK_LIFT * 0.6;
+  /** Shove the player away from a damage source, as hard as it hit. */
+  function knockbackPlayer(fromX: number, fromZ: number, strength: number): void {
+    player.applyKnockback(fromX, fromZ, strength);
   }
 
   const entityContext: EntityContext = {
@@ -878,7 +913,7 @@ async function boot(choice: StartChoice): Promise<void> {
                 : 'The night passes…';
           }
         },
-        onKnockback: (fromX, fromZ) => knockbackPlayer(fromX, fromZ),
+        onKnockback: (fromX, fromZ, strength) => knockbackPlayer(fromX, fromZ, strength),
         onRemoteArrow: (x, y, z, dx, dy, dz, speed, ownerId, ageMs) => {
           const origin = new THREE.Vector3(x, y, z);
           const dir = new THREE.Vector3(dx, dy, dz);
@@ -959,6 +994,8 @@ async function boot(choice: StartChoice): Promise<void> {
     viewmodel,
     breakOverlay,
     isSleeping: () => sleeping,
+    /** The live field of view, which widens while sprinting. */
+    getCameraFov: () => camera.fov,
     /** Try the bed at a block position, exactly as a right-click on it would. */
     sleepAt: (x: number, y: number, z: number) => trySleep(x, y, z),
     /** Draw any atlas tile into a 2D context; used to inspect textures in tests. */
@@ -1033,7 +1070,7 @@ async function boot(choice: StartChoice): Promise<void> {
     lastTime = nowMs;
     const playing = isPlaying();
 
-    handleKeys();
+    handleKeys(nowMs);
 
     if (touch) {
       const [lookDx, lookDy] = touch.takeLookDelta();
@@ -1050,6 +1087,15 @@ async function boot(choice: StartChoice): Promise<void> {
       ),
       jump: input.isDown('Space') || (touch?.jumpHeld ?? false),
       sneak: input.isDown('ShiftLeft') || input.isDown('ShiftRight') || (touch?.sneakOn ?? false),
+      // Hold Ctrl, double-tap forward, or push a touch stick to its edge.
+      // Too hungry and you cannot run at all, which is what gives the food
+      // cost its teeth.
+      sprint:
+        (input.isDown('ControlLeft') ||
+          input.isDown('ControlRight') ||
+          sprintLatched ||
+          (touch?.sprinting ?? false)) &&
+        survival.hunger > SPRINT_MIN_HUNGER,
     };
 
     // Raising a shield slows you down, as it does in Minecraft.
@@ -1061,8 +1107,20 @@ async function boot(choice: StartChoice): Promise<void> {
       // A jump costs a little food; charged on the frame it leaves the ground.
       if (move.jump && player.onGround && !player.feetInWater) survival.exert('jump');
       player.update(dt, move, look.yaw);
+    } else {
+      player.sprinting = false;
     }
     survival.update(dt, player);
+
+    // Running widens the view a little. It is the only cue that you are
+    // moving faster, since the ground gives none at this scale.
+    const wantedFov = BASE_FOV + (player.sprinting ? SPRINT_FOV_BOOST : 0);
+    if (camera.fov !== wantedFov) {
+      const step = SPRINT_FOV_RATE * dt;
+      camera.fov += Math.max(-step, Math.min(step, wantedFov - camera.fov));
+      if (Math.abs(camera.fov - wantedFov) < 0.01) camera.fov = wantedFov;
+      camera.updateProjectionMatrix();
+    }
 
     world.update(
       player.position.x,

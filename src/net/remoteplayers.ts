@@ -9,6 +9,7 @@ import {
   FLAG_JUMPING,
   FLAG_MOVING,
   FLAG_SLEEPING,
+  FLAG_SPRINTING,
   FLAG_SWINGING,
   FLAG_USING,
   INTERPOLATION_DELAY_MS,
@@ -296,11 +297,14 @@ export class RemotePlayer {
     // match the ground however jittery the packets were. FLAG_MOVING gates it
     // so a player being shoved around does not appear to stroll.
     const moving = (flags & FLAG_MOVING) !== 0;
+    const sprinting = (flags & FLAG_SPRINTING) !== 0;
     if (this.hasRendered) {
       const stepped = Math.hypot(x - this.lastRendered.x, z - this.lastRendered.z);
       this.walkPhase += stepped * WALK_PHASE_PER_BLOCK;
       const speed = dt > 0 ? stepped / dt : 0;
-      const target = moving ? Math.min(1, speed / 4) : 0;
+      // A runner's stride is longer, not just quicker, so the gait reads as
+      // sprinting rather than as a walk cycle played back fast.
+      const target = moving ? Math.min(sprinting ? 1.3 : 1, speed / 4) : 0;
       this.walkAmount += (target - this.walkAmount) * Math.min(1, dt * 9);
     }
     this.lastRendered.set(x, y, z);

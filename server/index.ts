@@ -30,6 +30,7 @@ import {
 } from '../src/items/containers.ts';
 import { Inventory } from '../src/items/inventory.ts';
 import { getItem } from '../src/items/items.ts';
+import { arrowKnockback, attackKnockback, clampKnockback } from '../src/shared/combat.ts';
 import { blockDrops, wearsTool } from '../src/shared/harvest.ts';
 import { RoomSimulation, blockKey, type BlockEntity } from '../src/shared/roomsim.ts';
 import { emptyWorldSave, type SavedPlayer, type WorldSave } from '../src/shared/save.ts';
@@ -300,6 +301,15 @@ function sendEditsFor(client: Client, room: Room, keys: string[]): void {
   flush(true);
 }
 
+/**
+ * How hard this client's hit shoves. Derived here, from the server's own copy
+ * of what they are holding, so knockback cannot be forged; an arrow carries
+ * its own strength because by the time it lands the bow may be put away.
+ */
+function hitKnockback(client: Client, ranged: boolean): number {
+  return ranged ? arrowKnockback() : attackKnockback(client.inventory.selectedStack);
+}
+
 function withinReach(client: Client, x: number, y: number, z: number, range = MAX_INTERACT_RANGE): boolean {
   return Math.hypot(x + 0.5 - client.pos.x, y + 0.5 - (client.pos.y + 1), z + 0.5 - client.pos.z) <= range;
 }
@@ -486,7 +496,7 @@ function openRoom(save: WorldSave): Room {
   };
   // The simulation owns mobs, drops, containers and time for the life of the room.
   room.sim = new RoomSimulation(serverWorld, {
-    damagePlayer: (playerId, amount, fromX, fromZ) => {
+    damagePlayer: (playerId, amount, fromX, fromZ, knockback) => {
       const victim = room.clients.get(playerId);
       if (!victim || victim.dead) return;
       victim.health = Math.max(0, victim.health - amount);
@@ -499,7 +509,7 @@ function openRoom(save: WorldSave): Room {
         health: victim.health,
         dead: died,
       });
-      send(victim, { t: 'knockback', fromX, fromZ });
+      send(victim, { t: 'knockback', fromX, fromZ, strength: clampKnockback(knockback) });
       if (room.sim.sleepers.has(victim.id)) {
         room.sim.wake(victim.id);
         send(victim, { t: 'sleep_result', sleeping: false, message: 'You were attacked in your sleep!' });
@@ -945,6 +955,14 @@ function handleMessage(client: Client, raw: string): void {
         health: victim.health,
         dead: died,
       });
+      // The shove comes from the server's own copy of the attacker's hand, so
+      // a modified client cannot send itself a launcher.
+      send(victim, {
+        t: 'knockback',
+        fromX: client.pos.x,
+        fromZ: client.pos.z,
+        strength: hitKnockback(client, msg.ranged === true),
+      });
       if (died) setDead(room, victim);
       return;
     }
@@ -994,7 +1012,13 @@ function handleMessage(client: Client, raw: string): void {
         mob.position.z - client.pos.z,
       );
       if (dist > MAX_ATTACK_RANGE) return;
-      room.sim.damageMob(msg.mob as number, damage, client.id, client.pos);
+      room.sim.damageMob(
+        msg.mob as number,
+        damage,
+        client.id,
+        client.pos,
+        hitKnockback(client, msg.ranged === true),
+      );
       return;
     }
 

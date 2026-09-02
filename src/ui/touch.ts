@@ -10,6 +10,7 @@
 // little travel is a tap; holding still past TOUCH_LONG_PRESS_MS starts mining.
 
 import {
+  SPRINT_STICK_THRESHOLD,
   TOUCH_LONG_PRESS_MS,
   TOUCH_TAP_CANCEL_PX,
   TOUCH_TAP_MAX_MS,
@@ -22,6 +23,8 @@ export class TouchControls {
   moveStrafe = 0;
   jumpHeld = false;
   sneakOn = false;
+  /** Stick pushed to its edge: the touch way of asking to run. */
+  sprinting = false;
   /** True while a long-press is active: mine the targeted block. */
   holdActive = false;
   onPause: (() => void) | null = null;
@@ -89,6 +92,9 @@ export class TouchControls {
       const dead = len < JOYSTICK_DEAD_ZONE;
       this.moveStrafe = dead ? 0 : dx;
       this.moveForward = dead ? 0 : -dy;
+      // Pushing the stick all the way is how a finger says "run" — no extra
+      // button to reach for, and it is already the gesture people make.
+      this.sprinting = !dead && len >= SPRINT_STICK_THRESHOLD;
       const knobRange = radius * 0.6;
       this.knob.style.transform = `translate(calc(-50% + ${dx * knobRange}px), calc(-50% + ${dy * knobRange}px))`;
     };
@@ -96,6 +102,7 @@ export class TouchControls {
       this.joyPointer = -1;
       this.moveForward = 0;
       this.moveStrafe = 0;
+      this.sprinting = false;
       this.knob.style.transform = 'translate(-50%, -50%)';
     };
 

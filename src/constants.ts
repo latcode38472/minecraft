@@ -21,6 +21,18 @@ export const PLAYER_HEIGHT = 1.8;
 export const PLAYER_EYE_HEIGHT = 1.62;
 export const WALK_SPEED = 4.3; // blocks per second
 export const SNEAK_SPEED = 1.6;
+/** Sprinting is 1.3x walking, as in Minecraft: quicker, not a different game. */
+export const SPRINT_SPEED = 5.6;
+/** Too hungry to sprint below this, so the food cost has teeth. */
+export const SPRINT_MIN_HUNGER = 6;
+/** Degrees of extra field of view while sprinting — the sense of speed. */
+export const SPRINT_FOV_BOOST = 6;
+/** How fast the view widens and narrows again, in FOV units per second. */
+export const SPRINT_FOV_RATE = 28;
+/** Two taps of forward within this long latch a sprint, as in Minecraft. */
+export const SPRINT_DOUBLE_TAP_MS = 260;
+/** A touch stick pushed at least this far past centre means sprint. */
+export const SPRINT_STICK_THRESHOLD = 0.85;
 export const JUMP_SPEED = 8.2;
 export const GRAVITY = 24;
 export const WATER_GRAVITY = 6;
@@ -46,6 +58,13 @@ export const MAX_HUNGER = 20;
 export const HUNGER_IDLE_DRAIN_PER_S = 0.0035; // ~95 min from full to empty
 export const HUNGER_WALK_COST_PER_BLOCK = 0.0025; // on top of idle while moving
 export const HUNGER_SWIM_COST_PER_BLOCK = 0.006;
+/**
+ * Sprinting costs three times walking per block, and covers 1.3x the ground,
+ * so it drains roughly four times as fast — about seven minutes of solid
+ * sprinting on a full bar against twenty-four minutes of walking. Enough to
+ * make you think about food, not enough to make running a chore.
+ */
+export const HUNGER_SPRINT_COST_PER_BLOCK = 0.0075;
 export const HUNGER_JUMP_COST = 0.04;
 export const HUNGER_ATTACK_COST = 0.03;
 export const HUNGER_MINE_COST = 0.01; // per block broken
@@ -70,8 +89,28 @@ export const DROWN_INTERVAL_S = 1;
 export const PLAYER_ATTACK_RANGE = 3.5;
 export const FIST_DAMAGE = 1;
 export const FIST_COOLDOWN_S = 0.35;
-export const KNOCKBACK_SPEED = 6;
-export const KNOCKBACK_LIFT = 3.2;
+/**
+ * Knockback. Every way of dealing damage names its own strength (see the
+ * `attack` stats in items/items.ts and `knockback` in shared/mobs.ts); these
+ * turn that number into movement.
+ *
+ * A shove decays exponentially, so the distance travelled is very close to
+ * `strength / KNOCKBACK_DRAG` blocks: a bare fist moves something half a
+ * block, a diamond axe — the heaviest hit in the game — just over one. That
+ * is deliberately short. Knockback should interrupt and separate, not launch.
+ */
+export const KNOCKBACK_DRAG = 6;
+/** A shove overrides a mob's own movement for this long, then it recovers. */
+export const KNOCKBACK_TIME_S = 0.5;
+/** Every hit pops the target up a little; heavier hits, slightly more. */
+export const KNOCKBACK_LIFT_BASE = 2.6;
+export const KNOCKBACK_LIFT_PER_STRENGTH = 0.12;
+/** Nothing is ever shoved harder than this, whatever asks for it. */
+export const MAX_KNOCKBACK = 8;
+/** Bare hands. Every weapon is measured against this. */
+export const FIST_KNOCKBACK = 3.2;
+/** An arrow's shove, wherever it came from. */
+export const ARROW_KNOCKBACK = 4;
 /** Fraction of damage a raised shield absorbs. */
 export const BLOCK_DAMAGE_REDUCTION = 0.66;
 /** Movement multiplier while blocking. */

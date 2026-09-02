@@ -1049,6 +1049,178 @@ try {
     await context.close();
   });
 
+  await testCase('sprinting is faster, widens the view, and costs more food', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    // A long flat corridor, so nothing but the gait decides the distance.
+    await page.evaluate(() => {
+      const v = window.__voxel;
+      v.autoQuality?.disable();
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dz = -60; dz <= 4; dz++) {
+        for (let dx = -3; dx <= 3; dx++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, v.Block.Stone);
+          for (let dy = 0; dy < 4; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      v.look.yaw = 0;
+      v.look.pitch = 0;
+    });
+    await sleep(1200);
+
+    /** Hold forward (optionally with Ctrl) and report distance and food spent. */
+    const run = async (sprint) => {
+      await page.evaluate((withCtrl) => {
+        const v = window.__voxel;
+        const p = v.player.position;
+        const bz = Math.round(p.z);
+        v.player.position.set(p.x, p.y, bz + 0.5);
+        v.survival.load(20, 20);
+        v.look.yaw = 0;
+        window.__runStart = { x: p.x, z: v.player.position.z, hunger: v.survival.hunger };
+        document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true }));
+        if (withCtrl) {
+          document.dispatchEvent(new KeyboardEvent('keydown', { code: 'ControlLeft', bubbles: true }));
+        }
+      }, sprint);
+      // Sample the actual ground speed as well as the distance: the frame loop
+      // clamps dt, so on a software renderer wall-clock distance understates
+      // how fast the player is really moving. Speed is frame-rate independent.
+      const speeds = [];
+      for (let i = 0; i < 20; i++) {
+        await sleep(120);
+        speeds.push(
+          await page.evaluate(() => {
+            const v = window.__voxel;
+            return Math.hypot(v.player.velocity.x, v.player.velocity.z);
+          }),
+        );
+      }
+      const out = await page.evaluate(() => {
+        const v = window.__voxel;
+        const s = window.__runStart;
+        return {
+          distance: Math.hypot(v.player.position.x - s.x, v.player.position.z - s.z),
+          hunger: s.hunger - v.survival.hunger,
+          sprinting: v.player.sprinting,
+          fov: v.getCameraFov(),
+        };
+      });
+      // The fastest sample: the steady-state speed, once moving.
+      out.speed = Math.max(...speeds);
+      await page.evaluate(() => {
+        document.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent('keyup', { code: 'ControlLeft', bubbles: true }));
+      });
+      await sleep(700);
+      return out;
+    };
+
+    const walked = await run(false);
+    const sprinted = await run(true);
+
+    assert.ok(walked.distance > 2, `the walk test did not move: ${walked.distance.toFixed(2)}`);
+    assert.equal(walked.sprinting, false, 'walking must not report sprinting');
+    assert.equal(sprinted.sprinting, true, 'Ctrl + forward must sprint');
+    const speedRatio = sprinted.speed / walked.speed;
+    assert.ok(
+      speedRatio > 1.15 && speedRatio < 1.5,
+      `sprinting runs at ${speedRatio.toFixed(2)}x walking (${walked.speed.toFixed(2)} -> ${sprinted.speed.toFixed(2)}), expected about 1.3x`,
+    );
+    assert.ok(
+      sprinted.distance > walked.distance,
+      `sprinting should also cover more ground: ${walked.distance.toFixed(2)} -> ${sprinted.distance.toFixed(2)}`,
+    );
+    assert.ok(sprinted.fov > walked.fov + 2, `the view should widen: ${walked.fov} -> ${sprinted.fov}`);
+
+    // More food per block, but nowhere near enough to be punishing.
+    const walkPerBlock = walked.hunger / walked.distance;
+    const sprintPerBlock = sprinted.hunger / sprinted.distance;
+    assert.ok(
+      sprintPerBlock > walkPerBlock * 1.5,
+      `sprinting should cost more per block (${sprintPerBlock} vs ${walkPerBlock})`,
+    );
+    assert.ok(
+      sprintPerBlock < walkPerBlock * 5,
+      `sprinting costs far too much per block (${sprintPerBlock} vs ${walkPerBlock})`,
+    );
+
+    // Too hungry to run: the food cost has to bite.
+    const starved = await page.evaluate(async () => {
+      const v = window.__voxel;
+      v.survival.load(20, 2);
+      document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keydown', { code: 'ControlLeft', bubbles: true }));
+      await new Promise((r) => setTimeout(r, 600));
+      const sprinting = v.player.sprinting;
+      document.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keyup', { code: 'ControlLeft', bubbles: true }));
+      return sprinting;
+    });
+    assert.equal(starved, false, 'a starving player must not be able to sprint');
+    await context.close();
+  });
+
+  await testCase('a hit shoves the player back, then hands the controls straight back', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+
+    const at = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.autoQuality?.disable();
+      const p = v.player.position;
+      const bx = Math.round(p.x), bz = Math.round(p.z), by = Math.floor(p.y);
+      for (let dz = -10; dz <= 10; dz++) {
+        for (let dx = -10; dx <= 10; dx++) {
+          v.world.setBlock(bx + dx, by - 1, bz + dz, v.Block.Stone);
+          for (let dy = 0; dy < 5; dy++) v.world.setBlock(bx + dx, by + dy, bz + dz, 0);
+        }
+      }
+      v.player.position.set(bx + 0.5, by, bz + 0.5);
+      return { bx, by, bz };
+    });
+    await sleep(1200);
+
+    // A zombie right on top of the player, which will punch within a second.
+    const before = await page.evaluate((a) => {
+      const v = window.__voxel;
+      v.spawnTestMob('zombie', a.bx + 1.2, a.by, a.bz + 0.5);
+      return { x: v.player.position.x, z: v.player.position.z, health: v.survival.health };
+    }, at);
+
+    const hit = await until(
+      page,
+      () => (window.__voxel.survival.health < 20 ? window.__voxel.survival.health : 0),
+      30000,
+      'the zombie to land a punch',
+    );
+    assert.ok(hit < before.health, 'the zombie must actually hit');
+
+    // The shove moves the player away from the zombie, and not very far.
+    const moved = await page.evaluate((b) => {
+      const v = window.__voxel;
+      return {
+        dx: v.player.position.x - b.x,
+        distance: Math.hypot(v.player.position.x - b.x, v.player.position.z - b.z),
+      };
+    }, before);
+    assert.ok(moved.distance > 0.15, `the hit did not move the player: ${moved.distance.toFixed(2)}`);
+    assert.ok(moved.distance < 4, `the hit threw the player ${moved.distance.toFixed(2)} blocks`);
+    assert.ok(moved.dx < 0, 'the player should be pushed away from the zombie, not into it');
+
+    // And the shove must fade rather than sticking.
+    await until(
+      page,
+      () => window.__voxel.player.knockback.length() === 0,
+      15000,
+      'the shove to fade',
+    );
+    await context.close();
+  });
+
   await testCase('sleeping in a bed at night brings the morning', async () => {
     const { context, page } = await openGame(browser);
     await startSingleplayer(page);

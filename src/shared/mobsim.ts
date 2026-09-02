@@ -10,13 +10,16 @@
 
 import { Block } from '../blocks.ts';
 import {
+  FIST_KNOCKBACK,
   GRAVITY,
+  KNOCKBACK_TIME_S,
   NIGHT_END,
   NIGHT_START,
   TERMINAL_VELOCITY,
   WOOL_REGROW_S,
   ZOMBIE_DETECT_RANGE,
 } from '../constants.ts';
+import { clampKnockback, knockbackDecay, knockbackLift } from './combat.ts';
 import {
   MOB_FLAG_COLOR_SHIFT,
   MOB_FLAG_GRAZING,
@@ -94,8 +97,14 @@ export interface SimPlayer {
 
 /** What the simulation reports back to whoever is driving it. */
 export interface SimEvents {
-  /** A mob landed a hit on a player. */
-  onPlayerHit(playerId: string, damage: number, fromX: number, fromZ: number): void;
+  /** A mob landed a hit on a player. `knockback` is how hard it shoves them. */
+  onPlayerHit(
+    playerId: string,
+    damage: number,
+    fromX: number,
+    fromZ: number,
+    knockback: number,
+  ): void;
   /** A mob died; `killerId` is whoever last damaged it, if anyone. */
   onMobDied(mob: MobSim, killerId: string | null): void;
   /** A skeleton loosed an arrow. The room turns this into a real projectile. */
@@ -124,6 +133,12 @@ export class MobSim {
   dead = false;
   /** Seconds of hurt flash left; doubles as a damage cooldown. */
   hurtTime = 0;
+  /**
+   * Seconds of shove left. While this is running the mob cannot steer, which
+   * is the whole point of knockback: it interrupts. Without it the AI would
+   * overwrite the shove on the very next frame and nothing would move.
+   */
+  knockbackTime = 0;
   /** Who last damaged this mob — decides who receives the loot. */
   lastAttackerId: string | null = null;
   /** Seconds left of the swing animation clients should be drawing. */
@@ -172,19 +187,19 @@ export class MobSim {
     return this.def.shape;
   }
 
-  takeDamage(amount: number, fromX: number, fromZ: number, attackerId: string | null): void {
+  takeDamage(
+    amount: number,
+    fromX: number,
+    fromZ: number,
+    attackerId: string | null,
+    knockback = FIST_KNOCKBACK,
+  ): void {
     if (this.hurtTime > 0 || this.dead) return;
     this.health -= amount;
     this.hurtTime = HURT_FLASH_S;
     this.lastAttackerId = attackerId;
     this.grazeTime = 0;
-
-    const dx = this.position.x - fromX;
-    const dz = this.position.z - fromZ;
-    const len = Math.hypot(dx, dz) || 1;
-    this.velocity.x = (dx / len) * 6;
-    this.velocity.z = (dz / len) * 6;
-    this.velocity.y = Math.max(this.velocity.y, 3.2);
+    this.shove(fromX, fromZ, knockback);
 
     if (!this.def.hostile) {
       this.fleeTime = FLEE_DURATION_S;
@@ -193,10 +208,36 @@ export class MobSim {
     if (this.health <= 0) this.dead = true;
   }
 
+  /**
+   * Push away from a point. The velocity decays rather than being cancelled,
+   * so the mob slides a short way and recovers — see KNOCKBACK_DRAG for the
+   * distance that works out to.
+   */
+  shove(fromX: number, fromZ: number, strength: number): void {
+    const force = clampKnockback(strength);
+    if (force === 0) return;
+    const dx = this.position.x - fromX;
+    const dz = this.position.z - fromZ;
+    // Straight down on top of it: pick a direction rather than divide by zero.
+    const len = Math.hypot(dx, dz);
+    const nx = len > 1e-4 ? dx / len : Math.sin(this.yaw);
+    const nz = len > 1e-4 ? dz / len : Math.cos(this.yaw);
+    this.velocity.x = nx * force;
+    this.velocity.z = nz * force;
+    if (this.onGround) this.velocity.y = Math.max(this.velocity.y, knockbackLift(force));
+    this.knockbackTime = KNOCKBACK_TIME_S;
+  }
+
   update(dt: number, world: BlockQuery, players: SimPlayer[], events: SimEvents): void {
     this.hurtTime = Math.max(0, this.hurtTime - dt);
     this.attackCooldown = Math.max(0, this.attackCooldown - dt);
     this.swingTime = Math.max(0, this.swingTime - dt);
+    if (this.knockbackTime > 0) {
+      this.knockbackTime = Math.max(0, this.knockbackTime - dt);
+      const decay = knockbackDecay(dt);
+      this.velocity.x *= decay;
+      this.velocity.z *= decay;
+    }
 
     if (this.sheared) {
       this.woolTimer = Math.max(0, this.woolTimer - dt);
@@ -271,8 +312,7 @@ export class MobSim {
       this.yaw = Math.atan2(dx / distance, dz / distance);
     } else {
       // Committed to the shot: plant the feet so the arrow goes where it aimed.
-      this.velocity.x = 0;
-      this.velocity.z = 0;
+      this.halt();
     }
 
     if (this.reloadTime > 0) {
@@ -390,7 +430,13 @@ export class MobSim {
         Math.abs(dy) < 2 &&
         this.attackCooldown === 0
       ) {
-        events.onPlayerHit(target.id, this.def.attackDamage, this.position.x, this.position.z);
+        events.onPlayerHit(
+          target.id,
+          this.def.attackDamage,
+          this.position.x,
+          this.position.z,
+          this.def.knockback,
+        );
         this.attackCooldown = this.def.attackCooldown;
         this.swingTime = SWING_TIME_S;
       }
@@ -444,8 +490,7 @@ export class MobSim {
       return;
     }
 
-    this.velocity.x = 0;
-    this.velocity.z = 0;
+    this.halt();
     if (this.grazeTime > 0) {
       this.grazeTime = Math.max(0, this.grazeTime - dt);
       this.headYaw *= Math.max(0, 1 - dt * 6);
@@ -494,8 +539,7 @@ export class MobSim {
       return;
     }
 
-    this.velocity.x = 0;
-    this.velocity.z = 0;
+    this.halt();
     const visitor = this.nearestPlayer(players, VILLAGER_GREET_RANGE);
     if (visitor) {
       // Face the visitor with the whole body; the head follows the body.
@@ -540,15 +584,17 @@ export class MobSim {
   private walkToward(world: BlockQuery, dirX: number, dirZ: number, speed: number): void {
     const len = Math.hypot(dirX, dirZ);
     if (len < 1e-4) {
-      this.velocity.x = 0;
-      this.velocity.z = 0;
+      this.halt();
       return;
     }
     const nx = dirX / len;
     const nz = dirZ / len;
+    this.yaw = Math.atan2(nx, nz);
+    // Mid-shove the mob still turns to face where it wants to go, but its feet
+    // are not its own: the knockback carries it until it wears off.
+    if (this.knockbackTime > 0) return;
     this.velocity.x = nx * speed;
     this.velocity.z = nz * speed;
-    this.yaw = Math.atan2(nx, nz);
 
     if (this.onGround) {
       const ax = Math.floor(this.position.x + nx * (this.shape.halfWidth + 0.35));
@@ -558,6 +604,13 @@ export class MobSim {
         this.velocity.y = JUMP_SPEED;
       }
     }
+  }
+
+  /** Stand still — unless a shove is carrying the mob, which outranks it. */
+  private halt(): void {
+    if (this.knockbackTime > 0) return;
+    this.velocity.x = 0;
+    this.velocity.z = 0;
   }
 
   private applyGravity(dt: number, world: BlockQuery): void {

@@ -18,6 +18,7 @@ import {
   HUNGER_IDLE_DRAIN_PER_S,
   HUNGER_JUMP_COST,
   HUNGER_MINE_COST,
+  HUNGER_SPRINT_COST_PER_BLOCK,
   HUNGER_SWIM_COST_PER_BLOCK,
   HUNGER_WALK_COST_PER_BLOCK,
   HURT_INVULN_S,
@@ -145,7 +146,13 @@ export class Survival {
     const walked = Math.hypot(dx, dz);
     this.lastPos.copy(player.position);
 
-    const perBlock = player.feetInWater ? HUNGER_SWIM_COST_PER_BLOCK : HUNGER_WALK_COST_PER_BLOCK;
+    // Running is the expensive way to travel, and it also covers more ground,
+    // so the two multiply: roughly four times the drain of walking.
+    const perBlock = player.sprinting
+      ? HUNGER_SPRINT_COST_PER_BLOCK
+      : player.feetInWater
+        ? HUNGER_SWIM_COST_PER_BLOCK
+        : HUNGER_WALK_COST_PER_BLOCK;
     this.spendHunger(HUNGER_IDLE_DRAIN_PER_S * dt + walked * perBlock);
   }
 

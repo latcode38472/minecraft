@@ -13,6 +13,7 @@
 import {
   CROP_GROWTH_MEAN_S,
   DAY_LENGTH_SECONDS,
+  FIST_KNOCKBACK,
   MAX_MOBS,
   MOB_DESPAWN_DISTANCE,
   MOB_SPAWN_INTERVAL_S,
@@ -37,6 +38,7 @@ import type {
   MobStateData,
   SleepStateData,
 } from '../net/protocol.ts';
+import { arrowKnockback } from './combat.ts';
 import { blockDrops } from './harvest.ts';
 import { VILLAGE_CHEST_LOOT, positionSeed, rollLoot, seededRandom, type LootRoll } from './loot.ts';
 import { MOB_DEFS, pickSpawnKind, type MobKind } from './mobs.ts';
@@ -98,8 +100,17 @@ const HERD_SPREAD = 3;
 export type WakeReason = 'morning' | 'bed_gone' | 'dead';
 
 export interface SimulationHooks {
-  /** A mob hit a player; the room applies it to that player's health. */
-  damagePlayer(playerId: string, amount: number, fromX: number, fromZ: number): void;
+  /**
+   * A mob hit a player; the room applies it to that player's health and
+   * shoves them away from (fromX, fromZ) with the given knockback strength.
+   */
+  damagePlayer(
+    playerId: string,
+    amount: number,
+    fromX: number,
+    fromZ: number,
+    knockback: number,
+  ): void;
   /** A player walked over a drop; return how many items did NOT fit. */
   giveItems(playerId: string, itemId: string, count: number, damage?: number): number;
   /** The simulation changed a block by itself: a crop grew, a furnace lit. */
@@ -182,8 +193,8 @@ export class RoomSimulation {
     for (const crop of this.world.drainNewCrops?.() ?? []) this.registerCrop(crop.x, crop.y, crop.z);
 
     const events = {
-      onPlayerHit: (id: string, damage: number, fromX: number, fromZ: number) =>
-        this.hooks.damagePlayer(id, damage, fromX, fromZ),
+      onPlayerHit: (id: string, damage: number, fromX: number, fromZ: number, knockback: number) =>
+        this.hooks.damagePlayer(id, damage, fromX, fromZ, knockback),
       onMobDied: () => {},
       onMobShoot: (from: Vec3, dir: Vec3, speed: number, damage: number, shooterId: number) => {
         if (this.arrows.size >= MAX_ARROWS) return;
@@ -237,7 +248,13 @@ export class RoomSimulation {
     for (const [id, arrow] of [...this.arrows]) {
       const hit = arrow.update(dt, this.world, players);
       if (hit) {
-        this.hooks.damagePlayer(hit.id, arrow.damage, arrow.position.x, arrow.position.z);
+        this.hooks.damagePlayer(
+          hit.id,
+          arrow.damage,
+          arrow.position.x,
+          arrow.position.z,
+          arrowKnockback(),
+        );
       }
       if (arrow.dead) {
         this.arrows.delete(id);
@@ -347,13 +364,23 @@ export class RoomSimulation {
     }
   }
 
-  /** Apply damage from a player to a mob; returns true if it connected. */
-  damageMob(mobId: number, damage: number, attackerId: string, from: Vec3): boolean {
+  /**
+   * Apply damage from a player to a mob; returns true if it connected.
+   * `knockback` is the shove the attacker's weapon carries — the caller looks
+   * it up, because only it knows what was in the attacker's hand.
+   */
+  damageMob(
+    mobId: number,
+    damage: number,
+    attackerId: string,
+    from: Vec3,
+    knockback = FIST_KNOCKBACK,
+  ): boolean {
     const mob = this.mobs.get(mobId);
     if (!mob || mob.dead) return false;
     // The client already paced the swing; don't double-gate on hurt time.
     mob.hurtTime = 0;
-    mob.takeDamage(damage, from.x, from.z, attackerId);
+    mob.takeDamage(damage, from.x, from.z, attackerId, knockback);
     return true;
   }
 

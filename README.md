@@ -70,6 +70,7 @@ without it the suite says so and exits successfully rather than failing.
 | Click | capture mouse (Esc releases) |
 | W A S D | move |
 | Mouse | look |
+| Ctrl (hold) or double-tap W | sprint — 1.3x speed, more food |
 | Space | jump / swim up |
 | Shift | sneak / swim down |
 | Left click (hold) | mine the targeted block / attack a mob |
@@ -101,6 +102,7 @@ landscape):
 | Input | Action |
 | --- | --- |
 | Left pad | move (analog) |
+| Left pad, pushed to the edge | sprint |
 | Drag anywhere else | look |
 | Hold | mine the targeted block / attack a mob |
 | Tap | place block, eat food, use a table / furnace / chest / bed, till, plant, shear |
@@ -249,7 +251,8 @@ Two things that will bite you:
 
 | Synchronised | Not synchronised |
 | --- | --- |
-| Player position, yaw, pitch, held item, and movement/jump/sneak/swing/use/hurt/dead/sleeping flags | Fall, drowning and starvation damage are computed on the client that suffers them (reported, clamped) |
+| Player position, yaw, pitch, held item, and movement/jump/sneak/sprint/swing/use/hurt/dead/sleeping flags | Fall, drowning and starvation damage are computed on the client that suffers them (reported, clamped) |
+| Knockback, with the strength derived server-side from the attacker's hand | |
 | Joins, leaves, display names, room roster, host changes | |
 | Block breaks and placements (server-authoritative, reach- and item-checked) | |
 | Inventories, armour, the crafting grid and cursor (server-authoritative) | |
@@ -349,8 +352,21 @@ for two seconds so it does not snap straight back.
   every shot — that draw is your cue to dodge or break cover. They aim with a
   real ballistic solution (plus a little spread), so the arc is right at any
   range, and they drop bones and arrows
+- **Sprinting**: hold Ctrl or double-tap forward (on touch, push the stick to
+  its edge) to run at 1.3x walking speed. The view widens a little, other
+  players see the longer stride, and it costs about four times the food per
+  second — roughly seven minutes of solid running on a full bar against
+  twenty-four of walking. Below 6 hunger you cannot sprint at all
 - **Melee**: swords, axes and pickaxes in four tiers, each with its own damage
   and attack cooldown; bare fists do 1
+- **Knockback**: every way of dealing damage shoves what it hits by its own
+  amount, from a pair of shears at half a block to a diamond axe at just over
+  one. Heavier, slower weapons push hardest — an axe further than a sword of
+  the same tier, a sword further than a pickaxe — and arrows and a zombie's
+  punch have their own. The shove decays rather than being cancelled, so a hit
+  interrupts and separates without launching anything: `strength / drag` is
+  the distance, and it is capped. In multiplayer the server looks the strength
+  up from its own copy of the attacker's hand, so it cannot be forged
 - **Bow and arrows**: hold to draw (a charge bar fills), release to fire.
   Damage and speed scale with draw; arrows are swept against the voxel grid so
   they cannot tunnel through walls, and they hit mobs and players
@@ -434,6 +450,7 @@ src/
     containers.ts    slot clicks, quick-move, grid crafting, chest/furnace slots
   shared/            runs identically in the browser and in Node
     voxel.ts         AABB-vs-voxel collision and ray/box tests, no THREE
+    combat.ts        knockback: strength per damage source, decay and distance
     mobs.ts          mob registry: stats, shapes, loot and spawn rules
     loot.ts          loot tables (mobs, shears, village chests), seeded rolls
     harvest.ts       break time, tool tiers, what a block drops
@@ -466,6 +483,7 @@ server/
 tests/
   simulation.test.ts headless: terrain, mobs, loot, drops, memory bounds
   gameplay.test.ts   clicks, grid crafting, furnaces, chests, crops, beds, saves, villages
+  combat.test.ts     knockback per weapon, how far it really moves a mob, sprint costs
   protocol.test.ts   every sanitiser, from an attacker's point of view
   animation.test.ts  rigs, gait, hand strokes, crack stages, the snapshot clock
   survival.test.ts   health, breath, drowning, and what the death screen says

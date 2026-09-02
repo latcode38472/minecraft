@@ -49,7 +49,13 @@ export interface ItemDef {
   maxStack: number;
   block?: Block;
   tool?: ToolStats;
-  attack?: { damage: number; cooldown: number };
+  /**
+   * Melee stats. `knockback` is how hard a landed hit shoves what it hits, in
+   * the units shared/combat.ts turns into movement: a bare fist is 3.2, and
+   * nothing goes above the diamond axe's 6.5. Heavier, slower weapons push
+   * hardest; a pickaxe or a pair of shears barely more than a punch.
+   */
+  attack?: { damage: number; cooldown: number; knockback: number };
   food?: FoodStats;
   armor?: ArmorStats;
   /** Ranged weapon: charges up, then fires the named ammo item. */
@@ -174,7 +180,8 @@ TOOL_TIERS.forEach((t, i) => {
     tile: PICKAXE_TILES[i],
     maxStack: 1,
     tool: { kind: 'pickaxe', tier: t.tier, speed: t.speed, durability: t.durability },
-    attack: { damage: 1 + t.tier, cooldown: 0.45 },
+    // A pickaxe is for stone. Swung at something alive it is barely a punch.
+    attack: { damage: 1 + t.tier, cooldown: 0.45, knockback: 3.4 + t.tier * 0.2 },
   });
   register({
     id: `${t.key}_axe`,
@@ -182,7 +189,8 @@ TOOL_TIERS.forEach((t, i) => {
     tile: AXE_TILES[i],
     maxStack: 1,
     tool: { kind: 'axe', tier: t.tier, speed: t.speed, durability: t.durability },
-    attack: { damage: 2 + t.tier, cooldown: 0.6 },
+    // The heaviest swing in the game: slowest, and it shoves hardest.
+    attack: { damage: 2 + t.tier, cooldown: 0.6, knockback: 4.5 + t.tier * 0.5 },
   });
   register({
     id: `${t.key}_sword`,
@@ -190,7 +198,8 @@ TOOL_TIERS.forEach((t, i) => {
     tile: SWORD_TILES[i],
     maxStack: 1,
     tool: { kind: 'sword', tier: t.tier, speed: 1.5, durability: t.durability },
-    attack: { damage: 3 + t.tier, cooldown: 0.35 },
+    // Fast and sharp: more damage than an axe over time, less shove per blow.
+    attack: { damage: 3 + t.tier, cooldown: 0.35, knockback: 4 + t.tier * 0.4 },
   });
   register({
     id: `${t.key}_hoe`,
@@ -198,7 +207,7 @@ TOOL_TIERS.forEach((t, i) => {
     tile: HOE_TILES[i],
     maxStack: 1,
     tool: { kind: 'hoe', tier: t.tier, speed: t.speed, durability: t.durability },
-    attack: { damage: 1, cooldown: 0.4 },
+    attack: { damage: 1, cooldown: 0.4, knockback: 3.4 },
   });
 });
 register({
@@ -207,7 +216,8 @@ register({
   tile: ItemTile.Shears,
   maxStack: 1,
   tool: { kind: 'shears', tier: 1, speed: 6, durability: 238 },
-  attack: { damage: 1, cooldown: 0.4 },
+  // Snips rather than swings: the gentlest hit there is.
+  attack: { damage: 1, cooldown: 0.4, knockback: 3 },
 });
 
 // --- Combat gear ---
@@ -217,7 +227,8 @@ register({
   tile: ItemTile.Bow,
   maxStack: 1,
   ranged: { ammo: 'arrow', maxDamage: 9, drawTime: 1.0, durability: 384 },
-  attack: { damage: 1, cooldown: 0.5 },
+  // Hitting someone with the bow itself; the arrow has its own shove.
+  attack: { damage: 1, cooldown: 0.5, knockback: 3 },
 });
 material('arrow', 'Arrow', ItemTile.Arrow);
 register({

@@ -44,6 +44,8 @@ export interface MobDef {
   attackDamage: number;
   attackRange: number;
   attackCooldown: number;
+  /** How hard its blow shoves a player; 0 for anything that does not fight. */
+  knockback: number;
   /** Animals drop their head to eat grass now and then. */
   grazes: boolean;
   /** Never despawned for being far away — villagers stay with their village. */
@@ -67,6 +69,7 @@ export const MOB_DEFS: Record<MobKind, MobDef> = {
     attackDamage: 3,
     attackRange: 1.7,
     attackCooldown: 1.1,
+    knockback: 4.2,
     grazes: false,
     persistent: false,
     loot: MOB_LOOT.zombie,
@@ -84,6 +87,7 @@ export const MOB_DEFS: Record<MobKind, MobDef> = {
     attackDamage: 0,
     attackRange: 0,
     attackCooldown: 0,
+    knockback: 0,
     grazes: false,
     persistent: false,
     loot: MOB_LOOT.skeleton,
@@ -100,6 +104,7 @@ export const MOB_DEFS: Record<MobKind, MobDef> = {
     attackDamage: 0,
     attackRange: 0,
     attackCooldown: 0,
+    knockback: 0,
     grazes: false,
     persistent: false,
     loot: MOB_LOOT.pig,
@@ -116,6 +121,7 @@ export const MOB_DEFS: Record<MobKind, MobDef> = {
     attackDamage: 0,
     attackRange: 0,
     attackCooldown: 0,
+    knockback: 0,
     grazes: true,
     persistent: false,
     loot: MOB_LOOT.cow,
@@ -132,6 +138,7 @@ export const MOB_DEFS: Record<MobKind, MobDef> = {
     attackDamage: 0,
     attackRange: 0,
     attackCooldown: 0,
+    knockback: 0,
     grazes: true,
     persistent: false,
     loot: MOB_LOOT.sheep,
@@ -148,6 +155,7 @@ export const MOB_DEFS: Record<MobKind, MobDef> = {
     attackDamage: 0,
     attackRange: 0,
     attackCooldown: 0,
+    knockback: 0,
     grazes: false,
     persistent: true,
     loot: MOB_LOOT.villager,
