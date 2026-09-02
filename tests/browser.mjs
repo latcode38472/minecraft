@@ -1028,6 +1028,24 @@ try {
       const after = await page.evaluate(() => window.__voxel.look.yaw);
       assert.notEqual(after, before, 'the camera must turn with the mouse again');
     }
+
+    // 5. The safety net. Force the state that should be unreachable — free
+    //    cursor, no screen, no menu — and check that the click a stuck player
+    //    would try still gets them back in.
+    await page.evaluate(() => document.exitPointerLock());
+    await sleep(400);
+    await page.evaluate(() => {
+      document.getElementById('menu').style.display = 'none';
+    });
+    const stranded = await state();
+    assert.equal(stranded.locked, false, 'the test must actually strand the player first');
+    assert.equal(stranded.menu, 'none');
+    await page.mouse.click(512, 350);
+    await sleep(900);
+    assert.ok(
+      (await state()).locked,
+      'clicking the world must recover from a stranded state, whatever caused it',
+    );
     await context.close();
   });
 

@@ -537,6 +537,21 @@ async function boot(choice: StartChoice): Promise<void> {
    */
   document.addEventListener('pointerlockerror', () => offerMenu());
 
+  /**
+   * Last line of defence: a click on the world itself resumes play whenever
+   * nothing is on screen to explain why it would not.
+   *
+   * The menu covers the canvas whenever it is up, so this only ever fires in
+   * the state that should not exist — free cursor, no screen, no menu. That
+   * makes the click a stuck player instinctively tries the one that gets them
+   * moving again, whatever went wrong upstream.
+   */
+  renderer.domElement.addEventListener('pointerdown', () => {
+    if (touchDevice || look.locked || inventoryUi.open || survival.dead || sleeping) return;
+    initAudio();
+    resumePlay();
+  });
+
   function offerMenu(): void {
     if (touchDevice || look.locked || inventoryUi.open || survival.dead || sleeping) return;
     menu.style.display = 'flex';
