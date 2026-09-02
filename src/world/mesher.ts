@@ -177,25 +177,69 @@ export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeo
         const def = BLOCKS[id];
         const target = isWater ? water : cut ? cutout : opaque;
 
+        if (def.shape === 'cross') {
+          // Crops: two diagonal sprites, drawn from both sides, never culled.
+          emitCross(cutout, lx, y, lz, def.tiles.side);
+          continue;
+        }
+
+        const slab = def.shape === 'slab';
         for (const face of FACES) {
           const neighbor = sample(wx + face.dir[0], y + face.dir[1], wz + face.dir[2]);
           if (isWater) {
             if (neighbor !== Block.Air) continue;
+          } else if (slab && face.kind === 'top') {
+            // A slab's top sits below the cell's ceiling, so a block above it
+            // never fully hides it.
           } else if (cut) {
             // Cull against opaque neighbours and against the same block, so a
             // glass wall has no interior faces but still shows through.
-            if (isOpaque(neighbor) || neighbor === id) continue;
-          } else if (isOpaque(neighbor)) {
+            if (coversFace(neighbor) || neighbor === id) continue;
+          } else if (coversFace(neighbor)) {
             continue;
           }
           const tile = def.tiles[face.kind];
-          emitFace(target, face, lx, y, lz, wx, wz, tile, isWater, sample);
+          emitFace(target, face, lx, y, lz, wx, wz, tile, isWater, sample, slab ? def.height : 1);
         }
       }
     }
   }
 
   return { opaque: opaque.build(), cutout: cutout.build(), water: water.build() };
+}
+
+/**
+ * Only a full opaque cube hides a neighbour's face completely. A slab leaves
+ * a slit above itself, so faces beside it must still be drawn or the gap
+ * would show straight through the world.
+ */
+function coversFace(id: number): boolean {
+  return isOpaque(id) && BLOCKS[id].shape === 'cube';
+}
+
+/** Two diagonal quads through the cell; the cutout material draws both sides. */
+function emitCross(out: MeshBuilder, lx: number, y: number, lz: number, tile: number): void {
+  const [u0, v0, u1, v1] = tileUVRect(tile);
+  const quads: [number, number, number, number][] = [
+    [0, 0, 1, 1],
+    [1, 0, 0, 1],
+  ];
+  for (const [xa, za, xb, zb] of quads) {
+    const base = out.positions.length / 3;
+    const corners: [number, number, number, number, number][] = [
+      [lx + xa, y, lz + za, 0, 0],
+      [lx + xb, y, lz + zb, 1, 0],
+      [lx + xb, y + 1, lz + zb, 1, 1],
+      [lx + xa, y + 1, lz + za, 0, 1],
+    ];
+    for (const [px, py, pz, u, v] of corners) {
+      out.positions.push(px, py, pz);
+      out.normals.push(0, 1, 0);
+      out.colors.push(0.95, 0.95, 0.95);
+      out.uvs.push(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v);
+    }
+    out.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
 }
 
 function emitFace(
@@ -209,8 +253,11 @@ function emitFace(
   tile: number,
   isWater: boolean,
   sample: BlockSampler,
+  height = 1,
 ): void {
-  const [u0, v0, u1, v1] = tileUVRect(tile);
+  const [u0, v0, u1, v1full] = tileUVRect(tile);
+  // Shorter blocks show only the lower part of their side texture.
+  const v1 = face.kind === 'side' ? v0 + (v1full - v0) * height : v1full;
   const base = out.positions.length / 3;
   const [nx, ny, nz] = face.dir;
   // The air cell the face looks into; AO neighbours live in its plane.
@@ -225,7 +272,7 @@ function emitFace(
   const ao: number[] = [];
   for (const corner of face.corners) {
     let px = lx + corner.pos[0];
-    let py = y + corner.pos[1];
+    let py = y + corner.pos[1] * height;
     let pz = lz + corner.pos[2];
     if (lowerTop && corner.pos[1] === 1) py = y + WATER_SURFACE_Y;
 

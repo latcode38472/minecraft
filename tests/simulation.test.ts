@@ -9,6 +9,7 @@ import test from 'node:test';
 import { ServerWorld } from '../server/world.ts';
 import { RoomSimulation } from '../src/shared/roomsim.ts';
 import { ArrowSim, MobSim, isNightTime, solveArrowArc } from '../src/shared/mobsim.ts';
+import { MOB_DEFS } from '../src/shared/mobs.ts';
 import { moveWithCollision, rayBoxDistance } from '../src/shared/voxel.ts';
 import { Block } from '../src/blocks.ts';
 import { MAX_MOBS, NIGHT_START } from '../src/constants.ts';
@@ -86,8 +87,8 @@ test('mobs spawn at night, on the ground, and stay grounded', () => {
   assert.ok(sim.mobs.size > 0, 'night should populate the room with hostiles');
   const mobs = [...sim.mobs.values()];
   assert.ok(
-    mobs.every((m) => m.kind === 'zombie' || m.kind === 'skeleton'),
-    'only hostiles spawn at night',
+    mobs.every((m) => MOB_DEFS[m.kind].hostile),
+    `only hostiles spawn at night, got ${mobs.map((m) => m.kind)}`,
   );
   // Every mob must be resting on something solid, not floating or sunk.
   for (const mob of mobs) {
@@ -127,9 +128,10 @@ test('daytime spawns passive mobs instead of hostiles', () => {
   run(sim, [player], 60);
 
   assert.ok(sim.mobs.size > 0, 'daytime should still populate the room');
+  const kinds = [...sim.mobs.values()].map((m) => m.kind);
   assert.ok(
-    [...sim.mobs.values()].every((m) => m.kind === 'pig'),
-    'daylight spawns passive mobs only',
+    kinds.every((k) => !MOB_DEFS[k].hostile),
+    `daylight spawns passive mobs only, got ${kinds}`,
   );
 });
 

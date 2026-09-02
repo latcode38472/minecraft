@@ -786,6 +786,197 @@ try {
     await context.close();
   });
 
+  // --- Crafting, containers, beds, death and villages ---
+  await testCase('the crafting grid turns a log into planks, from the pocket and the table', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    const result = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.inventory.add('log', 2);
+      const pocket = v.__craftAt('planks', 'none');
+      const planks = v.inventory.count('planks');
+      v.inventory.add('cobblestone', 3);
+      v.inventory.add('stick', 2);
+      const denied = v.__craftAt('stone_pickaxe', 'none');
+      const table = v.__craftAt('stone_pickaxe', 'table');
+      return { pocket, planks, denied, table, picks: v.inventory.count('stone_pickaxe'), open: v.inventoryUi.open };
+    });
+    assert.equal(result.pocket, true, 'planks come out of the pocket grid');
+    assert.equal(result.planks, 4);
+    assert.equal(result.denied, false, 'a pickaxe does not fit a 2x2 grid');
+    assert.equal(result.table, true, 'but a crafting table makes it');
+    assert.equal(result.picks, 1);
+
+    // The screen itself shows the grid and the recipe book.
+    await page.evaluate(() => {
+      window.__voxel.inventoryCtl.openGrid(3);
+      window.__voxel.inventoryUi.show();
+    });
+    const screen = await page.evaluate(() => ({
+      cells: document.querySelectorAll('#inv-craft-grid .inv-slot').length,
+      recipes: document.querySelectorAll('#recipe-list .recipe').length,
+      title: document.getElementById('inv-title').textContent,
+    }));
+    assert.equal(screen.cells, 9, 'a table shows nine cells');
+    assert.ok(screen.recipes > 10, 'the recipe book lists the recipes');
+    assert.equal(screen.title, 'Crafting Table');
+    await page.evaluate(() => window.__voxel.inventoryUi.close());
+    await context.close();
+  });
+
+  await testCase('a furnace smelts ore over time and a chest keeps its contents', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    const at = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.autoQuality?.disable();
+      const p = v.player.position;
+      const bx = Math.floor(p.x) + 2, by = Math.floor(p.y), bz = Math.floor(p.z);
+      v.world.setBlock(bx, by, bz, v.Block.Furnace);
+      v.world.setBlock(bx + 1, by, bz, v.Block.Chest);
+      v.inventory.add('raw_iron', 1);
+      v.inventory.add('coal', 1);
+      v.inventory.add('diamond', 2);
+      const ctl = v.inventoryCtl;
+      if (!ctl.openContainer(bx, by, bz)) return null;
+      // Shift-click the ore and the coal into the furnace.
+      ctl.click({ kind: 'inv', index: v.inventory.slots.findIndex((s) => s && s.id === 'raw_iron') }, 0, true);
+      ctl.click({ kind: 'inv', index: v.inventory.slots.findIndex((s) => s && s.id === 'coal') }, 0, true);
+      const slots = ctl.container.slots.slots.map((s) => (s ? s.id : null));
+      return { bx, by, bz, slots };
+    });
+    assert.ok(at, 'the furnace must open as a container');
+    assert.deepEqual(at.slots, ['raw_iron', 'coal', null], 'ore in the top, fuel in the bottom');
+
+    // The world keeps going while the furnace screen is open: the flame and
+    // the arrow must move on screen, not wait for the screen to close.
+    await page.evaluate(() => window.__voxel.inventoryUi.show());
+    await until(
+      page,
+      () => {
+        const state = window.__voxel.inventoryCtl.furnaceState();
+        return state && state.burn > 0 && state.progress > 0;
+      },
+      20000,
+      'the furnace to burn while being watched',
+    );
+    const bars = await page.evaluate(() => ({
+      flame: document.getElementById('furnace-flame-bar').style.height,
+      arrow: document.getElementById('furnace-arrow-bar').style.width,
+      title: document.getElementById('inv-title').textContent,
+    }));
+    assert.equal(bars.title, 'Furnace');
+    assert.notEqual(bars.flame, '0%', 'the flame bar shows the fuel burning');
+    assert.notEqual(bars.arrow, '0%', 'the arrow shows smelting progress');
+    await page.evaluate(() => window.__voxel.inventoryUi.close());
+
+    // The furnace works whether or not anyone is looking at it: it lights up
+    // in the world, and an ingot comes out after the smelting time.
+    await until(
+      page,
+      new Function(
+        `const v = window.__voxel; return v.world.getBlock(${at.bx}, ${at.by}, ${at.bz}) === v.Block.LitFurnace;`,
+      ),
+      20000,
+      'the furnace to light',
+    );
+    const smelted = await until(
+      page,
+      () => {
+        for (const c of window.__voxel.getLocalSim().containers.values()) {
+          if (c.kind === 'furnace' && c.slots[2] && c.slots[2].id === 'iron_ingot') return true;
+        }
+        return false;
+      },
+      60000,
+      'the ore to smelt',
+    );
+    assert.ok(smelted, 'an ingot must come out');
+
+    // Put diamonds into the chest, close it, reopen: still there.
+    const kept = await page.evaluate((a) => {
+      const v = window.__voxel;
+      const ctl = v.inventoryCtl;
+      ctl.openContainer(a.bx + 1, a.by, a.bz);
+      ctl.click({ kind: 'inv', index: v.inventory.slots.findIndex((s) => s && s.id === 'diamond') }, 0, true);
+      ctl.close();
+      ctl.openContainer(a.bx + 1, a.by, a.bz);
+      const inChest = ctl.container.slots.slots.filter((s) => s && s.id === 'diamond').reduce((n, s) => n + s.count, 0);
+      ctl.close();
+      return { inChest, inBag: v.inventory.count('diamond') };
+    }, at);
+    assert.equal(kept.inChest, 2, 'the chest holds what was put in it');
+    assert.equal(kept.inBag, 0);
+    await context.close();
+  });
+
+  await testCase('sleeping in a bed at night brings the morning', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    const before = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.autoQuality?.disable();
+      const p = v.player.position;
+      const bx = Math.floor(p.x) + 1, by = Math.floor(p.y), bz = Math.floor(p.z);
+      v.world.setBlock(bx, by - 1, bz, v.Block.Stone);
+      v.world.setBlock(bx, by, bz, v.Block.Bed);
+      v.getLocalSim().timeOfDay = 0.5;
+      const atNoon = v.sleepAt(bx, by, bz);
+      const noonSleeping = v.isSleeping();
+      v.getLocalSim().timeOfDay = 0.8;
+      v.sleepAt(bx, by, bz);
+      return { atNoon, noonSleeping, sleeping: v.isSleeping(), time: v.sky.timeOfDay };
+    });
+    assert.equal(before.noonSleeping, false, 'you cannot sleep at noon');
+    assert.equal(before.sleeping, true, 'at night the bed is accepted');
+    const overlay = await page.evaluate(() => document.getElementById('sleep-overlay').style.display);
+    assert.equal(overlay, 'flex', 'the screen goes dark');
+
+    await until(page, () => !window.__voxel.isSleeping(), 30000, 'the night to pass');
+    const after = await page.evaluate(() => window.__voxel.sky.timeOfDay);
+    assert.ok(after > 0.2 && after < 0.35, `it should be morning, time is ${after.toFixed(2)}`);
+    await context.close();
+  });
+
+  await testCase('dying drops what you carried where you fell, and you get nothing back', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    const result = await page.evaluate(() => {
+      const v = window.__voxel;
+      v.inventory.add('diamond', 5);
+      v.inventory.add('iron_sword', 1);
+      v.survival.damage(100, true, 'generic');
+      const drops = [...v.getLocalSim().drops.values()].map((d) => d.itemId);
+      return { dead: v.survival.dead, drops, left: v.inventory.count('diamond') };
+    });
+    assert.equal(result.dead, true);
+    assert.ok(result.drops.includes('diamond') && result.drops.includes('iron_sword'), `dropped: ${result.drops}`);
+    assert.equal(result.left, 0, 'the inventory is emptied');
+    await page.evaluate(() => window.__voxel.respawn());
+    const respawned = await page.evaluate(() => ({ alive: !window.__voxel.survival.dead, diamonds: window.__voxel.inventory.count('diamond') }));
+    assert.equal(respawned.alive, true);
+    assert.equal(respawned.diamonds, 0, 'nothing comes back for free');
+    await context.close();
+  });
+
+  await testCase('villages exist in the world, with houses, chests and farms', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    const village = await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const near = v.world.terrain.villagesNear(p.x, p.z, 700);
+      if (near.length === 0) return null;
+      const [gx, gz] = near[0].id.split(',').map(Number);
+      const layout = v.world.terrain.villageInCell(gx, gz);
+      return { count: near.length, houses: layout.houses.length, farms: layout.farms.length, paths: layout.paths.length };
+    });
+    assert.ok(village, 'a village should be within reach of spawn');
+    assert.ok(village.houses >= 1, 'with at least one house');
+    assert.equal(village.paths, 4, 'and paths leading out of it');
+    await context.close();
+  });
+
   // --- Multiplayer: three real tabs, one of them "mobile" ---
   await testCase('three players share one world across desktop and mobile', async () => {
     const host = await openGame(browser);
@@ -842,19 +1033,27 @@ try {
         assert.equal(others, 2, 'each player should see the other two');
       }
 
-      // A block placed by the phone must appear for the host. setBlock is what
-      // the game itself calls; the session forwards local edits automatically.
-      const placed = await phone.page.evaluate(() => {
+      // A block dug up by the phone must disappear for the host. setBlock is
+      // what the game itself calls; the session forwards local edits, and the
+      // server relays what it accepts. (Placing needs an item in hand, and a
+      // fresh player holds nothing.)
+      // A phone starts paused behind its tap-to-play menu; tap through it so
+      // the body actually drops onto the ground before digging under it.
+      await phone.page.evaluate(() =>
+        document.getElementById('menu').dispatchEvent(new PointerEvent('pointerup', { bubbles: true })),
+      );
+      await until(phone.page, () => window.__voxel.player.onGround, 20000, 'the phone to land');
+      const dug = await phone.page.evaluate(() => {
         const v = window.__voxel;
         const p = v.player.position;
-        const at = { x: Math.floor(p.x) + 2, y: Math.floor(p.y) + 3, z: Math.floor(p.z) };
-        v.world.setBlock(at.x, at.y, at.z, 4); // cobblestone
+        const at = { x: Math.floor(p.x) + 1, y: Math.floor(p.y) - 1, z: Math.floor(p.z) };
+        v.world.setBlock(at.x, at.y, at.z, 0);
         return at;
       });
       await until(
         host.page,
         new Function(
-          `return window.__voxel.world.getBlock(${placed.x}, ${placed.y}, ${placed.z}) === 4`,
+          `return window.__voxel.world.getBlock(${dug.x}, ${dug.y}, ${dug.z}) === 0`,
         ),
         20000,
         'the block to sync',
@@ -909,6 +1108,21 @@ try {
         });
       }
 
+      // Items only come from the world now: the giver digs up the block under
+      // their feet, falls into the hole and collects the dirt the server drops.
+      await until(host.page, () => window.__voxel.player.onGround, 20000, 'the giver to land');
+      await host.page.evaluate(() => {
+        const v = window.__voxel;
+        const p = v.player.position;
+        v.world.setBlock(Math.floor(p.x), Math.floor(p.y) - 1, Math.floor(p.z), 0);
+      });
+      await until(
+        host.page,
+        () => window.__voxel.inventory.count('dirt'),
+        30000,
+        'the server to hand over the dug-up block',
+      );
+
       // Stand the taker on the giver, so the thrown stack lands at their feet.
       const at = await host.page.evaluate(() => {
         const p = window.__voxel.player.position;
@@ -918,13 +1132,11 @@ try {
         window.__voxel.player.position.set(pos.x, pos.y, pos.z);
       }, at);
 
-      const beforeCount = await guest.page.evaluate(() => window.__voxel.inventory.count('diamond'));
+      const beforeCount = await guest.page.evaluate(() => window.__voxel.inventory.count('dirt'));
       await host.page.evaluate(() => {
-        window.__voxel.inventory.add('diamond', 3);
-        window.__voxel.inventory.selectSlot(
-          window.__voxel.inventory.slots.findIndex((s) => s && s.id === 'diamond'),
-        );
-        window.__voxel.dropHeldItem(true);
+        const v = window.__voxel;
+        v.inventoryCtl.selectSlot(v.inventory.slots.findIndex((s) => s && s.id === 'dirt'));
+        v.dropHeldItem(true);
       });
 
       // The throw has to reach the world before it can reach anyone in it;
@@ -941,14 +1153,14 @@ try {
       // the pickup delay and the fall both take longer than their wall clock.
       const taken = await until(
         guest.page,
-        () => window.__voxel.inventory.count('diamond'),
+        () => window.__voxel.inventory.count('dirt'),
         45000,
         'the item to change hands',
       );
       assert.ok(taken > beforeCount, 'the receiving player never got the item');
 
       const keptByThrower = await host.page.evaluate(() =>
-        window.__voxel.inventory.count('diamond'),
+        window.__voxel.inventory.count('dirt'),
       );
       assert.equal(keptByThrower, 0, 'the thrower must not still hold what they threw');
     } finally {

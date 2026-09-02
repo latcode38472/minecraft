@@ -26,6 +26,7 @@ import {
 } from '../src/game/handpose.ts';
 import { CRACK_STAGES, CRACK_TILE_0, crackTileFor } from '../src/textures.ts';
 import {
+  FLAG_MASK,
   FLAG_MOVING,
   FLAG_SWINGING,
   receiveClock,
@@ -285,8 +286,9 @@ test('the swing flag survives the wire, alongside the movement flags', () => {
 test('flags above the defined set are still masked away', () => {
   const state = sanitizePlayerState({ x: 0, y: 64, z: 0, yaw: 0, pitch: 0, flags: 0xffff });
   assert.ok(state);
-  // Widening the mask for the swing flag must not have opened it wide.
-  assert.ok(state.flags <= (FLAG_SWINGING << 1) - 1, `mask leaked: ${state.flags}`);
+  // Widening the mask for new flags must not have opened it wide.
+  assert.ok(state.flags <= FLAG_MASK, `mask leaked: ${state.flags}`);
+  assert.ok(FLAG_MASK < 0xffff, 'the mask stays tight around the defined flags');
 });
 
 // --- First-person hand -----------------------------------------------------

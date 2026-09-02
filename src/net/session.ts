@@ -11,20 +11,28 @@ import type { Player } from '../player/player';
 import type { World } from '../world/world';
 import { NetClient, type ConnectionStatus } from './client';
 import {
+  FLAG_DEAD,
   FLAG_GROUNDED,
+  FLAG_HURT,
   FLAG_JUMPING,
   FLAG_MOVING,
+  FLAG_SLEEPING,
   FLAG_SNEAKING,
   FLAG_SWINGING,
+  FLAG_USING,
   MAX_BLOCK_ID,
   MAX_CHUNK_REQUEST,
   PROTOCOL_VERSION,
   STATE_SEND_HZ,
   receiveClock,
   WORLD_HEIGHT_LIMIT,
+  type ClickButton,
+  type ContainerStateData,
+  type InventoryStateData,
   type PlayerInfo,
   type PlayerVitals,
   type ServerMessage,
+  type SlotRef,
   type WorldInfo,
   type WorldStateData,
 } from './protocol';
@@ -57,8 +65,23 @@ export interface SessionEvents {
     dx: number, dy: number, dz: number,
     speed: number, ownerId: string, ageMs: number,
   ): void;
-  /** Loot the host awarded us for a mob we killed. */
-  onLootGranted(items: { id: string; count: number }[]): void;
+  /** The server's copy of our inventory, after one of our actions or a pickup. */
+  onInventory(state: InventoryStateData): void;
+  /** The chest or furnace we have open changed. */
+  onContainer(state: ContainerStateData): void;
+  onContainerClosed(): void;
+  /** Our health and hunger as the server now has them (eating, sleeping). */
+  onVitalsSet(health: number, hunger: number): void;
+  onSleepResult(sleeping: boolean, message?: string): void;
+}
+
+/** Local-player facts the state packet carries beyond position and look. */
+export interface StateFlags {
+  swinging: boolean;
+  using: boolean;
+  hurt: boolean;
+  dead: boolean;
+  sleeping: boolean;
 }
 
 export class MultiplayerSession {
@@ -69,19 +92,18 @@ export class MultiplayerSession {
   readonly code: string;
   self: PlayerInfo;
   players: PlayerInfo[] = [];
-  /** Set once the host leaves or the server shuts the room down. */
+  /** Set once the server shuts the room down. */
   ended = false;
+  /**
+   * Set by the game loop each frame; sent to other clients so they animate
+   * our body. Kept as fields rather than `update` arguments because they
+   * change independently of position and look.
+   */
+  readonly flags: StateFlags = { swinging: false, using: false, hurt: false, dead: false, sleeping: false };
 
   private lastStateSentAt = 0;
   private lastVitalsSentAt = 0;
-  private lastEquipmentSent = '';
-  /**
-   * Set by the game loop while the local player is mid-swing, so other clients
-   * can animate the arm. Kept as a field rather than another `update` argument
-   * because it changes independently of position and look.
-   */
-  swinging = false;
-  private readonly lastSent = { x: NaN, y: NaN, z: NaN, yaw: NaN, pitch: NaN, flags: -1 };
+  private readonly lastSent = { x: NaN, y: NaN, z: NaN, yaw: NaN, pitch: NaN, flags: -1, held: '' };
   /** Chunks we've already asked the server about, so we ask at most once each. */
   private readonly requestedChunks = new Set<string>();
   private pendingChunkRequests: string[] = [];
@@ -96,6 +118,8 @@ export class MultiplayerSession {
     self: PlayerInfo,
     world: WorldInfo,
     players: PlayerInfo[],
+    /** Our stable player key, needed to rejoin after a reconnect. */
+    private readonly key: string,
     private readonly events: SessionEvents,
   ) {
     this.remotePlayers = new RemotePlayerManager(scene);
@@ -183,7 +207,11 @@ export class MultiplayerSession {
     if (!this.player.onGround) flags |= FLAG_JUMPING;
     if (this.player.onGround) flags |= FLAG_GROUNDED;
     if (this.player.sneaking) flags |= FLAG_SNEAKING;
-    if (this.swinging) flags |= FLAG_SWINGING;
+    if (this.flags.swinging) flags |= FLAG_SWINGING;
+    if (this.flags.using) flags |= FLAG_USING;
+    if (this.flags.hurt) flags |= FLAG_HURT;
+    if (this.flags.dead) flags |= FLAG_DEAD;
+    if (this.flags.sleeping) flags |= FLAG_SLEEPING;
 
     // Idle players cost nothing: skip the packet when nothing changed.
     const moved =
@@ -204,6 +232,7 @@ export class MultiplayerSession {
     this.lastSent.flags = flags;
 
     // Round to centimetres/milliradians: same visual result, smaller packets.
+    // The held item is filled in by the server from its own copy of the hand.
     this.net.send({
       t: 'player_state',
       s: {
@@ -217,19 +246,51 @@ export class MultiplayerSession {
     });
   }
 
-  /** Throw an item into the world so another player can pick it up (vanilla's Q). */
-  dropItem(itemId: string, count: number): void {
-    this.net.send({ t: 'drop_item', item: itemId, count });
+  // --- Inventory and world actions (server-authoritative) -----------------
+
+  /** Throw the held stack, or one of it (vanilla's Q / Ctrl+Q). */
+  dropItem(seq: number, all: boolean): void {
+    this.net.send({ t: 'drop_item', seq, all });
   }
 
-  /** Put a mined block's drop into the world at the block's position. */
-  spawnDrop(itemId: string, count: number, x: number, y: number, z: number): void {
-    this.net.send({
-      t: 'drop_item',
-      item: itemId,
-      count,
-      p: [round(x, 2), round(y, 2), round(z, 2)],
-    });
+  selectSlot(index: number): void {
+    this.net.send({ t: 'select_slot', index });
+  }
+
+  clickSlot(seq: number, slot: SlotRef, button: ClickButton, shift: boolean): void {
+    this.net.send({ t: 'inv_click', seq, slot, button, shift });
+  }
+
+  craft(seq: number, all: boolean): void {
+    this.net.send({ t: 'inv_craft', seq, all });
+  }
+
+  closeInventory(seq: number): void {
+    this.net.send({ t: 'inv_close', seq });
+  }
+
+  openContainer(x: number, y: number, z: number): void {
+    this.net.send({ t: 'open_container', x, y, z });
+  }
+
+  openGrid(size: 2 | 3, at?: { x: number; y: number; z: number }): void {
+    this.net.send({ t: 'open_grid', size, ...(at ?? {}) });
+  }
+
+  till(x: number, y: number, z: number): void {
+    this.net.send({ t: 'till', x, y, z });
+  }
+
+  eat(seq: number): void {
+    this.net.send({ t: 'eat', seq });
+  }
+
+  sleep(x: number, y: number, z: number): void {
+    this.net.send({ t: 'sleep', x, y, z });
+  }
+
+  wake(): void {
+    this.net.send({ t: 'wake' });
   }
 
   /** Melee or arrow hit on another player; the server arbitrates. */
@@ -240,6 +301,11 @@ export class MultiplayerSession {
   /** Hit a mob; the server owns mob health and arbitrates the swing. */
   attackMob(mobId: number, damage: number): void {
     this.net.send({ t: 'attack_mob', mob: mobId, damage });
+  }
+
+  /** Use the held item on a mob: shears on a sheep. */
+  useOnMob(mobId: number): void {
+    this.net.send({ t: 'use_on_mob', mob: mobId });
   }
 
   /** Share a fired arrow so everyone sees the projectile. */
@@ -261,14 +327,6 @@ export class MultiplayerSession {
     if (now - this.lastVitalsSentAt < 250) return;
     this.lastVitalsSentAt = now;
     this.net.send({ t: 'player_vitals', health, hunger, dead });
-  }
-
-  /** Publish worn armour; only sent when it actually changes. */
-  sendEquipment(gear: number[]): void {
-    const key = gear.join(',');
-    if (key === this.lastEquipmentSent) return;
-    this.lastEquipmentSent = key;
-    this.net.send({ t: 'equipment', gear });
   }
 
   sendRespawn(): void {
@@ -312,6 +370,7 @@ export class MultiplayerSession {
       code: this.code,
       name: this.self.name,
       version: PROTOCOL_VERSION,
+      key: this.key,
     });
   }
 
@@ -319,7 +378,8 @@ export class MultiplayerSession {
     switch (msg.t) {
       case 'join_success': {
         // Reconnected: we get a fresh player id, and may have missed edits
-        // while offline, so forget what we've requested and ask again.
+        // while offline, so forget what we've requested and ask again. Our
+        // inventory follows in its own message, keyed by the player key.
         this.self = msg.self;
         this.players = msg.players;
         this.remotePlayers.sync(msg.players, this.self.id);
@@ -354,6 +414,16 @@ export class MultiplayerSession {
         if (who) this.events.onNotice(`${who.name} left the world.`);
         return;
       }
+      case 'host_changed': {
+        this.players = msg.players;
+        const me = msg.players.find((p) => p.id === this.self.id);
+        if (me) this.self = me;
+        this.events.onRosterChange(msg.players);
+        const host = msg.players.find((p) => p.id === msg.id);
+        if (host && host.id !== this.self.id) this.events.onNotice(`${host.name} is now the host.`);
+        else if (host) this.events.onNotice('You are now the host.');
+        return;
+      }
       case 'player_state': {
         // Ignore state for anyone not on the roster (stale or spoofed id).
         // Stamped with the SAME clock the frame loop interpolates against —
@@ -384,7 +454,7 @@ export class MultiplayerSession {
         this.remotePlayers.applyHealth(msg.id, msg.health);
         if (msg.id === this.self.id) {
           const attacker = this.players.find((p) => p.id === msg.by);
-          this.events.onDamaged(msg.damage, attacker?.name ?? 'someone');
+          this.events.onDamaged(msg.damage, attacker?.name ?? (msg.by === 'mob' ? 'A mob' : 'someone'));
         }
         return;
       }
@@ -423,8 +493,26 @@ export class MultiplayerSession {
         this.remotePlayers.applyEquipment(msg.id, msg.gear);
         return;
       }
-      case 'loot_grant': {
-        this.events.onLootGranted(msg.items);
+      case 'inventory': {
+        const { t: _t, ...state } = msg;
+        this.events.onInventory(state);
+        return;
+      }
+      case 'container': {
+        const { t: _t, ...state } = msg;
+        this.events.onContainer(state);
+        return;
+      }
+      case 'container_closed': {
+        this.events.onContainerClosed();
+        return;
+      }
+      case 'vitals_set': {
+        this.events.onVitalsSet(msg.health, msg.hunger);
+        return;
+      }
+      case 'sleep_result': {
+        this.events.onSleepResult(msg.sleeping, msg.message);
         return;
       }
       case 'room_closed': {

@@ -39,11 +39,19 @@ export const ITEM_DESPAWN_S = 300;
 // Survival
 export const MAX_HEALTH = 20;
 export const MAX_HUNGER = 20;
-export const HUNGER_DRAIN_PER_S = 0.02; // idle drain (~16 min to empty)
-export const HUNGER_DRAIN_PER_BLOCK = 0.008; // extra while walking
+// Hunger is mostly driven by what you do, not by the clock. Standing still
+// takes well over an hour to empty the bar; a busy session of running, jumping,
+// mining and fighting drains it several times faster. Every source is its own
+// constant so the balance can be tuned without touching the survival code.
+export const HUNGER_IDLE_DRAIN_PER_S = 0.0035; // ~95 min from full to empty
+export const HUNGER_WALK_COST_PER_BLOCK = 0.0025; // on top of idle while moving
+export const HUNGER_SWIM_COST_PER_BLOCK = 0.006;
+export const HUNGER_JUMP_COST = 0.04;
+export const HUNGER_ATTACK_COST = 0.03;
+export const HUNGER_MINE_COST = 0.01; // per block broken
 export const REGEN_HUNGER_THRESHOLD = 18; // heal only when this well fed
 export const REGEN_INTERVAL_S = 3.5;
-export const REGEN_HUNGER_COST = 0.6;
+export const REGEN_HUNGER_COST = 0.4;
 export const STARVE_INTERVAL_S = 4;
 export const FALL_DAMAGE_THRESHOLD = 3.5; // blocks of free fall before damage
 export const HURT_INVULN_S = 0.5;
@@ -76,7 +84,7 @@ export const ARROW_LIFETIME_S = 12;
 export const ARROW_MIN_CHARGE = 0.18; // below this the shot is cancelled
 
 // Mobs
-export const MAX_MOBS = 24;
+export const MAX_MOBS = 28;
 export const MOB_SPAWN_INTERVAL_S = 3;
 export const MOB_SPAWN_MIN_DISTANCE = 14;
 export const MOB_SPAWN_MAX_DISTANCE = 40;
@@ -84,6 +92,29 @@ export const MOB_DESPAWN_DISTANCE = 72;
 export const ZOMBIE_DETECT_RANGE = 18;
 export const NIGHT_START = 0.76; // time-of-day window where hostiles spawn
 export const NIGHT_END = 0.22;
+
+// Farming
+/** Average seconds between growth stages of a planted crop. */
+export const CROP_GROWTH_MEAN_S = 75;
+/** Seconds for a sheared sheep to grow its wool back. */
+export const WOOL_REGROW_S = 240;
+
+// Furnace
+/** Seconds to smelt one item, matching vanilla's 200 ticks. */
+export const SMELT_TIME_S = 10;
+
+// Sleeping
+/** Time of day beds may be used: dusk through to just before dawn. */
+export const SLEEP_START = 0.72;
+export const SLEEP_END = 0.24;
+/** Where the clock lands after a night is skipped (early morning). */
+export const SLEEP_WAKE_TIME = 0.25;
+/** Seconds everyone must stay in bed before the night is skipped. */
+export const SLEEP_DURATION_S = 3;
+
+// Villages
+/** One in this many chunks anchors a village (checked per chunk, from the seed). */
+export const VILLAGE_CHUNK_SPACING = 9;
 
 // Day/night
 

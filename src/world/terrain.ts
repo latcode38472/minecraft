@@ -4,8 +4,18 @@
 
 import { Block } from '../blocks.ts';
 import { CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT } from '../constants.ts';
+import type { VillageInfo } from '../shared/roomsim.ts';
+import type { Vec3 } from '../shared/voxel.ts';
 import { Chunk } from './chunk.ts';
 import { coordRandom, fbm2, fbm3, smoothstep } from './noise.ts';
+import {
+  VILLAGE_MAX_RADIUS,
+  chunkRect,
+  layoutVillage,
+  placeVillage,
+  villageCell,
+  type Village,
+} from './village.ts';
 
 const TREE_SALT = 0x7ee5;
 const TREE_CHANCE = 0.007;
@@ -23,9 +33,50 @@ export class TerrainGenerator {
   // the multiplayer server imports this file and Node's type stripping
   // cannot erase parameter properties.
   readonly seed: number;
+  /** Village layouts by cell, computed once each; null marks an empty cell. */
+  private readonly villages = new Map<string, Village | null>();
+  private readonly heightFn = (x: number, z: number): number => this.heightAt(x, z);
 
   constructor(seed: number) {
     this.seed = seed;
+  }
+
+  /** The village laid out in this cell, if any. */
+  villageInCell(gx: number, gz: number): Village | null {
+    const key = `${gx},${gz}`;
+    let village = this.villages.get(key);
+    if (village === undefined) {
+      village = layoutVillage(this.seed, gx, gz, this.heightFn);
+      this.villages.set(key, village);
+    }
+    return village;
+  }
+
+  /** The village whose grounds cover this column, if any. */
+  villageAt(x: number, z: number): Village | null {
+    const [gx, gz] = villageCell(x, z);
+    const village = this.villageInCell(gx, gz);
+    if (!village) return null;
+    const dx = x - village.x;
+    const dz = z - village.z;
+    return dx * dx + dz * dz <= village.radius * village.radius ? village : null;
+  }
+
+  /** Villages whose centre lies within `radius` blocks of the point. */
+  villagesNear(x: number, z: number, radius: number): VillageInfo[] {
+    const out: VillageInfo[] = [];
+    const [gx0, gz0] = villageCell(x - radius, z - radius);
+    const [gx1, gz1] = villageCell(x + radius, z + radius);
+    for (let gz = gz0; gz <= gz1; gz++) {
+      for (let gx = gx0; gx <= gx1; gx++) {
+        const village = this.villageInCell(gx, gz);
+        if (!village) continue;
+        const dx = village.x - x;
+        const dz = village.z - z;
+        if (dx * dx + dz * dz <= radius * radius) out.push(village);
+      }
+    }
+    return out;
   }
 
   /** Ground height: terrain occupies y in [0, height). */
@@ -52,7 +103,9 @@ export class TerrainGenerator {
           const x = 8 + dx * 8;
           const z = 8 + dz * 8;
           const h = this.heightAt(x, z);
-          if (h > SEA_LEVEL + 2) return { x, z, y: h };
+          // Never spawn inside a village: its levelled ground and walls do
+          // not follow the height function this spawn is resolved from.
+          if (h > SEA_LEVEL + 2 && !this.villageAt(x, z)) return { x, z, y: h };
         }
       }
     }
@@ -64,6 +117,8 @@ export class TerrainGenerator {
     const ground = this.heightAt(wx, wz);
     // Trees only on grass, comfortably above the beach line.
     if (ground <= SEA_LEVEL + 2) return null;
+    // Villagers keep their grounds clear.
+    if (this.villageAt(wx, wz)) return null;
     // Don't root a tree over a cave mouth — it would be left floating.
     if (this.isCaveAt(wx, ground - 1, wz)) return null;
     const r = coordRandom(wx, wz, this.seed ^ (TREE_SALT + 1));
@@ -103,7 +158,11 @@ export class TerrainGenerator {
     return null;
   }
 
-  generate(chunk: Chunk): void {
+  /**
+   * Fill a chunk. Returns the crops it planted (village farms), so whoever
+   * owns the simulation can start them growing without scanning the chunk.
+   */
+  generate(chunk: Chunk): Vec3[] {
     const ox = chunk.cx * CHUNK_SIZE;
     const oz = chunk.cz * CHUNK_SIZE;
 
@@ -157,6 +216,23 @@ export class TerrainGenerator {
         if (tree) this.placeTree(chunk, wx, wz, tree.height);
       }
     }
+
+    // Villages overlapping this chunk. A village never leaves its cell, so
+    // only cells within reach of the chunk's bounds can contribute.
+    const crops: Vec3[] = [];
+    const rect = chunkRect(chunk);
+    const [gx0, gz0] = villageCell(rect.x0 - VILLAGE_MAX_RADIUS, rect.z0 - VILLAGE_MAX_RADIUS);
+    const [gx1, gz1] = villageCell(rect.x1 + VILLAGE_MAX_RADIUS, rect.z1 + VILLAGE_MAX_RADIUS);
+    for (let gz = gz0; gz <= gz1; gz++) {
+      for (let gx = gx0; gx <= gx1; gx++) {
+        const village = this.villageInCell(gx, gz);
+        if (!village) continue;
+        const b = village.bounds;
+        if (b.x1 < rect.x0 || b.x0 > rect.x1 || b.z1 < rect.z0 || b.z0 > rect.z1) continue;
+        placeVillage(chunk, village, this.seed, this.heightFn, crops);
+      }
+    }
+    return crops;
   }
 
   private placeTree(chunk: Chunk, wx: number, wz: number, trunkHeight: number): void {

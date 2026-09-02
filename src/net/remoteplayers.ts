@@ -4,9 +4,13 @@
 
 import * as THREE from 'three';
 import {
+  FLAG_DEAD,
+  FLAG_HURT,
   FLAG_JUMPING,
   FLAG_MOVING,
+  FLAG_SLEEPING,
   FLAG_SWINGING,
+  FLAG_USING,
   INTERPOLATION_DELAY_MS,
   type PlayerInfo,
   type PlayerStateData,
@@ -14,6 +18,8 @@ import {
 import {
   Rig,
   WALK_PHASE_PER_BLOCK,
+  getMobHurtMaterial,
+  getMobMaterial,
   type BoxPart,
   type RigSegment,
 } from '../entities/models';
@@ -165,6 +171,10 @@ export class RemotePlayer {
   private walkPhase = 0;
   private walkAmount = 0;
   private swingTime = 0;
+  private useAmount = 0;
+  /** 0 standing, 1 lying flat: eased so a fall or a bedtime is not a snap. */
+  private lieAmount = 0;
+  private hurtActive = false;
   private readonly lastRendered = new THREE.Vector3();
   private hasRendered = false;
 
@@ -308,13 +318,32 @@ export class RemotePlayer {
     this.swingTime = Math.max(0, this.swingTime - dt);
     const swing = this.swingTime > 0 ? 1 - this.swingTime / SWING_TIME_S : 0;
 
-    this.rig.pose(this.walkPhase, this.walkAmount, swing, pitch);
+    // Using something holds the arm out; it eases so a tap does not twitch.
+    const using = (flags & FLAG_USING) !== 0;
+    this.useAmount += ((using ? 1 : 0) - this.useAmount) * Math.min(1, dt * 12);
+
+    this.rig.pose(this.walkPhase, this.walkAmount, swing, pitch, 0, { using: this.useAmount });
+
+    // Hurt: the same red flash mobs get, for as long as the flag is up.
+    const hurt = (flags & FLAG_HURT) !== 0;
+    if (hurt !== this.hurtActive) {
+      this.hurtActive = hurt;
+      this.rig.setMaterial(hurt ? getMobHurtMaterial() : getMobMaterial());
+    }
+
+    // Dead bodies keel over; sleeping ones lie down in bed. Both are eased.
+    const dead = (flags & FLAG_DEAD) !== 0;
+    const sleeping = (flags & FLAG_SLEEPING) !== 0;
+    this.lieAmount += ((dead || sleeping ? 1 : 0) - this.lieAmount) * Math.min(1, dt * 6);
+    const lie = this.lieAmount;
+    this.rig.group.rotation.set(sleeping ? (-Math.PI / 2) * lie : 0, 0, dead ? (Math.PI / 2) * lie : 0);
 
     // A jumping body lifts slightly; the label rides along with it.
     const lift = jumping ? 0.05 : 0;
-    this.rig.group.position.y = lift;
-    this.label.position.y = PLAYER_HEIGHT + 0.45 + lift;
-    this.healthBar.position.y = PLAYER_HEIGHT + 0.24 + lift;
+    this.rig.group.position.y = lift + lie * (sleeping ? 0.5 : 0.25);
+    this.label.position.y = PLAYER_HEIGHT + 0.45 + lift - lie * 1.2;
+    this.healthBar.position.y = PLAYER_HEIGHT + 0.24 + lift - lie * 1.2;
+    this.healthBar.visible = this.healthBar.visible && !dead;
   }
 
   dispose(): void {

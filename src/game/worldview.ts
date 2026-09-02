@@ -8,17 +8,23 @@
 import * as THREE from 'three';
 import {
   INTERPOLATION_DELAY_MS,
-  MOB_KIND_PIG,
-  MOB_KIND_SKELETON,
+  MOB_FLAG_COLOR_MASK,
+  MOB_FLAG_COLOR_SHIFT,
+  MOB_FLAG_GRAZING,
+  MOB_FLAG_HURT,
+  MOB_FLAG_SHEARED,
   type ArrowStateData,
   type DropStateData,
   type MobStateData,
 } from '../net/protocol';
 import {
+  COW_SEGMENTS,
   PIG_SEGMENTS,
   Rig,
+  SHEEP_SEGMENTS,
   SKELETON_BOW_SEGMENTS,
   SKELETON_SEGMENTS,
+  VILLAGER_SEGMENTS,
   WALK_PHASE_PER_BLOCK,
   ZOMBIE_SEGMENTS,
   buildBoxGeometry,
@@ -26,6 +32,7 @@ import {
   getMobMaterial,
 } from '../entities/models';
 import { getItem } from '../items/items';
+import { MOB_DEFS, SHEEP_COLORS, mobKindFromWire, type MobKind } from '../shared/mobs';
 import { getAtlasTexture, tileUVRect } from '../textures';
 
 const SNAPSHOT_BUFFER = 16;
@@ -34,15 +41,14 @@ const SNAP_DISTANCE = 12;
 const DROP_SIZE = 0.3;
 /** How long a mob holds its attack pose, so a swing is visible between ticks. */
 const ATTACK_POSE_MS = 300;
-
-const MOB_SHAPES = {
-  pig: { halfWidth: 0.45, height: 0.9 },
-  zombie: { halfWidth: 0.3, height: 1.95 },
-  skeleton: { halfWidth: 0.3, height: 1.95 },
-} as const;
+/** How long a dead mob takes to keel over and fade before it is removed. */
+const DEATH_MS = 700;
 
 /** How far the bowstring is pulled back at full draw, in blocks. */
 const BOW_PULL = 0.22;
+
+/** Flag bits that change the model itself rather than its pose. */
+const MODEL_FLAGS = MOB_FLAG_SHEARED | (MOB_FLAG_COLOR_MASK << MOB_FLAG_COLOR_SHIFT);
 
 interface Snapshot {
   time: number;
@@ -104,69 +110,120 @@ class Interpolated {
 }
 
 export class MobView extends Interpolated {
-  readonly object: THREE.Object3D;
+  readonly object = new THREE.Group();
   readonly id: number;
   readonly kind: number;
+  readonly kindName: MobKind;
   readonly halfWidth: number;
   readonly height: number;
   health: number;
+  /** Behaviour flags from the last snapshot (MOB_FLAG_*). */
+  flags: number;
+  /** Set once the mob has died and is keeling over; it can no longer be hit. */
+  dying = false;
+  /** Set when the death animation has played out and the view can go. */
+  finished = false;
 
   /** Public so tools and tests can inspect the pose; treat as read-only. */
-  readonly rig: Rig;
+  rig: Rig;
   private hurtUntil = 0;
   private hurtActive = false;
   private previousHp: number;
   private attackUntil = 0;
+  private deathStart = 0;
   /** Gait position, advanced by distance travelled rather than by time. */
   private walkPhase = 0;
   private walkAmount = 0;
+  private headYaw = 0;
+  private shownHeadYaw = 0;
+  private graze = 0;
   private readonly lastRendered = new THREE.Vector3();
   private hasRendered = false;
   /** The bow, when this mob carries one. Parented to the arms segment. */
   private bow: Rig | null = null;
   /** Latest reported bow draw, 0..1. */
   private draw = 0;
+  private articulated: boolean;
 
   constructor(state: MobStateData, articulated: boolean) {
     super();
     this.id = state.i;
     this.kind = state.k;
-    const isPig = state.k === MOB_KIND_PIG;
-    const isSkeleton = state.k === MOB_KIND_SKELETON;
-    const shape = isPig
-      ? MOB_SHAPES.pig
-      : isSkeleton
-        ? MOB_SHAPES.skeleton
-        : MOB_SHAPES.zombie;
+    this.kindName = mobKindFromWire(state.k) ?? 'zombie';
+    const shape = MOB_DEFS[this.kindName].shape;
     this.halfWidth = shape.halfWidth;
     this.height = shape.height;
     this.health = state.hp;
     this.previousHp = state.hp;
-    this.rig = new Rig(
-      isPig ? 'pig' : isSkeleton ? 'skeleton' : 'zombie',
-      isPig ? PIG_SEGMENTS : isSkeleton ? SKELETON_SEGMENTS : ZOMBIE_SEGMENTS,
-      articulated,
-    );
-    this.object = this.rig.group;
-
-    // A skeleton carries a bow in the hands the arms rig moves, so parenting it
-    // to that segment makes it follow the aim for free.
-    if (isSkeleton) {
-      this.bow = new Rig('skeleton-bow', SKELETON_BOW_SEGMENTS, articulated);
-      this.bow.group.position.set(0, -0.52, 0.22);
-      this.bow.group.rotation.y = Math.PI / 2;
-      const hands = this.rig.segments.get('arms');
-      if (hands) hands.add(this.bow.group);
-      else this.rig.group.add(this.bow.group); // merged rig: still show the bow
-    }
+    this.flags = state.f ?? 0;
+    this.articulated = articulated;
+    this.rig = this.buildRig();
     this.object.visible = false;
+  }
+
+  /** The body is built straight into `object`, so a rebuild swaps nothing in the scene. */
+  private buildRig(): Rig {
+    const articulated = this.articulated;
+    const group = this.object;
+    switch (this.kindName) {
+      case 'pig':
+        return new Rig('pig', PIG_SEGMENTS, articulated, group);
+      case 'cow':
+        return new Rig('cow', COW_SEGMENTS, articulated, group);
+      case 'sheep': {
+        const color = (this.flags >> MOB_FLAG_COLOR_SHIFT) & MOB_FLAG_COLOR_MASK;
+        const sheared = (this.flags & MOB_FLAG_SHEARED) !== 0;
+        const wool = SHEEP_COLORS[color] ?? SHEEP_COLORS[0];
+        return new Rig(`sheep|${color}|${sheared ? 1 : 0}`, () => SHEEP_SEGMENTS(wool, sheared), articulated, group);
+      }
+      case 'villager':
+        return new Rig('villager', VILLAGER_SEGMENTS, articulated, group);
+      case 'skeleton': {
+        const rig = new Rig('skeleton', SKELETON_SEGMENTS, articulated, group);
+        // A skeleton carries a bow in the hands the arms rig moves, so parenting
+        // it to that segment makes it follow the aim for free.
+        this.bow = new Rig('skeleton-bow', SKELETON_BOW_SEGMENTS, articulated);
+        this.bow.group.position.set(0, -0.52, 0.22);
+        this.bow.group.rotation.y = Math.PI / 2;
+        const hands = rig.segments.get('arms');
+        if (hands) hands.add(this.bow.group);
+        else rig.group.add(this.bow.group); // merged rig: still show the bow
+        return rig;
+      }
+      default:
+        return new Rig('zombie', ZOMBIE_SEGMENTS, articulated, group);
+    }
+  }
+
+  /** Swap the model (sheared, quality change) while keeping everything else. */
+  private rebuildRig(): void {
+    this.rig.dispose(); // empties the shared group
+    this.bow = null;
+    this.rig = this.buildRig();
+    if (this.hurtActive) this.rig.setMaterial(getMobHurtMaterial());
+  }
+
+  setArticulated(on: boolean): void {
+    if (on === this.articulated) return;
+    this.articulated = on;
+    this.rebuildRig();
   }
 
   apply(state: MobStateData, now: number, direct: boolean): void {
     // A drop in health flashes the mob red, matching local combat feedback.
-    if (state.hp < this.previousHp) this.hurtUntil = now + 400;
+    const flags = state.f ?? 0;
+    if (state.hp < this.previousHp || (flags & MOB_FLAG_HURT && !(this.flags & MOB_FLAG_HURT))) {
+      this.hurtUntil = now + 400;
+    }
     this.previousHp = state.hp;
     this.health = state.hp;
+    // A sheep losing (or regrowing) its wool is a different model.
+    if ((flags & MODEL_FLAGS) !== (this.flags & MODEL_FLAGS)) {
+      this.flags = flags;
+      this.rebuildRig();
+    }
+    this.flags = flags;
+    this.headYaw = state.hy ?? 0;
     // The simulation reports a swing; hold the pose long enough to be seen
     // even when it lands between two snapshots.
     if (state.s) this.attackUntil = Math.max(this.attackUntil, now + ATTACK_POSE_MS);
@@ -177,15 +234,30 @@ export class MobView extends Interpolated {
     else this.push(state.x, state.y, state.z, state.yaw, now);
   }
 
+  /** Start the death animation where the mob last stood. */
+  kill(now: number): void {
+    if (this.dying) return;
+    this.dying = true;
+    this.deathStart = now;
+    this.hurtUntil = now + DEATH_MS;
+  }
+
   render(now: number, dt: number, direct: boolean): void {
-    if (!direct && !this.interpolate(now)) return;
+    if (!this.dying && !direct && !this.interpolate(now)) return;
     this.object.position.copy(this.position);
-    this.object.rotation.y = this.yaw;
+    this.object.rotation.set(0, this.yaw, 0);
     this.object.visible = true;
 
-    // Derive the gait from how far the body actually moved since last frame.
-    // Nothing about the walk cycle travels over the wire.
-    if (this.hasRendered) {
+    if (this.dying) {
+      // Keel over sideways and sink a little, then go.
+      const t = Math.min(1, (now - this.deathStart) / DEATH_MS);
+      const ease = 1 - (1 - t) * (1 - t);
+      this.object.rotation.z = (ease * Math.PI) / 2;
+      this.object.position.y += ease * -0.15 + Math.sin(ease * Math.PI) * 0.1;
+      if (t >= 1) this.finished = true;
+    } else if (this.hasRendered) {
+      // Derive the gait from how far the body actually moved since last frame.
+      // Nothing about the walk cycle travels over the wire.
       const moved = Math.hypot(
         this.position.x - this.lastRendered.x,
         this.position.z - this.lastRendered.z,
@@ -198,9 +270,17 @@ export class MobView extends Interpolated {
     this.lastRendered.copy(this.position);
     this.hasRendered = true;
 
+    // Idle behaviours ease in and out so a head never snaps.
+    const grazing = (this.flags & MOB_FLAG_GRAZING) !== 0 && !this.dying;
+    this.graze += ((grazing ? 1 : 0) - this.graze) * Math.min(1, dt * 5);
+    this.shownHeadYaw += (this.headYaw - this.shownHeadYaw) * Math.min(1, dt * 6);
+
     const attack = now < this.attackUntil ? 1 - (this.attackUntil - now) / ATTACK_POSE_MS : 0;
     // A drawn bow outranks a swing: an archer mid-draw is not also punching.
-    this.rig.pose(this.walkPhase, this.walkAmount, this.draw > 0 ? 0 : attack, 0, this.draw);
+    this.rig.pose(this.walkPhase, this.walkAmount, this.draw > 0 ? 0 : attack, 0, this.draw, {
+      headYaw: this.shownHeadYaw,
+      graze: this.graze,
+    });
     if (this.bow) {
       // Pull the string back as the draw builds, and let it snap forward on
       // release — the visible difference between aiming and having fired.
@@ -215,18 +295,6 @@ export class MobView extends Interpolated {
       this.hurtActive = hurt;
       this.rig.setMaterial(hurt ? getMobHurtMaterial() : getMobMaterial());
     }
-  }
-
-  /** Take over another view's interpolation state, so a rebuild does not jump. */
-  adopt(previous: MobView): void {
-    this.draw = previous.draw;
-    this.snapshots.push(...previous.snapshots);
-    this.position.copy(previous.position);
-    this.yaw = previous.yaw;
-    this.walkPhase = previous.walkPhase;
-    this.walkAmount = previous.walkAmount;
-    this.lastRendered.copy(previous.lastRendered);
-    this.hasRendered = previous.hasRendered;
   }
 
   dispose(): void {
@@ -365,22 +433,12 @@ export class WorldView {
   /**
    * Turn limb animation on or off. Articulated bodies cost a few draw calls
    * each; the quality ladder drops them on devices that cannot spare it.
-   * Existing mobs are rebuilt so the change takes effect immediately.
+   * Existing mobs are rebuilt in place so the change takes effect immediately.
    */
   setArticulated(on: boolean): void {
     if (on === this.articulated) return;
     this.articulated = on;
-    for (const [id, mob] of [...this.mobs]) {
-      const replacement = new MobView(
-        { i: mob.id, k: mob.kind, x: 0, y: 0, z: 0, yaw: 0, hp: mob.health },
-        on,
-      );
-      replacement.adopt(mob);
-      this.scene.remove(mob.object);
-      mob.dispose();
-      this.scene.add(replacement.object);
-      this.mobs.set(id, replacement);
-    }
+    for (const mob of this.mobs.values()) mob.setArticulated(on);
   }
 
   applyMobs(states: MobStateData[], now: number): void {
@@ -393,6 +451,12 @@ export class WorldView {
       }
       mob.apply(state, now, this.direct);
     }
+  }
+
+  /** Mobs that died this tick keel over instead of vanishing. */
+  killMobs(deaths: { i: number }[]): void {
+    const now = performance.now();
+    for (const death of deaths) this.mobs.get(death.i)?.kill(now);
   }
 
   applyArrows(states: ArrowStateData[], now: number): void {
@@ -436,10 +500,11 @@ export class WorldView {
     }
   }
 
-  removeMobs(ids: number[]): void {
+  /** Remove mobs; one mid-death stays until its animation has finished. */
+  removeMobs(ids: number[], force = false): void {
     for (const id of ids) {
       const mob = this.mobs.get(id);
-      if (!mob) continue;
+      if (!mob || (mob.dying && !mob.finished && !force)) continue;
       this.scene.remove(mob.object);
       mob.dispose();
       this.mobs.delete(id);
@@ -468,6 +533,7 @@ export class WorldView {
     for (const mob of this.mobs.values()) mob.render(now, dt, this.direct);
     for (const drop of this.drops.values()) drop.render(now, dt, this.direct);
     for (const arrow of this.arrows.values()) arrow.render(now, this.direct);
+    for (const [id, mob] of this.mobs) if (mob.finished) this.removeMobs([id], true);
   }
 
   /** Nearest mob under the ray, for melee and arrows. */
@@ -475,7 +541,7 @@ export class WorldView {
     let best: MobView | null = null;
     let bestT = Infinity;
     for (const mob of this.mobs.values()) {
-      if (!mob.object.visible) continue;
+      if (!mob.object.visible || mob.dying) continue;
       const t = rayBox(origin, dir, mob, maxDist);
       if (t !== null && t < bestT) {
         bestT = t;
@@ -498,7 +564,7 @@ export class WorldView {
   }
 
   clear(): void {
-    this.removeMobs([...this.mobs.keys()]);
+    this.removeMobs([...this.mobs.keys()], true);
     this.removeDrops([...this.drops.keys()]);
     this.removeArrows([...this.arrows.keys()]);
   }

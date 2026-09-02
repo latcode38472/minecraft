@@ -2,7 +2,7 @@
 // hotbar. Stacks merge up to each item's max stack size; tools stack to 1 and
 // carry a `damage` counter for durability.
 
-import { getItem } from './items';
+import { getItem } from './items.ts';
 
 export const HOTBAR_SIZE = 9;
 export const INVENTORY_ROWS = 3;

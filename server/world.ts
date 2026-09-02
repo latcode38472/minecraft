@@ -6,31 +6,54 @@
 // players and evicted behind them, so a room's memory stays bounded no matter
 // how far anyone travels.
 
-import { BLOCKS } from '../src/blocks.ts';
+import { BLOCKS, isCrop } from '../src/blocks.ts';
 import { CHUNK_SIZE, WORLD_HEIGHT } from '../src/constants.ts';
 import { Chunk } from '../src/world/chunk.ts';
 import { TerrainGenerator } from '../src/world/terrain.ts';
 import type { Vec3 } from '../src/shared/voxel.ts';
-import type { SimWorld } from '../src/shared/roomsim.ts';
+import type { SimWorld, VillageInfo } from '../src/shared/roomsim.ts';
 
 /** Chunks are kept this far (in chunks) around any player, then evicted. */
 const KEEP_RADIUS = 4;
 /** Hard cap in case players scatter; oldest-touched chunks go first. */
 const MAX_CHUNKS = 400;
+/** Crops waiting to be handed to the simulation; bounded in case nobody asks. */
+const MAX_PENDING_CROPS = 8192;
 
 export class ServerWorld implements SimWorld {
+  readonly seed: number;
   readonly terrain: TerrainGenerator;
   private readonly chunks = new Map<string, Chunk>();
   /** Last tick each chunk was touched, for eviction. */
   private readonly touched = new Map<string, number>();
   private tick = 0;
+  private pendingCrops: Vec3[] = [];
 
   /** Live reference to the room's edits: chunkKey -> voxelIndex -> blockId. */
   private readonly edits: Map<string, Map<number, number>>;
 
   constructor(seed: number, edits: Map<string, Map<number, number>>) {
+    this.seed = seed;
     this.terrain = new TerrainGenerator(seed);
     this.edits = edits;
+    // Crops players planted before this world was last put away pick up
+    // growing again: the edit map is sparse, so this is cheap.
+    for (const [key, chunkEdits] of edits) {
+      const [cxRaw, czRaw] = key.split(',');
+      const cx = Number(cxRaw);
+      const cz = Number(czRaw);
+      for (const [index, id] of chunkEdits) {
+        if (!isCrop(id)) continue;
+        const lx = index % CHUNK_SIZE;
+        const lz = Math.floor(index / CHUNK_SIZE) % CHUNK_SIZE;
+        const y = Math.floor(index / (CHUNK_SIZE * CHUNK_SIZE));
+        this.queueCrop({ x: cx * CHUNK_SIZE + lx, y, z: cz * CHUNK_SIZE + lz });
+      }
+    }
+  }
+
+  private queueCrop(at: Vec3): void {
+    if (this.pendingCrops.length < MAX_PENDING_CROPS) this.pendingCrops.push(at);
   }
 
   private chunkAt(cx: number, cz: number): Chunk {
@@ -38,7 +61,7 @@ export class ServerWorld implements SimWorld {
     let chunk = this.chunks.get(key);
     if (!chunk) {
       chunk = new Chunk(cx, cz);
-      this.terrain.generate(chunk);
+      for (const crop of this.terrain.generate(chunk)) this.queueCrop(crop);
       // Replay the room's edits so the server sees the world players see.
       const edits = this.edits.get(key);
       if (edits) for (const [index, id] of edits) chunk.data[index] = id;
@@ -75,6 +98,26 @@ export class ServerWorld implements SimWorld {
     // room's edit map and will be replayed when the chunk is next generated.
     const chunk = this.chunks.get(key);
     if (chunk) chunk.set(x - cx * CHUNK_SIZE, y, z - cz * CHUNK_SIZE, id);
+  }
+
+  /** Untouched terrain: no player edit has ever landed on this voxel. */
+  isNaturalBlock(x: number, y: number, z: number): boolean {
+    const cx = Math.floor(x / CHUNK_SIZE);
+    const cz = Math.floor(z / CHUNK_SIZE);
+    const edits = this.edits.get(Chunk.key(cx, cz));
+    if (!edits) return true;
+    return !edits.has(Chunk.index(x - cx * CHUNK_SIZE, y, z - cz * CHUNK_SIZE));
+  }
+
+  drainNewCrops(): Vec3[] {
+    if (this.pendingCrops.length === 0) return [];
+    const out = this.pendingCrops;
+    this.pendingCrops = [];
+    return out;
+  }
+
+  villagesNear(x: number, z: number, radius: number): VillageInfo[] {
+    return this.terrain.villagesNear(x, z, radius);
   }
 
   /** Drop chunks nobody is standing near, keeping memory flat. */

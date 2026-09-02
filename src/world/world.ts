@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { Block, isSolid } from '../blocks';
+import { Block, isCrop, isSolid } from '../blocks';
 import {
   CHUNK_SIZE,
   MAX_CHUNK_GENS_PER_FRAME,
@@ -7,6 +7,8 @@ import {
   UNLOAD_PADDING,
   WORLD_HEIGHT,
 } from '../constants';
+import type { SimWorld, VillageInfo } from '../shared/roomsim';
+import type { Vec3 } from '../shared/voxel';
 import { Chunk } from './chunk';
 import {
   buildChunkGeometry,
@@ -19,7 +21,11 @@ import { TerrainGenerator } from './terrain';
 /** Sparse per-chunk map of player edits: voxel index -> block id. */
 export type ChunkEdits = Map<number, number>;
 
-export class World {
+/** Crops waiting for the local simulation; bounded, since multiplayer never drains them. */
+const MAX_PENDING_CROPS = 8192;
+
+export class World implements SimWorld {
+  readonly seed: number;
   readonly terrain: TerrainGenerator;
   readonly chunks = new Map<string, Chunk>();
   /** All edits ever made, kept for chunks whether loaded or not. */
@@ -30,6 +36,7 @@ export class World {
   private readonly scene: THREE.Scene;
   private readonly dirtyQueue = new Set<Chunk>();
   private frame = 0;
+  private pendingCrops: Vec3[] = [];
 
   /**
    * Multiplayer hooks. Both are null in singleplayer, so that path is
@@ -41,11 +48,58 @@ export class World {
   persistEdits = true;
 
   constructor(seed: number, scene: THREE.Scene, savedEdits?: Map<string, ChunkEdits>) {
+    this.seed = seed;
     this.terrain = new TerrainGenerator(seed);
     this.scene = scene;
     if (savedEdits) {
-      for (const [key, edits] of savedEdits) this.edits.set(key, edits);
+      for (const [key, edits] of savedEdits) {
+        this.edits.set(key, edits);
+        // Planted crops resume growing after a reload.
+        const [cxRaw, czRaw] = key.split(',');
+        const cx = Number(cxRaw);
+        const cz = Number(czRaw);
+        for (const [index, id] of edits) {
+          if (!isCrop(id)) continue;
+          const lx = index % CHUNK_SIZE;
+          const lz = Math.floor(index / CHUNK_SIZE) % CHUNK_SIZE;
+          const y = Math.floor(index / (CHUNK_SIZE * CHUNK_SIZE));
+          this.queueCrop({ x: cx * CHUNK_SIZE + lx, y, z: cz * CHUNK_SIZE + lz });
+        }
+      }
     }
+  }
+
+  private queueCrop(at: Vec3): void {
+    if (this.pendingCrops.length < MAX_PENDING_CROPS) this.pendingCrops.push(at);
+  }
+
+  /** Part of the SimWorld contract: crops generated or loaded since the last call. */
+  drainNewCrops(): Vec3[] {
+    if (this.pendingCrops.length === 0) return [];
+    const out = this.pendingCrops;
+    this.pendingCrops = [];
+    return out;
+  }
+
+  villagesNear(x: number, z: number, radius: number): VillageInfo[] {
+    return this.terrain.villagesNear(x, z, radius);
+  }
+
+  /** Untouched terrain: no edit has ever landed on this voxel. */
+  isNaturalBlock(wx: number, wy: number, wz: number): boolean {
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const edits = this.edits.get(Chunk.key(cx, cz));
+    if (!edits) return true;
+    return !edits.has(Chunk.index(wx - cx * CHUNK_SIZE, wy, wz - cz * CHUNK_SIZE));
+  }
+
+  /**
+   * The local simulation changed a block (a crop grew, a furnace lit). It is
+   * recorded like a remote edit: saved and remeshed, never re-broadcast.
+   */
+  applyEdit(wx: number, wy: number, wz: number, id: number): void {
+    this.applyRemoteEdit(wx, wy, wz, id);
   }
 
   /** Block id at world coords; Air for unloaded chunks or above the world. */
@@ -216,7 +270,7 @@ export class World {
 
   private createChunk(cx: number, cz: number): void {
     const chunk = new Chunk(cx, cz);
-    this.terrain.generate(chunk);
+    for (const crop of this.terrain.generate(chunk)) this.queueCrop(crop);
     const key = Chunk.key(cx, cz);
     const edits = this.edits.get(key);
     if (edits) {

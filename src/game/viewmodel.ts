@@ -230,10 +230,11 @@ export class Viewmodel {
     // Which rest pose and which strike style apply is decided here, once per
     // item change, rather than re-derived every frame.
     this.hold = !def ? 'hand' : def.block !== undefined ? 'block' : 'item';
-    // A sword has an edge and sweeps it across; every other tool is swung
-    // overhead and brought down; a bare fist, a block or an apple just goes out.
+    // A sword has an edge and sweeps it across; a hoe, pick or axe is swung
+    // overhead and brought down; shears snip, and a bare fist, a block or an
+    // apple just goes out.
     const tool = def?.tool?.kind;
-    this.style = tool === 'sword' ? 'sweep' : tool ? 'chop' : 'jab';
+    this.style = tool === 'sword' ? 'sweep' : tool && tool !== 'shears' ? 'chop' : 'jab';
 
     if (!def) {
       this.mesh = new THREE.Mesh(getHandGeometry(), getMobMaterial());

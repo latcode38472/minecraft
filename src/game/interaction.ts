@@ -1,8 +1,9 @@
 // Everything the crosshair does: mining with per-block progress, placing,
-// attacking mobs, eating, and opening crafting stations.
+// attacking mobs, eating, tilling, planting, shearing, and using blocks
+// (crafting tables, furnaces, chests, beds).
 
 import * as THREE from 'three';
-import { BLOCKS, Block, type BlockDef } from '../blocks';
+import { BLOCKS, Block, isCrop, isFurnace, type BlockDef } from '../blocks';
 import {
   ARROW_MIN_CHARGE,
   FIST_COOLDOWN_S,
@@ -11,13 +12,15 @@ import {
   PLAYER_ATTACK_RANGE,
   REACH_DISTANCE,
 } from '../constants';
-import type { Station } from '../items/crafting';
 import type { Inventory, ItemStack } from '../items/inventory';
 import { getItem } from '../items/items';
 import type { Player } from '../player/player';
 import { raycastVoxel, type RayHit } from '../raycast';
+import { breakTimeFor, canHarvest } from '../shared/harvest';
 import type { World } from '../world/world';
 import { MINE_STRIKE_S, type StrikeKind } from './handpose';
+
+export { breakTimeFor, canHarvest };
 
 /**
  * Seconds between arm swings while a block is being mined. Matching the stroke
@@ -32,11 +35,17 @@ export interface CombatTarget {
   position: THREE.Vector3;
   halfWidth: number;
   height: number;
+  /** Mob kind by name, so the right-click knows a sheep from a cow. */
+  kind?: string;
 }
 
+/** Blocks that open a screen or do something when used. */
+export type UsableBlock = 'table' | 'furnace' | 'chest' | 'bed';
+
 export interface InteractionHooks {
-  onBreakBlock(def: BlockDef): void;
-  onPlaceBlock(def: BlockDef): void;
+  /** A block left the world; the owner of the world decides the drop. */
+  onBreakBlock(hit: RayHit, def: BlockDef, held: ItemStack | null): void;
+  onPlaceBlock(def: BlockDef, x: number, y: number, z: number): void;
   onAttack(): void;
   /**
    * Start a hand animation: repeatedly while mining, once per landed hit, once
@@ -51,13 +60,16 @@ export interface InteractionHooks {
   combatTargets(): CombatTarget[];
   /** Melee or arrow hit — routed to whichever simulation owns the target. */
   onHitTarget(id: string, damage: number): void;
+  /** Right-click on a mob with something in hand (shears on a sheep). */
+  onUseOnTarget(id: string): boolean;
   /** Fire an arrow from the eye along `dir`, with the given draw strength. */
   fireArrow(origin: THREE.Vector3, dir: THREE.Vector3, charge: number): void;
-  /** Spawn a block's drop into the simulation that owns the world. */
-  spawnDrop(id: string, count: number, x: number, y: number, z: number): void;
-  /** Feed the player; returns false when already full so the food is kept. */
-  tryEat(hunger: number): boolean;
-  onOpenStation(station: Station): void;
+  /** Eat the held item; returns false when nothing happened. */
+  tryEat(): boolean;
+  /** Use a block with a screen or a function. */
+  onUseBlock(kind: UsableBlock, hit: RayHit): void;
+  /** Hoe on dirt or grass. */
+  onTill(hit: RayHit): void;
   toast(message: string): void;
 }
 
@@ -70,28 +82,6 @@ export interface ActionInput {
   useTaps: number;
 }
 
-/**
- * Seconds to break a block with the given held item. Matching the block's tool
- * class speeds it up; lacking the required tier makes it far slower AND
- * forfeits the drop, the way Minecraft handles stone without a pickaxe.
- */
-export function breakTimeFor(def: BlockDef, stack: ItemStack | null): number {
-  if (!def.breakable) return Infinity;
-  const tool = stack ? getItem(stack.id)?.tool : undefined;
-  const matches = tool !== undefined && def.tool !== null && tool.kind === def.tool;
-  const speed = matches ? tool.speed : 1;
-  const base = def.hardness * (canHarvest(def, stack) ? 1.5 : 5);
-  return Math.max(0.05, base / speed);
-}
-
-/** Does the held item qualify to collect this block's drop? */
-export function canHarvest(def: BlockDef, stack: ItemStack | null): boolean {
-  if (def.minTier <= 0) return true;
-  const tool = stack ? getItem(stack.id)?.tool : undefined;
-  if (!tool || def.tool === null || tool.kind !== def.tool) return false;
-  return tool.tier >= def.minTier;
-}
-
 export class Interaction {
   /** Currently targeted block, for the highlight box. */
   target: RayHit | null = null;
@@ -101,6 +91,8 @@ export class Interaction {
   bowCharge = 0;
   /** True while a shield is raised (slows movement, absorbs damage). */
   blocking = false;
+  /** Seconds left of the "using" pose other players see. */
+  useTime = 0;
 
   private miningKey = '';
   private attackCooldown = 0;
@@ -130,6 +122,7 @@ export class Interaction {
     this.eye.copy(eye);
     this.dir.copy(dir);
     this.attackCooldown = Math.max(0, this.attackCooldown - dt);
+    this.useTime = Math.max(0, this.useTime - dt);
 
     this.target = raycastVoxel(this.world, this.eye, this.dir, REACH_DISTANCE);
 
@@ -145,6 +138,7 @@ export class Interaction {
     } else if (this.drawingBow) {
       this.cancelBow();
     }
+    if (this.blocking || this.drawingBow) this.useTime = 0.2;
 
     // A mob or player in front of the block takes the hit instead of the block.
     const combatHit = this.raycastTargets();
@@ -173,7 +167,7 @@ export class Interaction {
     const wantUse = input.useTaps > 0 || (input.using && nowMs >= this.nextUseAt);
     if (wantUse) {
       if (combatInFront && input.useTaps > 0) {
-        this.attackTarget(combatHit!.target);
+        if (!this.useOnTarget(combatHit!.target)) this.attackTarget(combatHit!.target);
       } else if (this.tryUse()) {
         this.nextUseAt = nowMs + PLACE_REPEAT_MS;
       }
@@ -237,6 +231,16 @@ export class Interaction {
     this.hooks.onSwing('attack');
   }
 
+  /** Shears on a sheep; anything else falls through to an attack. */
+  private useOnTarget(target: CombatTarget): boolean {
+    const stack = this.inventory.selectedStack;
+    if (!stack || getItem(stack.id)?.tool?.kind !== 'shears' || target.kind !== 'sheep') return false;
+    if (!this.hooks.onUseOnTarget(target.id)) return false;
+    this.hooks.onSwing('use');
+    this.useTime = 0.3;
+    return true;
+  }
+
   private targetCentre(hit: RayHit): THREE.Vector3 {
     return this.scratch.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
   }
@@ -266,52 +270,58 @@ export class Interaction {
   private breakBlock(hit: RayHit, def: BlockDef): void {
     const stack = this.inventory.selectedStack;
     if (!this.world.setBlock(hit.x, hit.y, hit.z, Block.Air)) return;
-
-    if (def.drop && canHarvest(def, stack)) {
-      this.hooks.spawnDrop(def.drop, def.dropCount, hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
-    }
-    // Tools only wear out on blocks that actually needed them.
-    if (stack && getItem(stack.id)?.tool && def.hardness > 0) {
-      if (this.inventory.damageSelected()) this.hooks.toast('Your tool broke!');
-    }
-    this.hooks.onBreakBlock(def);
+    this.hooks.onBreakBlock(hit, def, stack);
   }
 
-  /** Right-click / tap: use a station, eat, or place the held block. */
+  /** Right-click / tap: use a block, till, eat, or place the held item. */
   private tryUse(): boolean {
-    // Using a crafting station beats placing a block on it.
-    if (this.target) {
-      if (this.target.id === Block.CraftingTable) {
-        this.hooks.onOpenStation('table');
+    const stack = this.inventory.selectedStack;
+    const def = stack ? getItem(stack.id) : undefined;
+
+    // Using a block beats placing on it — unless sneaking, so a chest can be
+    // built against a chest.
+    if (this.target && !this.player.sneaking) {
+      const usable = usableBlockAt(this.target.id);
+      if (usable) {
+        this.hooks.onUseBlock(usable, this.target);
         this.hooks.onSwing('use');
-        return true;
-      }
-      if (this.target.id === Block.Furnace) {
-        this.hooks.onOpenStation('furnace');
-        this.hooks.onSwing('use');
+        this.useTime = 0.3;
         return true;
       }
     }
 
-    const stack = this.inventory.selectedStack;
-    if (!stack) return false;
-    const def = getItem(stack.id);
-    if (!def) return false;
+    if (!stack || !def) return false;
 
     if (def.food) {
-      if (!this.hooks.tryEat(def.food.hunger)) return false;
-      this.inventory.consumeSelected();
+      if (!this.hooks.tryEat()) return false;
       this.hooks.onSwing('eat');
+      this.useTime = 0.9;
       return true;
     }
 
-    if (def.block === undefined || !this.target) return false;
-    if (!this.placeBlock(def.block)) return false;
+    if (!this.target) return false;
+
+    if (def.tool?.kind === 'hoe') {
+      const id = this.target.id;
+      const above = this.world.getBlock(this.target.x, this.target.y + 1, this.target.z);
+      if ((id === Block.Dirt || id === Block.Grass) && above === Block.Air) {
+        this.hooks.onTill(this.target);
+        this.hooks.onSwing('use');
+        this.useTime = 0.3;
+        return true;
+      }
+      return false;
+    }
+
+    const block = def.block ?? def.plants;
+    if (block === undefined) return false;
+    if (!this.placeBlock(block, def.plants !== undefined)) return false;
     this.hooks.onSwing('use');
+    this.useTime = 0.3;
     return true;
   }
 
-  private placeBlock(block: Block): boolean {
+  private placeBlock(block: Block, isSeed: boolean): boolean {
     const hit = this.target!;
     const px = hit.x + hit.normal[0];
     const py = hit.y + hit.normal[1];
@@ -319,16 +329,31 @@ export class Interaction {
 
     const occupied = this.world.getBlock(px, py, pz);
     if (occupied !== Block.Air && occupied !== Block.Water) return false;
+    const below = this.world.getBlock(px, py - 1, pz);
+    // Seeds only take in tilled soil; crops and beds need something under them.
+    if (isSeed || isCrop(block)) {
+      if (below !== Block.Farmland) return false;
+    } else if (block === Block.Bed && !BLOCKS[below].solid) {
+      return false;
+    }
     // Never seal the player inside a block.
     if (BLOCKS[block].solid && this.player.intersectsBlock(px, py, pz)) return false;
     if (!this.world.setBlock(px, py, pz, block)) return false;
 
     this.inventory.consumeSelected();
-    this.hooks.onPlaceBlock(BLOCKS[block]);
+    this.hooks.onPlaceBlock(BLOCKS[block], px, py, pz);
     return true;
   }
 }
 
+/** What using a block does, if anything. */
+export function usableBlockAt(id: number): UsableBlock | null {
+  if (id === Block.CraftingTable) return 'table';
+  if (isFurnace(id)) return 'furnace';
+  if (id === Block.Chest) return 'chest';
+  if (id === Block.Bed) return 'bed';
+  return null;
+}
 
 /** Slab-method ray/AABB test, shared by melee targeting and arrows. */
 function rayHitsBox(

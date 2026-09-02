@@ -1,8 +1,10 @@
 // Health, hunger, breath, damage and death.
 //
-// Hunger drains with time and distance walked. Above REGEN_HUNGER_THRESHOLD it
-// slowly buys back health; at zero it starts costing health instead. Air drains
-// whenever the head is submerged and costs health once it runs out.
+// Hunger drains slowly with time and faster with exertion: walking, swimming,
+// jumping, mining and fighting each cost their own amount (see constants.ts).
+// Above REGEN_HUNGER_THRESHOLD it slowly buys back health; at zero it starts
+// costing health instead. Air drains whenever the head is submerged and costs
+// health once it runs out.
 
 import * as THREE from 'three';
 import {
@@ -12,8 +14,12 @@ import {
   DROWN_DAMAGE,
   DROWN_INTERVAL_S,
   FALL_DAMAGE_THRESHOLD,
-  HUNGER_DRAIN_PER_BLOCK,
-  HUNGER_DRAIN_PER_S,
+  HUNGER_ATTACK_COST,
+  HUNGER_IDLE_DRAIN_PER_S,
+  HUNGER_JUMP_COST,
+  HUNGER_MINE_COST,
+  HUNGER_SWIM_COST_PER_BLOCK,
+  HUNGER_WALK_COST_PER_BLOCK,
   HURT_INVULN_S,
   MAX_AIR,
   MAX_HEALTH,
@@ -24,6 +30,15 @@ import {
   STARVE_INTERVAL_S,
 } from '../constants.ts';
 import type { Player } from './player';
+
+/** Discrete exertions that cost hunger on top of moving around. */
+export type Exertion = 'jump' | 'attack' | 'mine';
+
+const EXERTION_COST: Record<Exertion, number> = {
+  jump: HUNGER_JUMP_COST,
+  attack: HUNGER_ATTACK_COST,
+  mine: HUNGER_MINE_COST,
+};
 
 /** What last hurt the player, so the death screen can name it. */
 export type DamageCause = 'generic' | 'fall' | 'starve' | 'drown';
@@ -130,11 +145,20 @@ export class Survival {
     const walked = Math.hypot(dx, dz);
     this.lastPos.copy(player.position);
 
+    const perBlock = player.feetInWater ? HUNGER_SWIM_COST_PER_BLOCK : HUNGER_WALK_COST_PER_BLOCK;
+    this.spendHunger(HUNGER_IDLE_DRAIN_PER_S * dt + walked * perBlock);
+  }
+
+  /** Charge a one-off exertion (a jump, a swing, a block broken). */
+  exert(kind: Exertion): void {
+    if (this.dead) return;
+    this.spendHunger(EXERTION_COST[kind]);
+  }
+
+  private spendHunger(amount: number): void {
+    if (amount <= 0) return;
     const before = this.hunger;
-    this.hunger = Math.max(
-      0,
-      this.hunger - HUNGER_DRAIN_PER_S * dt - walked * HUNGER_DRAIN_PER_BLOCK,
-    );
+    this.hunger = Math.max(0, this.hunger - amount);
     if (Math.floor(before) !== Math.floor(this.hunger)) this.version++;
   }
 
@@ -231,6 +255,14 @@ export class Survival {
     this.hurtFlash = 0;
     this.lastCause = 'generic';
     this.posInitialised = false;
+    this.version++;
+  }
+
+  /** Health and hunger as the server has them (after eating or sleeping there). */
+  setVitals(health: number, hunger: number): void {
+    if (this.dead) return;
+    this.health = Math.max(0, Math.min(MAX_HEALTH, health));
+    this.hunger = Math.max(0, Math.min(MAX_HUNGER, hunger));
     this.version++;
   }
 

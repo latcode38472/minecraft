@@ -73,16 +73,25 @@ without it the suite says so and exits successfully rather than failing.
 | Space | jump / swim up |
 | Shift | sneak / swim down |
 | Left click (hold) | mine the targeted block / attack a mob |
-| Right click | place block, eat food, use a crafting table or furnace |
-| E | inventory & crafting |
+| Right click | place block, eat food, open a crafting table, furnace or chest |
+| Right click (bed, at night) | sleep; when everyone is in bed the night is skipped |
+| Right click (hoe) | till dirt or grass into farmland; then right click with seeds to plant |
+| Right click (shears, on a sheep) | shear it for wool |
+| Shift + right click | place a block against a chest/table instead of opening it |
+| E | inventory & crafting (2×2 grid; a crafting table gives 3×3) |
 | 1–9 / mouse wheel | select hotbar slot |
 | Q | drop one of the held item |
 | Ctrl+Q | drop the whole stack |
 | Right click (bow) | hold to draw, release to fire |
 | Right click (shield) | hold to block |
 | `[` / `]` | decrease / increase view distance |
-| T | skip time forward (test day/night) |
 | F3 | debug overlay |
+
+In the inventory screen: left click picks a stack up onto the cursor and puts
+it down, right click takes half or puts one, shift-click quick-moves (into a
+chest or furnace, onto the armour slots, between hotbar and bag). The recipe
+book on the right lays a recipe out on the grid from your bag; click the result
+slot to take one, shift-click it to craft as many as the grid allows.
 
 ### Mobile / touch
 
@@ -94,7 +103,8 @@ landscape):
 | Left pad | move (analog) |
 | Drag anywhere else | look |
 | Hold | mine the targeted block / attack a mob |
-| Tap | place block, eat food, use a crafting table or furnace |
+| Tap | place block, eat food, use a table / furnace / chest / bed, till, plant, shear |
+| Tap a slot (inventory) | pick up / put down; hold a slot to take half |
 | Hold with a bow | draw; release to fire |
 | Hold with a shield | raise it to block |
 | ▲ button | jump / swim up (hold) |
@@ -124,10 +134,11 @@ than one mesh, so an animated body costs more draw calls than a rigid one:
 | --- | --- | --- |
 | Zombie | 4 (body, both arms together, each leg) | 1 |
 | Skeleton | 4, plus 2 for the bow it carries | 1, plus the bow |
-| Pig | 3 (body, two diagonal leg pairs) | 1 |
+| Pig, cow, sheep | 4 (body, head, two diagonal leg pairs) | 1 |
+| Villager | 4 (body with folded arms, head, each leg) | 1 |
 | Player | 6 (head, torso, two arms, two legs) | 1 |
 
-With the caps in place — 24 mobs and 2 other players — that is at most ~108
+With the caps in place — 28 mobs and 2 other players — that is at most ~124
 draw calls animated against ~26 merged. Both are small next to the few hundred
 the terrain costs, so limb animation is on everywhere by default. It is only
 traded away at the *bottom* of the quality ladder, below resolution and view
@@ -143,9 +154,19 @@ controls, `?server=host:port` points multiplayer at a specific server.
 ## Multiplayer
 
 Up to **3 players** per room — one host and two guests — with full PC/mobile
-cross-play. Pick **Multiplayer** on the start screen, enter a name, then either
-**Create Multiplayer World** (you get a 6-character code like `F7K2Q9` to share)
-or type a friend's code and **Join**.
+cross-play. Pick **Multiplayer** on the start screen and enter a name. The
+panel lists **your worlds**: every world you have hosted or visited on this
+server, with its host, how many people are in it and whether it is open right
+now or saved. **Join** an open one straight away, or **Open** a saved one
+(only its owner can). **Create** makes a new world (name optional) and gives
+you a 6-character code like `F7K2Q9` to share; friends type it in and **Join**.
+
+Worlds are saved on the server: block edits, chests and furnaces, mobs,
+dropped items and the clock, plus every player's inventory, armour, health,
+hunger and position under a stable per-browser key. Leave and come back — even
+after the server restarted — and you carry on where you left off. If the host
+leaves, the world keeps running and another player becomes host; the owner
+takes the chair back when they return.
 
 ### Playing from your phone
 
@@ -219,18 +240,26 @@ Two things that will bite you:
   takes a few seconds to wake, so the first join after a quiet spell may fail.
   Try again and it connects. `GET /health` returns room and player counts, and
   is also what wakes it.
+- **Free tiers forget.** Saved worlds are JSON files under `VOXEL_DATA_DIR`
+  (default `data/worlds`). Render's free disk is wiped on every deploy and
+  restart, so worlds survive a quiet spell but not a redeploy; attach a
+  persistent disk and point `VOXEL_DATA_DIR` at it to keep them for good.
 
 ### What is synchronised
 
 | Synchronised | Not synchronised |
 | --- | --- |
-| Player position, yaw, pitch, movement/jump/sneak/swing flags | Inventory and hotbar contents |
-| Joins, leaves, display names, room roster | |
-| Block breaks and placements (server-authoritative) | |
-| Player health, hunger and death (server-authoritative) | |
+| Player position, yaw, pitch, held item, and movement/jump/sneak/swing/use/hurt/dead/sleeping flags | Fall, drowning and starvation damage are computed on the client that suffers them (reported, clamped) |
+| Joins, leaves, display names, room roster, host changes | |
+| Block breaks and placements (server-authoritative, reach- and item-checked) | |
+| Inventories, armour, the crafting grid and cursor (server-authoritative) | |
+| Chests and furnaces: contents, fuel and smelting progress | |
+| Crops growing, furnaces lighting, tilled soil | |
+| Player health, hunger and death; death drops | |
+| Eating and sleeping; the night skip | |
 | Worn armour, drawn on other players' bodies | |
 | PvP damage from melee and arrows | |
-| Mobs — position, health, death, attack swings, bow draw (server-authoritative) | |
+| Mobs — position, health, death, swings, bow draw, grazing, looking around, wool | |
 | Arrows fired by mobs, simulated server-side | |
 | Dropped items, including who is allowed to pick one up | |
 | Mob loot, awarded to whoever landed the killing blow | |
@@ -239,15 +268,26 @@ Two things that will bite you:
 
 **Authority.** The server owns the world. It runs the same `RoomSimulation` the
 singleplayer client runs, over the same `TerrainGenerator`, so it knows what the
-ground looks like and can collide mobs against it. Mobs, dropped items and the
-day/night clock all live there and are broadcast as one `world_state` snapshot
-ten times a second, which clients interpolate. No client — host included —
-simulates a mob in a room, so nothing depends on one player's browser tab
-staying awake, and everyone sees the same creatures in the same places.
+ground looks like and can collide mobs against it. Mobs, dropped items,
+containers, crops, beds and the day/night clock all live there and are
+broadcast as one `world_state` snapshot ten times a second, which clients
+interpolate. No client — host included — simulates a mob in a room, so nothing
+depends on one player's browser tab staying awake, and everyone sees the same
+creatures in the same places.
+
+The server owns every inventory too. Clicks in the inventory screen are applied
+locally at once as a prediction and sent with a sequence number; the server
+replays the same slot code (`items/containers.ts`) on its own copy and replies
+with the inventory it now holds, which the client adopts once the reply has
+caught up with its last click. Block drops, mob loot, crafting results, smelted
+output, eaten food and thrown items all come from the server's copy, so a
+modified client cannot give itself anything.
 
 The server arbitrates damage too: it knows every player's last reported position
 and rejects a hit thrown from beyond melee/arrow range, so a modified client
-cannot snipe across the map. Damage values are clamped, not trusted.
+cannot snipe across the map. Damage values are clamped, not trusted. Block edits
+are checked for reach and for the item in hand; a rejected edit is reverted on
+the sender's screen.
 
 **Item handoff.** There is no trade window, exactly as in vanilla: you throw the
 item on the ground with **Q** (**Ctrl+Q** for the whole stack; hold a hotbar slot
@@ -263,19 +303,46 @@ for two seconds so it does not snap straight back.
 - Seeded terrain: continents/oceans, plains, hills, mountains, beaches, valleys,
   and cave systems carved by 3D noise (~6% of underground volume)
 - Ore generation by depth: coal, then iron, gold, and diamond deepest and rarest
-- 20 block types including gravel, bricks, glass, crafting table and furnace
+- 34 block types including gravel, bricks, glass, wool, hay, farmland, paths,
+  crops, beds, chests, crafting tables and (lit) furnaces; slabs and crop
+  sprites are meshed as partial blocks
 - Trees, water, day/night cycle driving sun, sky and fog
+- **Villages**: a well, four dirt paths, four to seven houses (cobblestone
+  floors, plank walls, log corners, glass windows, a bed, a chest stocked from
+  a seeded loot table, a crafting table or furnace) and up to three fenced
+  farms with a water channel and growing wheat or carrots. Laid out once per
+  144-block cell from the seed, so every player and every reload sees the same
+  village; villagers spawn by day, wander near home, look at you when you walk
+  up, and run from zombies
 
 **Survival and combat**
-- 20 health, 20 hunger; hunger drains with time and distance, regenerates health
-  when full, and starves you when empty
+- 20 health, 20 hunger. Hunger drains slowly with time (a full bar lasts about
+  95 minutes idle) and a little with every block walked, more when swimming,
+  plus a small cost per jump, swing and block broken — all in `constants.ts`.
+  Above 18 it slowly regenerates health; at zero it starves you
+- **Food**: apples from leaves, bread from wheat, carrots, and meat — pork,
+  beef and mutton, raw or cooked in a furnace (cooked restores more). Village
+  chests hold a starter kit. Farming: till dirt or grass with a hoe, plant
+  seeds or carrots, wait; crops grow through four stages near a player
+- **Beds**: craft one from wool and planks (or use a villager's). Sleeping is
+  only possible at night; in a room every living player must be in bed, then
+  the night is skipped for everyone and the bed becomes your respawn point.
+  Dying, leaving, a broken bed or a mob's hit gets you up
 - Fall damage, mob damage with knockback and invulnerability frames
+- **Death drops** everything you carried — inventory, armour, cursor — where
+  you fell, once, with tool wear intact; respawn comes with an empty bag
 - **Drowning**: fifteen seconds of air underwater, shown as ten bubbles above
   the food bar that burst one at a time. When they run out you lose a heart a
   second until you surface or die — armour and shields do not help. Coming up
   refills the bar about four times faster than it drained
-- Death screen and respawn at your world spawn point, naming what killed you
-- Passive pigs, hostile zombies and skeletons; all take damage, die and drop loot
+- Death screen and respawn at your spawn point (or your bed), naming what killed you
+- Passive pigs, cows and sheep in small herds on grass, villagers in villages,
+  hostile zombies and skeletons at night; all take damage, die with a keel-over
+  animation and drop from a loot table (`shared/loot.ts`)
+- **Animals** stroll, stand, look around, and (cows and sheep) put their head
+  down to graze; a hit sends them running. **Sheep** come in several fleece
+  colours; shears take the wool, which grows back in four minutes, and a
+  fleeced sheep drops wool on top of its mutton
 - **Zombies** chase the nearest player and swing in melee
 - **Skeletons** are archers: they hold you at 5–11 blocks, strafe rather than
   stand, need line of sight, and spend a visible second drawing the bow before
@@ -313,10 +380,13 @@ for two seconds so it does not snap straight back.
 - **Block cracks**: ten damage stages spread across the block you are mining,
   chosen from the same 0..1 progress the HUD bar uses
 - **Walking**: players and mobs have jointed limbs. Arms and legs counter-swing,
-  a pig moves on diagonal pairs, and the gait is driven by distance travelled
-  rather than by time, so it stays in step at any frame rate
-- **Attacks**: swings are visible on other players and on mobs, not just felt as
-  damage — the swing crosses the wire as one flag bit
+  four-legged animals move on diagonal pairs, and the gait is driven by
+  distance travelled rather than by time, so it stays in step at any frame rate
+- **Idle life**: animals and villagers turn their heads to look around, grazers
+  lower them to eat; both ease in and out rather than snapping
+- **Attacks and states**: swings, using an item (arm held out), the red hurt
+  flash, keeling over on death and lying down in bed are all visible on other
+  players and on mobs, not just felt — each crosses the wire as a flag bit
 - **Aiming**: a skeleton raises its bow and pulls the string back as it draws,
   then looses; the draw is a 0..1 level on the wire so every client sees the
   same shot building
@@ -326,13 +396,23 @@ for two seconds so it does not snap straight back.
 **Items and building**
 - Mining takes time based on block hardness and the tool you hold; the wrong
   tool tier means no drop at all (stone without a pickaxe drops nothing)
-- Broken blocks and dead mobs drop collectable item entities
+- Broken blocks and dead mobs drop collectable item entities; ripe crops drop
+  their harvest plus seeds, leaves occasionally drop an apple
 - 36-slot inventory with a 9-slot hotbar, stacking, and tool durability
-- Crafting: planks, sticks and a crafting table by hand; pickaxes, axes and
-  swords in four tiers at a table; smelting (iron, gold, glass, stone, bricks,
-  cooked food) at a furnace
-- Persistence in IndexedDB: seed, player state, inventory, health/hunger, and
-  per-chunk edit diffs
+- **Grid crafting**: a 2×2 grid in your pocket, 3×3 at a crafting table.
+  Shaped and shapeless recipes from one registry (`items/crafting.ts`),
+  matched anywhere on the grid and mirrored: planks, sticks, tables, chests,
+  furnaces, beds, bread, hay, shears, bows, arrows, shields, tools and hoes
+  in four tiers, armour in three
+- **Furnaces** with input, fuel and output slots, a fuel registry (coal smelts
+  eight items, planks one and a half, sticks half), burn time and progress
+  bars, and a lit block while the fire is going — they keep working while
+  nobody is looking, and across saves
+- **Chests** with 27 slots; contents live in the simulation, so in a room
+  everyone sees the same chest
+- Persistence in IndexedDB: seed, player state, inventory, health/hunger,
+  per-chunk edit diffs, and the simulation's state — chests, furnaces, mobs,
+  dropped items and the clock — validated field by field on the way back in
 
 ## Architecture
 
@@ -345,37 +425,47 @@ src/
   raycast.ts         Amanatides & Woo voxel DDA
   audio.ts           WebAudio generated sound effects
   sky.ts             day/night: sun/ambient lights, sky+fog colour keyframes
-  save.ts            IndexedDB store (meta, inventory, per-chunk edit diffs)
+  save.ts            IndexedDB store (meta, sim state, per-chunk edit diffs)
   items/
     items.ts         item registry: blocks, materials, food, tools, weapons
     inventory.ts     slots, stacking, durability, serialisation
-    crafting.ts      recipes and stations (hand / table / furnace)
+    crafting.ts      recipe registry (shaped + shapeless) and grid matching
+    smelting.ts      fuel and smelting registries
+    containers.ts    slot clicks, quick-move, grid crafting, chest/furnace slots
   shared/            runs identically in the browser and in Node
     voxel.ts         AABB-vs-voxel collision and ray/box tests, no THREE
-    mobsim.ts        mob behaviour (chase, shoot, wander/flee), drops, arrows
-    roomsim.ts       the world simulation: mobs, drops, loot, day/night clock
+    mobs.ts          mob registry: stats, shapes, loot and spawn rules
+    loot.ts          loot tables (mobs, shears, village chests), seeded rolls
+    harvest.ts       break time, tool tiers, what a block drops
+    save.ts          save schema + validation for worlds, players, sim state
+    mobsim.ts        mob behaviour (chase, shoot, wander/graze/flee), drops, arrows
+    roomsim.ts       the world simulation: mobs, drops, containers, crops, beds, clock
   entities/
     entity.ts        Entity base: gravity, buoyancy, voxel collision
     arrow.ts         swept projectile: reports block, mob and player hits
     models.ts        box models as jointed rigs (or one merged mesh), + posing
     manager.ts       lifecycle for client-side entities (arrows)
   game/
-    interaction.ts   mining progress, placing, attacking, eating, stations
+    interaction.ts   mining, placing, attacking, eating, tilling, shearing, using blocks
+    inventoryctl.ts  the inventory as the game acts on it; predicts, server corrects
     worldview.ts     renders mobs and drops from simulation snapshots
     handpose.ts      pure pose maths for the hand: strike curves, sway, swap
     viewmodel.ts     builds the held model and applies the pose to it
     breakoverlay.ts  the crack stages on the block being mined
   net/
     protocol.ts      wire types, limits and validators (shared with the server)
+    identity.ts      the stable per-browser player key
     config.ts        WebSocket URL resolution (query > env > same-host)
     client.ts        socket lifecycle, reconnect backoff, ping/RTT
-    session.ts       roster, state throttling, applying remote edits
-    remoteplayers.ts remote bodies, name labels, snapshot interpolation
+    session.ts       roster, state throttling, inventory/container/sleep replies
+    remoteplayers.ts remote bodies, name labels, snapshot interpolation, states
 server/
-  index.ts           authoritative room server (rooms, cap, edits, simulation)
+  index.ts           authoritative room server (rooms, inventories, containers, saves)
+  store.ts           world files on disk: atomic writes, backups, validation
   world.ts           server-side terrain + chunk cache with eviction
 tests/
   simulation.test.ts headless: terrain, mobs, loot, drops, memory bounds
+  gameplay.test.ts   clicks, grid crafting, furnaces, chests, crops, beds, saves, villages
   protocol.test.ts   every sanitiser, from an attacker's point of view
   animation.test.ts  rigs, gait, hand strokes, crack stages, the snapshot clock
   survival.test.ts   health, breath, drowning, and what the death screen says
@@ -384,9 +474,10 @@ tests/
   world/
     chunk.ts         flat Uint8Array voxel storage per 16x72x16 column
     noise.ts         seeded value noise + fBm
-    terrain.ts       heightmap layers, biome-ish masks, deterministic trees
+    terrain.ts       heightmap layers, biome-ish masks, deterministic trees, villages
+    village.ts       village layout (well, paths, houses, farms) and placement
     world.ts         chunk map, streaming, edit tracking, remesh queue
-    mesher.ts        culled face meshing with baked AO, opaque+water buffers
+    mesher.ts        culled face meshing with baked AO; cubes, slabs, crop sprites
   player/
     camera.ts        pointer-lock yaw/pitch
     player.ts        movement intent, water state, fall tracking
@@ -532,17 +623,22 @@ protocol is identical on both platforms.
 - No per-voxel light propagation — lighting is sun + ambient + baked AO, so
   caves aren't dark inside and torches don't exist yet. Hostile spawning is
   gated on time of day rather than light level for the same reason.
-- Mobs and dropped items are not saved; they despawn past 72 blocks (drops after
-  5 minutes) and respawn naturally. Only the seed, player state, inventory and
-  block edits persist. TODO hook: serialise `RoomSimulation.mobSnapshot()` and
-  `dropSnapshot()` alongside `SaveMeta`.
+- Mobs other than villagers still despawn past 72 blocks and drops after 5
+  minutes; what is alive at save time is saved (mobs and drops up to a cap of
+  256 each).
 - Mob AI has no pathfinding — zombies walk straight at you and hop one-block
   ledges, so they get stuck on complex terrain. Hook: `MobSim.update`.
-- Animation is procedural posing, not keyframes: bodies walk, swing, aim and
-  tilt their heads, but there is no jump, fall, sneak, swim, hurt-recoil or
-  death animation, and the first-person hand shows the item without an arm
-  behind it. Hook: more cases in `Rig.pose` and `Viewmodel.update`, which
-  already receive everything they would need.
+- Animation is procedural posing, not keyframes: bodies walk, swing, aim, use,
+  look around, graze, flash when hurt, keel over and lie in bed, but there is
+  no jump, fall, sneak or swim animation, and the first-person hand shows the
+  item without an arm behind it. Hook: more cases in `Rig.pose` and
+  `Viewmodel.update`, which already receive everything they would need.
+- Villages are one style on one terrain function: no biomes, no village
+  variants beyond layout, and a house on a steep slope is levelled into it
+  rather than terraced. Villagers wander, greet and flee but do not trade.
+- The recipe book fills the grid with a burst of ordinary slot clicks (up to
+  three per cell), which is what keeps the server free of recipe knowledge;
+  on a very slow connection the grid visibly fills in over a moment.
 - Mob arrows are simulated server-side while *player* arrows stay client-side
   (latency-compensated on the shooter's machine, hits reported). Two systems
   for one concept; unifying them means moving player arrows into
@@ -556,26 +652,23 @@ protocol is identical on both platforms.
 - Inventory is click-to-pick-up/click-to-place rather than true drag-and-drop.
   Dropping works from the hotbar (Q / Ctrl+Q, or hold a slot on touch) but not
   from a backpack slot while the inventory screen is open.
-- Dying keeps your inventory (deliberate for now). No shovels yet — `ToolKind`
-  already includes `'shovel'` as the extension point.
+- No shovels yet — `ToolKind` already includes `'shovel'` as the extension
+  point.
 - Only the shooter's client reports arrow hits, so damage is never
   double-applied. Remote arrows are spawned with the elapsed network time
   replayed, so they appear where they actually are rather than trailing the
   shot — but a hit still registers on the shooter's view of the world, so at
   high latency a very near-miss can differ between screens.
-- **Multiplayer:** inventories live on each client. The server owns the *world*
-  (mobs, drops, blocks, clock, damage) but not what is in your bag, so a
-  modified client could give itself items. Handing items over works — Q drops a
-  real entity the server arbitrates — but there is no trade window, exactly as
-  in vanilla.
-- **Multiplayer:** worlds are not saved. A room's edits live in server memory
-  and are gone when the host leaves. Hook: persist `Room.edits` in
-  `server/index.ts`.
-- **Multiplayer:** no host migration — the room closes when the host leaves,
-  and remaining players are told so.
-- **Multiplayer:** block edits are applied locally first and relayed; the
-  server validates coordinates, ids and rates, but does not re-check reach or
-  tool rules, so a modified client could place blocks it should not own.
+- **Multiplayer:** health lost to falls, drowning and starvation is computed
+  on the client that suffers it and reported (clamped) — mob and PvP damage,
+  eating and sleeping are the server's. A modified client could therefore
+  refuse to fall.
+- **Multiplayer:** the world list only shows worlds you have hosted or been
+  in; there is no public server browser, and a saved world can only be
+  reopened by the player key that created it — clear your browser storage and
+  you lose that key.
+- **Multiplayer:** saved worlds live on the server's disk (see *Free tiers
+  forget* above); there is no export or import of a world file yet.
 
 ## Next 5 features (priority order)
 
@@ -585,16 +678,14 @@ protocol is identical on both platforms.
    Hook: add a light array to `Chunk`, sample it in `emitFace`.
 2. **Web worker meshing/generation** — moves the remaining frame hitches off
    the main thread; `mesher.ts`/`terrain.ts` are already pure functions.
-3. **Chests and server-side containers** — a storage block whose contents live
-   in `RoomSimulation` rather than any client, which is how vanilla lets players
-   pool items in bulk and the natural place to start moving inventories
-   server-side. Hook: a new block in `blocks.ts` plus a container map on the
-   room, addressed the same way block edits already are.
-4. **Biomes and structures** — swap the single terrain function for a biome
-   table (desert, forest, snow) and scatter simple structures; the chunk
-   pipeline already supports it via `TerrainGenerator.generate`.
-5. **Multiplayer persistence and host migration** — save a room's edits on the
-   server so a world survives the host leaving, and promote a guest instead of
-   closing the room. The simulation already lives on the server, so nothing
-   about the world itself depends on the host any more; only the room's
-   lifecycle does. Hook: `Room.edits` and `leaveRoom` in `server/index.ts`.
+3. **Villager trading** — villagers already have homes, a greeting and a loot
+   registry; a trade screen is the chest UI with two slots and a table of
+   offers. Hook: `use_on_mob` in the protocol and `InventoryUi`'s container
+   section.
+4. **Biomes and village variants** — swap the single terrain function for a
+   biome table (desert, forest, snow) and give `village.ts` a palette per
+   biome; the chunk pipeline already supports it via `TerrainGenerator.generate`.
+5. **World export/import** — a saved world is one validated JSON document
+   (`shared/save.ts`), so downloading it from the server and uploading it
+   again, or moving a singleplayer world into a room, is a small UI over the
+   store that already exists.

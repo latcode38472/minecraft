@@ -2,17 +2,40 @@
 //
 // Run with:  npm run server        (node runs this .ts file directly)
 //
-// The server owns room membership, the world seed, and the authoritative set
-// of block edits. Clients apply their own edits immediately for responsiveness
-// and the server relays them; the server's copy is what late joiners receive,
-// so it is the source of truth for world state.
+// The server owns everything that matters: room membership, the world seed,
+// the block edits, every player's inventory, the chests and furnaces, the mobs
+// and dropped items, the clock and who is asleep. Clients predict their own
+// inventory clicks for responsiveness and are corrected by the server's reply;
+// they apply their own block edits immediately and the server relays them,
+// reverting any it rejects.
+//
+// Worlds are saved to disk (see store.ts) and can be reopened by their host,
+// with every player getting back the inventory and position they left with.
 //
 // It binds 0.0.0.0 by default so phones on the same Wi-Fi can connect.
 
+import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { RoomSimulation } from '../src/shared/roomsim.ts';
+import { BLOCKS, Block } from '../src/blocks.ts';
+import { MAX_HEALTH, MAX_HUNGER, SAVE_INTERVAL_MS } from '../src/constants.ts';
+import {
+  clickSlot,
+  closeHolding,
+  craftFromGrid,
+  createHolding,
+  setGridSize,
+  type ClickContext,
+  type Holding,
+} from '../src/items/containers.ts';
+import { Inventory } from '../src/items/inventory.ts';
+import { getItem } from '../src/items/items.ts';
+import { blockDrops, wearsTool } from '../src/shared/harvest.ts';
+import { RoomSimulation, blockKey, type BlockEntity } from '../src/shared/roomsim.ts';
+import { emptyWorldSave, type SavedPlayer, type WorldSave } from '../src/shared/save.ts';
+import type { SimPlayer } from '../src/shared/mobsim.ts';
 import { ServerWorld } from './world.ts';
+import { WorldStore } from './store.ts';
 import {
   CLIENT_TIMEOUT_MS,
   EDITS_PER_MESSAGE,
@@ -22,7 +45,7 @@ import {
   PROTOCOL_VERSION,
   RATE_LIMIT_EDITS_PER_SEC,
   MAX_ATTACK_RANGE,
-  MAX_DROP_RANGE,
+  MAX_INTERACT_RANGE,
   MAX_ARROWS_PER_MESSAGE,
   MAX_DROPS_PER_MESSAGE,
   MAX_MOBS_PER_MESSAGE,
@@ -41,25 +64,36 @@ import {
   isValidChunkKey,
   normalizeRoomCode,
   sanitizeDamage,
-  sanitizeDropRequest,
-  sanitizeEquipment,
   sanitizeName,
+  sanitizePlayerKey,
   sanitizePlayerState,
+  sanitizeSeq,
+  sanitizeSlotRef,
+  sanitizeWorldId,
+  sanitizeWorldName,
   type ChunkEditEntry,
+  type InventoryStateData,
   type JoinErrorReason,
   type PlayerInfo,
+  type PlayerRestoreData,
   type PlayerVitals,
   type ServerMessage,
   type WorldInfo,
+  type WorldListEntry,
 } from '../src/net/protocol.ts';
 
 const PORT = Number(process.env.PORT ?? process.env.VOXEL_SERVER_PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
-/** Rooms with no players are swept after this long (guards against leaks). */
+const DATA_DIR = process.env.VOXEL_DATA_DIR ?? 'data/worlds';
+/** Rooms with no players are kept in memory this long, then dropped (saved first). */
 const EMPTY_ROOM_TTL_MS = 60_000;
+/** How often a busy room is written to disk. */
+const AUTOSAVE_MS = SAVE_INTERVAL_MS * 6;
 const CHUNK_SIZE = 16;
 /** Cap total stored edits per room so one client cannot exhaust server memory. */
 const MAX_EDITS_PER_ROOM = 500_000;
+/** Inventory clicks arrive in bursts; allow a generous rate. */
+const RATE_LIMIT_INVENTORY_PER_SEC = 30;
 
 interface RateBucket {
   tokens: number;
@@ -70,39 +104,64 @@ interface Client {
   id: string;
   socket: WebSocket;
   name: string;
+  /** Stable per-browser key: what a player's saved data is filed under. */
+  key: string;
   room: Room | null;
   isHost: boolean;
   colorIndex: number;
   lastSeen: number;
-  /** Last position the client reported, used to validate attack range. */
+  /** Last position and look the client reported. */
   pos: { x: number; y: number; z: number };
-  /** Server-owned combat state — clients never set this directly. */
+  yaw: number;
+  pitch: number;
+  spawn: { x: number; y: number; z: number } | null;
+  /** Server-owned survival state — clients never set these directly. */
   health: number;
   hunger: number;
   dead: boolean;
-  /** Armour tier per slot, mirrored so late joiners see worn gear. */
-  equipment: number[];
-  buckets: { state: RateBucket; edits: RateBucket; other: RateBucket; combat: RateBucket };
+  /** Server-owned inventory, crafting grid and cursor. */
+  inventory: Inventory;
+  holding: Holding;
+  /** Block key of the chest or furnace this client has open, if any. */
+  container: string | null;
+  /** Last client action sequence number applied. */
+  lastAck: number;
+  /** Equipment tiers last broadcast, so gear only goes out when it changes. */
+  lastEquipment: string;
+  inventoryDirty: boolean;
+  buckets: {
+    state: RateBucket;
+    edits: RateBucket;
+    other: RateBucket;
+    combat: RateBucket;
+    inventory: RateBucket;
+  };
 }
-
-const MAX_HEALTH = 20;
-const MAX_HUNGER = 20;
 
 interface Room {
   code: string;
+  worldId: string;
+  name: string;
+  /** Player key of the world's owner, who can reopen it later. */
+  hostKey: string;
   hostId: string;
   clients: Map<string, Client>;
   world: WorldInfo;
+  serverWorld: ServerWorld;
   /** chunkKey -> (voxelIndex -> blockId). Mirrors the client's World.edits. */
   edits: Map<string, Map<number, number>>;
   editCount: number;
   emptySince: number | null;
-  /** Authoritative mobs, drops and day/night for this room. */
+  /** Authoritative mobs, drops, containers, crops and day/night for this room. */
   sim: RoomSimulation;
   lastSnapshotAt: number;
+  lastSaveAt: number;
+  /** Data of players who are not connected right now, by key. */
+  offlinePlayers: Map<string, SavedPlayer>;
 }
 
 const rooms = new Map<string, Room>();
+const store = new WorldStore(DATA_DIR);
 let nextClientId = 1;
 
 // --- Helpers ---
@@ -123,12 +182,8 @@ function makeRoomCode(): string {
   throw new Error('Could not allocate a unique room code');
 }
 
-function makeWorldInfo(): WorldInfo {
-  // The server picks the seed so every client in the room provably shares one.
-  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
-  // Spawn Y is resolved client-side from the terrain function; the server only
-  // fixes the column so all players land in the same place.
-  return { seed, spawn: { x: 8, y: 0, z: 8 }, generator: 'default' };
+function makeWorldId(): string {
+  return randomBytes(8).toString('hex');
 }
 
 function send(client: Client, msg: ServerMessage): void {
@@ -161,12 +216,16 @@ function playerInfo(client: Client): PlayerInfo {
     name: client.name,
     isHost: client.isHost,
     colorIndex: client.colorIndex,
-    equipment: client.equipment,
+    equipment: client.inventory.equipmentTiers(),
   };
 }
 
 function roster(room: Room): PlayerInfo[] {
   return [...room.clients.values()].map(playerInfo);
+}
+
+function simPlayers(room: Room): SimPlayer[] {
+  return [...room.clients.values()].map((c) => ({ id: c.id, position: c.pos, dead: c.dead }));
 }
 
 /** Lowest colour index not already taken in the room, so bodies stay distinct. */
@@ -241,44 +300,386 @@ function sendEditsFor(client: Client, room: Room, keys: string[]): void {
   flush(true);
 }
 
-function closeRoom(room: Room, reason: 'host_left' | 'server_shutdown', message: string): void {
-  broadcast(room, { t: 'room_closed', reason, message });
-  for (const client of room.clients.values()) {
-    client.room = null;
-    client.isHost = false;
-    // Let the message flush before dropping the socket.
-    setTimeout(() => client.socket.close(4000, reason), 50);
+function withinReach(client: Client, x: number, y: number, z: number, range = MAX_INTERACT_RANGE): boolean {
+  return Math.hypot(x + 0.5 - client.pos.x, y + 0.5 - (client.pos.y + 1), z + 0.5 - client.pos.z) <= range;
+}
+
+// --- Inventory authority ---
+
+function inventoryState(client: Client): InventoryStateData {
+  return {
+    ack: client.lastAck,
+    slots: client.inventory.serialize(),
+    armor: client.inventory.serializeArmor(),
+    cursor: client.holding.cursor ? { ...client.holding.cursor } : null,
+    craft: client.holding.craft.map((s) => (s ? { ...s } : null)),
+    gridSize: client.holding.gridSize,
+    selected: client.inventory.selected,
+  };
+}
+
+/** The container this client has open, or null when it is gone or out of reach. */
+function openEntity(client: Client): BlockEntity | null {
+  const room = client.room;
+  if (!room || !client.container) return null;
+  const entity = room.sim.containers.get(client.container);
+  if (!entity || !withinReach(client, entity.x, entity.y, entity.z, MAX_INTERACT_RANGE + 2)) {
+    closeContainer(client);
+    return null;
   }
-  room.clients.clear();
-  rooms.delete(room.code);
-  log(`room ${room.code} closed (${reason})`);
+  return entity;
+}
+
+function clickContext(client: Client): ClickContext {
+  const entity = openEntity(client);
+  return {
+    inventory: client.inventory,
+    holding: client.holding,
+    container: entity ? { kind: entity.kind, slots: entity.slots } : null,
+  };
+}
+
+function closeContainer(client: Client): void {
+  if (!client.container) return;
+  client.container = null;
+  send(client, { t: 'container_closed' });
+}
+
+/** Queue an inventory reply; sent once at the end of the message so bursts coalesce. */
+function markInventory(client: Client): void {
+  client.inventoryDirty = true;
+}
+
+function flushInventory(client: Client): void {
+  if (!client.inventoryDirty) return;
+  client.inventoryDirty = false;
+  send(client, { t: 'inventory', ...inventoryState(client) });
+  const room = client.room;
+  if (!room) return;
+  const gear = client.inventory.equipmentTiers();
+  const key = gear.join(',');
+  if (key !== client.lastEquipment) {
+    client.lastEquipment = key;
+    broadcast(room, { t: 'player_equipment', id: client.id, gear }, client.id);
+  }
+}
+
+/** Send a container's contents to everyone looking at it. */
+function syncContainer(room: Room, key: string): void {
+  const entity = room.sim.containers.get(key);
+  if (!entity) return;
+  const state = room.sim.containerSnapshot(entity);
+  for (const viewer of room.clients.values()) {
+    if (viewer.container === key) send(viewer, { t: 'container', ...state });
+  }
+}
+
+/** Throw a player's whole inventory on the ground where they died. */
+function dropInventoryOnDeath(room: Room, client: Client): void {
+  const at = client.pos;
+  room.sim.scatterStacks(client.inventory.slots, at.x, at.y + 0.6, at.z);
+  room.sim.scatterStacks(client.inventory.armor, at.x, at.y + 0.6, at.z);
+  room.sim.scatterStacks([client.holding.cursor, ...client.holding.craft], at.x, at.y + 0.6, at.z);
+  client.inventory.clear();
+  client.holding = createHolding(2);
+  closeContainer(client);
+  room.sim.wake(client.id);
+  markInventory(client);
+}
+
+function setDead(room: Room, client: Client): void {
+  if (client.dead) return;
+  client.dead = true;
+  client.health = 0;
+  dropInventoryOnDeath(room, client);
+  flushInventory(client);
+}
+
+// --- Persistence ---
+
+function savedPlayerFor(client: Client): SavedPlayer {
+  return {
+    key: client.key,
+    name: client.name,
+    x: client.pos.x,
+    y: client.pos.y,
+    z: client.pos.z,
+    yaw: client.yaw,
+    pitch: client.pitch,
+    // A dead player comes back alive at spawn, never dead where they fell.
+    health: client.dead ? MAX_HEALTH : client.health,
+    hunger: client.dead ? MAX_HUNGER : client.hunger,
+    selected: client.inventory.selected,
+    inventory: client.inventory.serialize(),
+    armor: client.inventory.serializeArmor(),
+    ...(client.spawn ? { spawn: { ...client.spawn } } : {}),
+  };
+}
+
+function buildSave(room: Room): WorldSave {
+  const edits: Record<string, number[]> = {};
+  for (const [key, chunk] of room.edits) {
+    if (chunk.size === 0) continue;
+    const pairs: number[] = [];
+    for (const [index, id] of chunk) pairs.push(index, id);
+    edits[key] = pairs;
+  }
+  const players: Record<string, SavedPlayer> = {};
+  for (const [key, saved] of room.offlinePlayers) players[key] = saved;
+  for (const client of room.clients.values()) players[client.key] = savedPlayerFor(client);
+  return {
+    ...emptyWorldSave(room.worldId, room.name, room.world.seed, room.hostKey),
+    ...room.sim.serialize(),
+    updated: Date.now(),
+    edits,
+    players,
+  };
+}
+
+function saveRoom(room: Room): void {
+  room.lastSaveAt = Date.now();
+  store.save(buildSave(room)).catch((err) => log(`save failed for ${room.worldId}`, err));
+}
+
+function saveRoomSync(room: Room): void {
+  try {
+    store.saveSync(buildSave(room));
+  } catch (err) {
+    log(`save failed for ${room.worldId}`, err);
+  }
+}
+
+// --- Rooms ---
+
+function makeWorldInfo(seed: number, serverWorld: ServerWorld): WorldInfo {
+  const spawn = serverWorld.terrain.findSpawnColumn();
+  return { seed, spawn: { x: spawn.x, y: spawn.y, z: spawn.z }, generator: 'default' };
+}
+
+/** Build a live room from a save (or a fresh one when `save` is new). */
+function openRoom(save: WorldSave): Room {
+  const edits = new Map<string, Map<number, number>>();
+  let editCount = 0;
+  for (const [key, pairs] of Object.entries(save.edits)) {
+    const chunk = new Map<number, number>();
+    for (let i = 0; i + 1 < pairs.length; i += 2) chunk.set(pairs[i], pairs[i + 1]);
+    edits.set(key, chunk);
+    editCount += chunk.size;
+  }
+  const serverWorld = new ServerWorld(save.seed, edits);
+  const room: Room = {
+    code: makeRoomCode(),
+    worldId: save.id,
+    name: save.name,
+    hostKey: save.host,
+    hostId: '',
+    clients: new Map(),
+    world: makeWorldInfo(save.seed, serverWorld),
+    serverWorld,
+    edits,
+    editCount,
+    emptySince: Date.now(),
+    sim: null as unknown as RoomSimulation,
+    lastSnapshotAt: 0,
+    lastSaveAt: Date.now(),
+    offlinePlayers: new Map(Object.entries(save.players)),
+  };
+  // The simulation owns mobs, drops, containers and time for the life of the room.
+  room.sim = new RoomSimulation(serverWorld, {
+    damagePlayer: (playerId, amount, fromX, fromZ) => {
+      const victim = room.clients.get(playerId);
+      if (!victim || victim.dead) return;
+      victim.health = Math.max(0, victim.health - amount);
+      const died = victim.health <= 0;
+      broadcast(room, {
+        t: 'player_hurt',
+        id: victim.id,
+        damage: amount,
+        by: 'mob',
+        health: victim.health,
+        dead: died,
+      });
+      send(victim, { t: 'knockback', fromX, fromZ });
+      if (room.sim.sleepers.has(victim.id)) {
+        room.sim.wake(victim.id);
+        send(victim, { t: 'sleep_result', sleeping: false, message: 'You were attacked in your sleep!' });
+      }
+      if (died) setDead(room, victim);
+    },
+    giveItems: (playerId, itemId, count, damage) => {
+      const target = room.clients.get(playerId);
+      if (!target || target.dead) return count;
+      const leftover = target.inventory.add(itemId, count, damage);
+      if (leftover < count) {
+        markInventory(target);
+        flushInventory(target);
+      }
+      return leftover;
+    },
+    onBlockChanged: (x, y, z, id) => {
+      recordEdit(room, x, y, z, id);
+      broadcast(room, { t: 'block_update', x, y, z, id, by: 'world' });
+    },
+    onWake: (playerId, reason) => {
+      const client = room.clients.get(playerId);
+      if (!client) return;
+      const message =
+        reason === 'morning' ? 'Good morning.' : reason === 'bed_gone' ? 'Your bed was broken.' : undefined;
+      send(client, { t: 'sleep_result', sleeping: false, message });
+    },
+  });
+  room.sim.restore(save);
+  rooms.set(room.code, room);
+  return room;
+}
+
+function roomForWorld(worldId: string): Room | undefined {
+  for (const room of rooms.values()) if (room.worldId === worldId) return room;
+  return undefined;
+}
+
+function restoreDataFor(saved: SavedPlayer): PlayerRestoreData {
+  return {
+    x: saved.x,
+    y: saved.y,
+    z: saved.z,
+    yaw: saved.yaw,
+    pitch: saved.pitch,
+    health: saved.health,
+    hunger: saved.hunger,
+    ...(saved.spawn ? { spawn: saved.spawn } : {}),
+  };
+}
+
+/** Put a client into a room, restoring their saved self if they have one. */
+function enterRoom(client: Client, room: Room, name: string): PlayerRestoreData | undefined {
+  // The same key already connected (a reconnect racing the old socket's
+  // timeout): the old body leaves so the player is never in the room twice.
+  for (const other of [...room.clients.values()]) {
+    if (other.key === client.key && other.id !== client.id) {
+      leaveRoom(other);
+      other.socket.close(4001, 'replaced');
+    }
+  }
+
+  client.name = name;
+  client.colorIndex = pickColorIndex(room);
+  client.room = room;
+  client.inventory = new Inventory();
+  client.holding = createHolding(2);
+  client.container = null;
+  client.lastAck = 0;
+  client.dead = false;
+  client.spawn = null;
+
+  const saved = room.offlinePlayers.get(client.key);
+  let restore: PlayerRestoreData | undefined;
+  if (saved) {
+    room.offlinePlayers.delete(client.key);
+    client.inventory.load(saved.inventory, saved.selected, saved.armor);
+    client.health = saved.health;
+    client.hunger = saved.hunger;
+    client.pos = { x: saved.x, y: saved.y, z: saved.z };
+    client.yaw = saved.yaw;
+    client.pitch = saved.pitch;
+    client.spawn = saved.spawn ? { ...saved.spawn } : null;
+    restore = restoreDataFor(saved);
+  } else {
+    client.health = MAX_HEALTH;
+    client.hunger = MAX_HUNGER;
+    client.pos = { x: room.world.spawn.x, y: room.world.spawn.y + 2, z: room.world.spawn.z };
+  }
+  client.lastEquipment = client.inventory.equipmentTiers().join(',');
+  client.isHost = room.clients.size === 0 || client.key === room.hostKey;
+  if (client.isHost) {
+    // The owner takes the chair back; whoever was standing in is demoted.
+    for (const other of room.clients.values()) other.isHost = false;
+    room.hostId = client.id;
+  }
+  room.clients.set(client.id, client);
+  room.emptySince = null;
+  return restore;
 }
 
 function leaveRoom(client: Client): void {
   const room = client.room;
   if (!room) return;
+  // Whatever was on the cursor or in the grid goes back in the bag first.
+  closeHolding(clickContext(client));
+  room.offlinePlayers.set(client.key, savedPlayerFor(client));
   room.clients.delete(client.id);
+  room.sim.removePlayer(client.id);
   client.room = null;
+  client.container = null;
 
   if (client.isHost) {
     client.isHost = false;
-    if (room.clients.size > 0) {
-      // No host migration by design: the room ends with its host.
-      closeRoom(room, 'host_left', 'The host left the world.');
-    } else {
-      rooms.delete(room.code);
-      log(`room ${room.code} removed (empty, host left)`);
+    const next = room.clients.values().next().value as Client | undefined;
+    if (next) {
+      // Host migration: the world goes on without its host.
+      next.isHost = true;
+      room.hostId = next.id;
+      broadcast(room, { t: 'player_left', id: client.id, players: roster(room) });
+      broadcast(room, { t: 'host_changed', id: next.id, players: roster(room) });
+      log(`${client.name} left room ${room.code}; ${next.name} is now host`);
     }
-    return;
+  } else {
+    broadcast(room, { t: 'player_left', id: client.id, players: roster(room) });
   }
 
-  broadcast(room, { t: 'player_left', id: client.id, players: roster(room) });
-  if (room.clients.size === 0) room.emptySince = Date.now();
+  if (room.clients.size === 0) {
+    room.emptySince = Date.now();
+    saveRoom(room);
+  }
   log(`${client.name} left room ${room.code} (${room.clients.size}/${MAX_PLAYERS})`);
 }
 
 function rejectJoin(client: Client, reason: JoinErrorReason, message: string): void {
   send(client, { t: 'join_error', reason, message });
+}
+
+/** Worlds this key owns or has played in: open rooms first, then saved ones. */
+function worldListFor(key: string): WorldListEntry[] {
+  const out: WorldListEntry[] = [];
+  const seen = new Set<string>();
+  for (const room of rooms.values()) {
+    const played =
+      room.hostKey === key ||
+      room.offlinePlayers.has(key) ||
+      [...room.clients.values()].some((c) => c.key === key);
+    if (!played) continue;
+    seen.add(room.worldId);
+    out.push({
+      id: room.worldId,
+      name: room.name,
+      host: room.hostKey === key ? 'You' : hostNameOf(room),
+      players: room.clients.size,
+      maxPlayers: MAX_PLAYERS,
+      status: 'open',
+      code: room.code,
+      updated: Date.now(),
+    });
+  }
+  for (const summary of store.list()) {
+    if (seen.has(summary.id)) continue;
+    if (summary.host !== key && !summary.playerKeys.includes(key)) continue;
+    out.push({
+      id: summary.id,
+      name: summary.name,
+      host: summary.host === key ? 'You' : 'A friend',
+      players: 0,
+      maxPlayers: MAX_PLAYERS,
+      status: 'saved',
+      updated: summary.updated,
+    });
+  }
+  return out.sort((a, b) => b.updated - a.updated).slice(0, 50);
+}
+
+function hostNameOf(room: Room): string {
+  const host = room.clients.get(room.hostId);
+  if (host) return host.name;
+  return room.offlinePlayers.get(room.hostKey)?.name ?? 'Host';
 }
 
 // --- Message handling ---
@@ -296,73 +697,57 @@ function handleMessage(client: Client, raw: string): void {
       return;
     }
 
+    case 'list_worlds': {
+      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
+      const key = sanitizePlayerKey(msg.key);
+      if (!key) return;
+      send(client, { t: 'world_list', worlds: worldListFor(key) });
+      return;
+    }
+
     case 'create_room': {
       if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
       if (msg.version !== PROTOCOL_VERSION) {
         rejectJoin(client, 'bad_version', 'This game version is out of date.');
         return;
       }
+      const key = sanitizePlayerKey(msg.key);
+      if (!key) {
+        rejectJoin(client, 'invalid', 'This game version is out of date.');
+        return;
+      }
+      client.key = key;
       // One room per connection: a client cannot spawn rooms in a loop.
       if (client.room) leaveRoom(client);
 
-      const edits = new Map<string, Map<number, number>>();
-      const world = makeWorldInfo();
-      const room: Room = {
-        code: makeRoomCode(),
-        hostId: client.id,
-        clients: new Map(),
-        world,
-        edits,
-        editCount: 0,
-        emptySince: null,
-        sim: null as unknown as RoomSimulation,
-        lastSnapshotAt: 0,
-      };
-      // The simulation owns mobs, drops and time for the life of the room.
-      room.sim = new RoomSimulation(new ServerWorld(world.seed, edits), {
-        damagePlayer: (playerId, amount, fromX, fromZ) => {
-          const victim = room.clients.get(playerId);
-          if (!victim || victim.dead) return;
-          victim.health = Math.max(0, victim.health - amount);
-          if (victim.health <= 0) victim.dead = true;
-          broadcast(room, {
-            t: 'player_hurt',
-            id: victim.id,
-            damage: amount,
-            by: 'mob',
-            health: victim.health,
-            dead: victim.dead,
-          });
-          send(victim, { t: 'knockback', fromX, fromZ });
-        },
-        giveItems: (playerId, itemId, count) => {
-          const target = room.clients.get(playerId);
-          if (!target) return count;
-          // The server does not model inventories; the client re-drops
-          // anything that does not fit, which closes the loop honestly.
-          send(target, { t: 'loot_grant', items: [{ id: itemId, count }] });
-          return 0;
-        },
-      });
-      client.name = sanitizeName(msg.name);
-      client.isHost = true;
-      client.colorIndex = 0;
-      client.health = MAX_HEALTH;
-      client.hunger = MAX_HUNGER;
-      client.dead = false;
-      client.equipment = [0, 0, 0, 0];
-      client.room = room;
-      room.clients.set(client.id, client);
-      rooms.set(room.code, room);
+      const worldId = msg.worldId === undefined ? null : sanitizeWorldId(msg.worldId);
+      if (msg.worldId !== undefined && worldId === null) {
+        rejectJoin(client, 'invalid', 'That world id is not valid.');
+        return;
+      }
+      if (worldId) {
+        openSavedWorld(client, worldId, sanitizeName(msg.name));
+        return;
+      }
 
+      const save = emptyWorldSave(
+        makeWorldId(),
+        sanitizeWorldName(msg.worldName),
+        Math.floor(Math.random() * 0xffffffff) >>> 0,
+        key,
+      );
+      const room = openRoom(save);
+      const restore = enterRoom(client, room, sanitizeName(msg.name));
       send(client, {
         t: 'room_created',
         code: room.code,
         self: playerInfo(client),
         world: room.world,
         players: roster(room),
+        ...(restore ? { restore } : {}),
       });
-      log(`${client.name} created room ${room.code} (seed ${room.world.seed})`);
+      log(`${client.name} created world "${room.name}" ${room.worldId} as room ${room.code} (seed ${room.world.seed})`);
+      saveRoom(room);
       return;
     }
 
@@ -372,6 +757,12 @@ function handleMessage(client: Client, raw: string): void {
         rejectJoin(client, 'bad_version', 'This game version is out of date.');
         return;
       }
+      const key = sanitizePlayerKey(msg.key);
+      if (!key) {
+        rejectJoin(client, 'invalid', 'This game version is out of date.');
+        return;
+      }
+      client.key = key;
       const code = normalizeRoomCode(msg.code);
       if (!code) {
         rejectJoin(client, 'invalid', 'That room code is not valid.');
@@ -382,37 +773,8 @@ function handleMessage(client: Client, raw: string): void {
         rejectJoin(client, 'room_not_found', 'Room not found.');
         return;
       }
-      // The cap is enforced here, on the server, so a crafted packet cannot
-      // squeeze a fourth player in.
-      if (room.clients.size >= MAX_PLAYERS) {
-        rejectJoin(client, 'room_full', 'This world already has 3 players.');
-        return;
-      }
       if (client.room) leaveRoom(client);
-
-      client.name = sanitizeName(msg.name);
-      client.isHost = false;
-      client.colorIndex = pickColorIndex(room);
-      client.health = MAX_HEALTH;
-      client.hunger = MAX_HUNGER;
-      client.dead = false;
-      client.equipment = [0, 0, 0, 0];
-      client.room = room;
-      room.clients.set(client.id, client);
-      room.emptySince = null;
-
-      send(client, {
-        t: 'join_success',
-        code: room.code,
-        self: playerInfo(client),
-        world: room.world,
-        players: roster(room),
-      });
-      // Ship the world's existing edits so late joiners see earlier changes.
-      sendEditsFor(client, room, [...room.edits.keys()]);
-      broadcast(room, { t: 'player_joined', player: playerInfo(client), players: roster(room) },
-        client.id);
-      log(`${client.name} joined room ${room.code} (${room.clients.size}/${MAX_PLAYERS})`);
+      joinExisting(client, room, sanitizeName(msg.name));
       return;
     }
 
@@ -422,42 +784,137 @@ function handleMessage(client: Client, raw: string): void {
     }
 
     case 'player_state': {
-      if (!client.room) return;
+      const room = client.room;
+      if (!room) return;
       if (!allow(client.buckets.state, RATE_LIMIT_STATE_PER_SEC)) return;
       const state = sanitizePlayerState(msg.s);
       if (!state) return;
-      // Remember where they claim to be, so attack range can be checked.
+      // Remember where they claim to be, so reach can be checked.
       client.pos.x = state.x;
       client.pos.y = state.y;
       client.pos.z = state.z;
-      broadcast(client.room, { t: 'player_state', id: client.id, s: state }, client.id);
+      client.yaw = state.yaw;
+      client.pitch = state.pitch;
+      // What is in the hand is the server's call, not the packet's.
+      const held = client.inventory.selectedStack;
+      if (held) state.h = held.id;
+      else delete state.h;
+      broadcast(room, { t: 'player_state', id: client.id, s: state }, client.id);
       return;
     }
 
-    case 'block_break':
-    case 'block_place': {
+    case 'block_break': {
       const room = client.room;
-      if (!room) return;
+      if (!room || client.dead) return;
       if (!allow(client.buckets.edits, RATE_LIMIT_EDITS_PER_SEC)) return;
       const { x, y, z } = msg as { x: unknown; y: unknown; z: unknown };
       if (!isValidBlockCoord(x, y, z)) return;
-      const id = msg.t === 'block_break' ? 0 : (msg as { id: unknown }).id;
-      if (!isValidBlockId(id)) return;
-
       const bx = x as number;
       const by = y as number;
       const bz = z as number;
-      if (!recordEdit(room, bx, by, bz, id)) {
+      const current = room.serverWorld.getBlock(bx, by, bz);
+      const def = BLOCKS[current];
+      if (!withinReach(client, bx, by, bz) || current === Block.Air || !def.breakable) {
+        // Put the block back on the sender's screen.
+        send(client, { t: 'block_update', x: bx, y: by, z: bz, id: current, by: 'world' });
+        return;
+      }
+      if (!recordEdit(room, bx, by, bz, Block.Air)) {
+        send(client, { t: 'block_update', x: bx, y: by, z: bz, id: current, by: 'world' });
         send(client, { t: 'error', message: 'This world has too many changes.' });
         return;
       }
-      room.sim.world.applyEdit?.(bx, by, bz, id);
+      const held = client.inventory.selectedStack;
+      room.serverWorld.applyEdit(bx, by, bz, Block.Air);
+      broadcast(room, { t: 'block_update', x: bx, y: by, z: bz, id: Block.Air, by: client.id }, client.id);
+      room.sim.blockRemoved(bx, by, bz);
+      // The drop is decided here, from the server's own copy of the hand, and
+      // lands in the world where the block was: whoever walks over it gets it.
+      for (const roll of blockDrops(def, held)) {
+        room.sim.spawnDrop(roll.id, roll.count, bx + 0.5, by + 0.5, bz + 0.5);
+      }
+      if (wearsTool(def, held)) {
+        client.inventory.damageSelected();
+        markInventory(client);
+        flushInventory(client);
+      }
+      return;
+    }
+
+    case 'block_place': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.edits, RATE_LIMIT_EDITS_PER_SEC)) return;
+      const { x, y, z, id } = msg as { x: unknown; y: unknown; z: unknown; id: unknown };
+      if (!isValidBlockCoord(x, y, z) || !isValidBlockId(id) || id === Block.Air) return;
+      const bx = x as number;
+      const by = y as number;
+      const bz = z as number;
+      const current = room.serverWorld.getBlock(bx, by, bz);
+      const revert = (): void =>
+        send(client, { t: 'block_update', x: bx, y: by, z: bz, id: current, by: 'world' });
+      const held = client.inventory.selectedStack;
+      const heldDef = held ? getItem(held.id) : undefined;
+      // You place what you hold: a block item, or seeds onto farmland.
+      const placesBlock = heldDef?.block === id;
+      const plants = heldDef?.plants === id;
+      const below = room.serverWorld.getBlock(bx, by - 1, bz);
+      if (
+        !heldDef ||
+        (!placesBlock && !plants) ||
+        !withinReach(client, bx, by, bz) ||
+        (current !== Block.Air && current !== Block.Water) ||
+        (plants && below !== Block.Farmland)
+      ) {
+        revert();
+        return;
+      }
+      if (!recordEdit(room, bx, by, bz, id)) {
+        revert();
+        send(client, { t: 'error', message: 'This world has too many changes.' });
+        return;
+      }
+      room.serverWorld.applyEdit(bx, by, bz, id);
+      room.sim.blockPlaced(bx, by, bz, id);
+      client.inventory.consumeSelected();
+      markInventory(client);
+      flushInventory(client);
       broadcast(room, { t: 'block_update', x: bx, y: by, z: bz, id, by: client.id }, client.id);
       return;
     }
 
-    case 'player_state': {
-      // (handled above; kept for exhaustiveness)
+    case 'till': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.edits, RATE_LIMIT_EDITS_PER_SEC)) return;
+      const { x, y, z } = msg as { x: unknown; y: unknown; z: unknown };
+      if (!isValidBlockCoord(x, y, z)) return;
+      const bx = x as number;
+      const by = y as number;
+      const bz = z as number;
+      const current = room.serverWorld.getBlock(bx, by, bz);
+      const held = client.inventory.selectedStack;
+      const tool = held ? getItem(held.id)?.tool : undefined;
+      const revert = (): void =>
+        send(client, { t: 'block_update', x: bx, y: by, z: bz, id: current, by: 'world' });
+      if (
+        tool?.kind !== 'hoe' ||
+        !withinReach(client, bx, by, bz) ||
+        (current !== Block.Dirt && current !== Block.Grass) ||
+        room.serverWorld.getBlock(bx, by + 1, bz) !== Block.Air
+      ) {
+        revert();
+        return;
+      }
+      if (!recordEdit(room, bx, by, bz, Block.Farmland)) {
+        revert();
+        return;
+      }
+      room.serverWorld.applyEdit(bx, by, bz, Block.Farmland);
+      client.inventory.damageSelected();
+      markInventory(client);
+      flushInventory(client);
+      broadcast(room, { t: 'block_update', x: bx, y: by, z: bz, id: Block.Farmland, by: client.id }, client.id);
       return;
     }
 
@@ -479,30 +936,32 @@ function handleMessage(client: Client, raw: string): void {
       if (dist > MAX_ATTACK_RANGE) return;
 
       victim.health = Math.max(0, victim.health - damage);
-      if (victim.health <= 0) victim.dead = true;
+      const died = victim.health <= 0;
       broadcast(room, {
         t: 'player_hurt',
         id: victim.id,
         damage,
         by: client.id,
         health: victim.health,
-        dead: victim.dead,
+        dead: died,
       });
+      if (died) setDead(room, victim);
       return;
     }
 
     case 'player_vitals': {
-      // A client reports damage it took locally (falls, mobs, starvation).
+      // A client reports damage it took locally (falls, starvation, drowning).
       // The server records it so everyone agrees, but clamps the values.
       const room = client.room;
       if (!room) return;
       if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
       if (!isFiniteNumber(msg.health)) return;
+      if (client.dead) return; // only a respawn brings a player back
       client.health = Math.max(0, Math.min(MAX_HEALTH, msg.health));
       if (isFiniteNumber(msg.hunger)) {
         client.hunger = Math.max(0, Math.min(MAX_HUNGER, msg.hunger));
       }
-      client.dead = client.health <= 0 || msg.dead === true;
+      if (client.health <= 0 || msg.dead === true) setDead(room, client);
       broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
       return;
     }
@@ -516,17 +975,6 @@ function handleMessage(client: Client, raw: string): void {
       client.dead = false;
       broadcast(room, { t: 'player_respawned', id: client.id });
       broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
-      return;
-    }
-
-    case 'equipment': {
-      const room = client.room;
-      if (!room) return;
-      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
-      const gear = sanitizeEquipment(msg.gear);
-      if (!gear) return;
-      client.equipment = gear;
-      broadcast(room, { t: 'player_equipment', id: client.id, gear }, client.id);
       return;
     }
 
@@ -550,30 +998,211 @@ function handleMessage(client: Client, raw: string): void {
       return;
     }
 
+    case 'use_on_mob': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
+      if (!Number.isInteger(msg.mob)) return;
+      const mob = room.sim.mobs.get(msg.mob as number);
+      const held = client.inventory.selectedStack;
+      if (!mob || !held || getItem(held.id)?.tool?.kind !== 'shears') return;
+      if (
+        Math.hypot(mob.position.x - client.pos.x, mob.position.y - client.pos.y, mob.position.z - client.pos.z) >
+        MAX_INTERACT_RANGE
+      ) {
+        return;
+      }
+      if (room.sim.shearMob(mob.id, client.id)) {
+        client.inventory.damageSelected();
+        markInventory(client);
+        flushInventory(client);
+      }
+      return;
+    }
+
     case 'drop_item': {
-      // Two callers: vanilla's Q (thrown from the player, so it carries an
-      // owner and cannot be re-grabbed for a moment), and the drop from a block
-      // the sender just mined (positioned, and free for anyone to collect).
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.inventory, RATE_LIMIT_INVENTORY_PER_SEC)) return;
+      const seq = sanitizeSeq(msg.seq);
+      if (seq === null) return;
+      client.lastAck = seq;
+      const stack = client.inventory.selectedStack;
+      if (stack) {
+        const count = msg.all === true ? stack.count : 1;
+        const damage = stack.damage;
+        stack.count -= count;
+        if (stack.count <= 0) client.inventory.slots[client.inventory.selected] = null;
+        client.inventory.version++;
+        room.sim.spawnDrop(stack.id, count, client.pos.x, client.pos.y + 1.2, client.pos.z, client.id, damage);
+      }
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'select_slot': {
+      if (!client.room) return;
+      if (!allow(client.buckets.inventory, RATE_LIMIT_INVENTORY_PER_SEC)) return;
+      if (!Number.isInteger(msg.index)) return;
+      client.inventory.selectSlot(msg.index as number);
+      return;
+    }
+
+    case 'inv_click': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.inventory, RATE_LIMIT_INVENTORY_PER_SEC)) return;
+      const seq = sanitizeSeq(msg.seq);
+      const slot = sanitizeSlotRef(msg.slot);
+      if (seq === null || !slot) return;
+      client.lastAck = seq;
+      const ctx = clickContext(client);
+      const button = msg.button === 1 ? 1 : 0;
+      if (clickSlot(ctx, slot, button, msg.shift === true) && slot.kind === 'container' && client.container) {
+        room.sim.dirtyContainers.add(client.container);
+      }
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'inv_craft': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.inventory, RATE_LIMIT_INVENTORY_PER_SEC)) return;
+      const seq = sanitizeSeq(msg.seq);
+      if (seq === null) return;
+      client.lastAck = seq;
+      craftFromGrid(clickContext(client), msg.all === true);
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'inv_close': {
       const room = client.room;
       if (!room) return;
+      if (!allow(client.buckets.inventory, RATE_LIMIT_INVENTORY_PER_SEC)) return;
+      const seq = sanitizeSeq(msg.seq);
+      if (seq === null) return;
+      client.lastAck = seq;
+      const ctx = clickContext(client);
+      const overflow = [...closeHolding(ctx), ...setGridSize(ctx, 2)];
+      room.sim.scatterStacks(overflow, client.pos.x, client.pos.y + 1, client.pos.z);
+      client.container = null;
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'open_container': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
+      const { x, y, z } = msg as { x: unknown; y: unknown; z: unknown };
+      if (!isValidBlockCoord(x, y, z)) return;
+      const bx = x as number;
+      const by = y as number;
+      const bz = z as number;
+      if (!withinReach(client, bx, by, bz)) return;
+      const entity = room.sim.openContainer(bx, by, bz);
+      if (!entity) return;
+      const ctx = clickContext(client);
+      room.sim.scatterStacks(setGridSize(ctx, 2), client.pos.x, client.pos.y + 1, client.pos.z);
+      client.container = blockKey(bx, by, bz);
+      send(client, { t: 'container', ...room.sim.containerSnapshot(entity) });
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'open_grid': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
+      const size = msg.size === 3 ? 3 : 2;
+      if (size === 3) {
+        // A big grid needs a real crafting table within reach.
+        const { x, y, z } = msg as { x: unknown; y: unknown; z: unknown };
+        if (!isValidBlockCoord(x, y, z)) return;
+        const bx = x as number;
+        const by = y as number;
+        const bz = z as number;
+        if (!withinReach(client, bx, by, bz) || room.serverWorld.getBlock(bx, by, bz) !== Block.CraftingTable) return;
+      }
+      closeContainer(client);
+      const ctx = clickContext(client);
+      room.sim.scatterStacks(setGridSize(ctx, size), client.pos.x, client.pos.y + 1, client.pos.z);
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'eat': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.inventory, RATE_LIMIT_INVENTORY_PER_SEC)) return;
+      const seq = sanitizeSeq(msg.seq);
+      if (seq === null) return;
+      client.lastAck = seq;
+      const stack = client.inventory.selectedStack;
+      const food = stack ? getItem(stack.id)?.food : undefined;
+      if (food && client.hunger < MAX_HUNGER) {
+        client.hunger = Math.min(MAX_HUNGER, client.hunger + food.hunger);
+        client.inventory.consumeSelected();
+        send(client, { t: 'vitals_set', health: client.health, hunger: client.hunger });
+        broadcast(room, { t: 'player_vitals', vitals: roomVitals(room) });
+      }
+      markInventory(client);
+      flushInventory(client);
+      return;
+    }
+
+    case 'sleep': {
+      const room = client.room;
+      if (!room || client.dead) return;
+      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
+      const { x, y, z } = msg as { x: unknown; y: unknown; z: unknown };
+      if (!isValidBlockCoord(x, y, z)) return;
+      const bx = x as number;
+      const by = y as number;
+      const bz = z as number;
+      if (!withinReach(client, bx, by, bz)) return;
+      // Sleeping also sets the respawn point, so a bed is home.
+      const result = room.sim.trySleep(client.id, bx, by, bz, simPlayers(room));
+      if (result.ok) client.spawn = { x: bx + 0.5, y: by + 1, z: bz + 0.5 };
+      send(client, { t: 'sleep_result', sleeping: result.ok, message: result.message });
+      return;
+    }
+
+    case 'wake': {
+      const room = client.room;
+      if (!room) return;
+      if (!allow(client.buckets.other, RATE_LIMIT_OTHER_PER_SEC)) return;
+      room.sim.wake(client.id);
+      send(client, { t: 'sleep_result', sleeping: false });
+      return;
+    }
+
+    case 'arrow_spawn': {
+      const room = client.room;
+      if (!room || client.dead) return;
       if (!allow(client.buckets.combat, RATE_LIMIT_COMBAT_PER_SEC)) return;
-      const request = sanitizeDropRequest(msg);
-      if (!request) return;
-      if (!request.p) {
-        room.sim.spawnDrop(
-          request.item, request.count,
-          client.pos.x, client.pos.y + 1.2, client.pos.z,
-          client.id,
-        );
-        return;
-      }
-      // A positioned drop must be within arm's reach of where the sender says
-      // they are, so nobody can conjure items on the far side of the world.
-      const [dx, dy, dz] = request.p;
-      if (Math.hypot(dx - client.pos.x, dy - client.pos.y, dz - client.pos.z) > MAX_DROP_RANGE) {
-        return;
-      }
-      room.sim.spawnDrop(request.item, request.count, dx, dy, dz);
+      const { x, y, z, dx, dy, dz, speed } = msg as Record<string, unknown>;
+      if (![x, y, z, dx, dy, dz, speed].every(isFiniteNumber)) return;
+      broadcast(
+        room,
+        {
+          t: 'arrow_spawn',
+          by: client.id,
+          x: x as number, y: y as number, z: z as number,
+          dx: dx as number, dy: dy as number, dz: dz as number,
+          speed: Math.max(1, Math.min(80, speed as number)),
+          sentAt: Date.now(),
+        },
+        client.id,
+      );
       return;
     }
 
@@ -593,6 +1222,86 @@ function handleMessage(client: Client, raw: string): void {
   }
 }
 
+/** Join a room that is already loaded. */
+function joinExisting(client: Client, room: Room, name: string): void {
+  // The cap is enforced here, on the server, so a crafted packet cannot
+  // squeeze a fourth player in. A returning key replaces its old body first.
+  const returning = [...room.clients.values()].some((c) => c.key === client.key);
+  if (!returning && room.clients.size >= MAX_PLAYERS) {
+    rejectJoin(client, 'room_full', `This world already has ${MAX_PLAYERS} players.`);
+    return;
+  }
+  const restore = enterRoom(client, room, name);
+  send(client, {
+    t: 'join_success',
+    code: room.code,
+    self: playerInfo(client),
+    world: room.world,
+    players: roster(room),
+    ...(restore ? { restore } : {}),
+  });
+  // Ship the world's existing edits so late joiners see earlier changes.
+  sendEditsFor(client, room, [...room.edits.keys()]);
+  send(client, { t: 'inventory', ...inventoryState(client) });
+  send(client, { t: 'player_vitals', vitals: roomVitals(room) });
+  broadcast(room, { t: 'player_joined', player: playerInfo(client), players: roster(room) }, client.id);
+  if (client.isHost && room.clients.size > 1) {
+    broadcast(room, { t: 'host_changed', id: client.id, players: roster(room) }, client.id);
+  }
+  log(`${client.name} joined room ${room.code} (${room.clients.size}/${MAX_PLAYERS})`);
+}
+
+/** Reopen a saved world by id: only its owner may, and it may already be open. */
+function openSavedWorld(client: Client, worldId: string, name: string): void {
+  const live = roomForWorld(worldId);
+  if (live) {
+    if (live.hostKey !== client.key && !live.offlinePlayers.has(client.key)) {
+      rejectJoin(client, 'not_owner', 'That world belongs to someone else.');
+      return;
+    }
+    joinExisting(client, live, name);
+    return;
+  }
+  const summary = store.get(worldId);
+  if (!summary) {
+    rejectJoin(client, 'world_not_found', 'That world is not on this server any more.');
+    return;
+  }
+  if (summary.host !== client.key) {
+    rejectJoin(client, 'not_owner', 'Only the world’s owner can open it.');
+    return;
+  }
+  store
+    .load(worldId)
+    .then((save) => {
+      if (client.socket.readyState !== WebSocket.OPEN) return;
+      if (!save) {
+        rejectJoin(client, 'world_not_found', 'That world could not be read.');
+        return;
+      }
+      // Someone may have opened it while the file was loading.
+      const raced = roomForWorld(worldId);
+      const room = raced ?? openRoom(save);
+      if (client.room) leaveRoom(client);
+      const restore = enterRoom(client, room, name);
+      send(client, {
+        t: 'room_created',
+        code: room.code,
+        self: playerInfo(client),
+        world: room.world,
+        players: roster(room),
+        ...(restore ? { restore } : {}),
+      });
+      sendEditsFor(client, room, [...room.edits.keys()]);
+      send(client, { t: 'inventory', ...inventoryState(client) });
+      log(`${client.name} reopened world "${room.name}" ${room.worldId} as room ${room.code}`);
+    })
+    .catch((err) => {
+      log('failed to open world', err);
+      rejectJoin(client, 'world_not_found', 'That world could not be read.');
+    });
+}
+
 // --- Wiring ---
 
 const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -604,6 +1313,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
         ok: true,
         rooms: rooms.size,
         players: [...rooms.values()].reduce((n, r) => n + r.clients.size, 0),
+        worlds: store.list().length,
         protocol: PROTOCOL_VERSION,
       }),
     );
@@ -635,7 +1345,8 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   <p class="ok">&#9679; Multiplayer server is running.</p>
   <p class="muted">
     ${rooms.size} room${rooms.size === 1 ? '' : 's'},
-    ${players} player${players === 1 ? '' : 's'} online.
+    ${players} player${players === 1 ? '' : 's'} online,
+    ${store.list().length} saved world${store.list().length === 1 ? '' : 's'}.
   </p>
   <p>
     This address is the <em>server</em> — there is no game to play here. It is
@@ -658,20 +1369,30 @@ wss.on('connection', (socket: WebSocket) => {
     id: `p${nextClientId++}`,
     socket,
     name: 'Player',
+    key: '',
     room: null,
     isHost: false,
     colorIndex: 0,
     lastSeen: Date.now(),
     pos: { x: 0, y: 0, z: 0 },
+    yaw: 0,
+    pitch: 0,
+    spawn: null,
     health: MAX_HEALTH,
     hunger: MAX_HUNGER,
     dead: false,
-    equipment: [0, 0, 0, 0],
+    inventory: new Inventory(),
+    holding: createHolding(2),
+    container: null,
+    lastAck: 0,
+    lastEquipment: '0,0,0,0',
+    inventoryDirty: false,
     buckets: {
       state: newBucket(RATE_LIMIT_STATE_PER_SEC),
       edits: newBucket(RATE_LIMIT_EDITS_PER_SEC),
       other: newBucket(RATE_LIMIT_OTHER_PER_SEC),
       combat: newBucket(RATE_LIMIT_COMBAT_PER_SEC),
+      inventory: newBucket(RATE_LIMIT_INVENTORY_PER_SEC),
     },
   };
 
@@ -693,8 +1414,8 @@ wss.on('connection', (socket: WebSocket) => {
 });
 
 // --- Authoritative simulation loop ---
-// Every room steps at SIM_HZ and publishes a world snapshot at MOB_SYNC_HZ.
-// Clients render what arrives and never simulate mobs themselves.
+// Every room with players steps at SIM_HZ and publishes a world snapshot at
+// MOB_SYNC_HZ. Clients render what arrives and never simulate mobs themselves.
 let lastSimAt = Date.now();
 setInterval(() => {
   const now = Date.now();
@@ -702,15 +1423,31 @@ setInterval(() => {
   lastSimAt = now;
 
   for (const room of rooms.values()) {
-    const players = [...room.clients.values()].map((c) => ({
-      id: c.id,
-      position: c.pos,
-      dead: c.dead,
-    }));
+    // An empty room stands still: no one to see it, nothing to spend on it.
+    if (room.clients.size === 0) continue;
+    const players = simPlayers(room);
     room.sim.update(dt, players);
+
+    // Anything the simulation handed to players went out already; the rest of
+    // its side effects are drained here at the snapshot rate.
+    for (const key of room.sim.removedContainers.splice(0)) {
+      for (const client of room.clients.values()) {
+        if (client.container === key) closeContainer(client);
+      }
+    }
 
     if (now - room.lastSnapshotAt < 1000 / MOB_SYNC_HZ) continue;
     room.lastSnapshotAt = now;
+
+    for (const key of room.sim.dirtyContainers) syncContainer(room, key);
+    room.sim.dirtyContainers.clear();
+    // Players who wandered off from an open chest get it closed for them.
+    for (const client of room.clients.values()) openEntity(client);
+
+    // Block changes the simulation made went out as block_update messages
+    // through the onBlockChanged hook; the list only needs draining here.
+    room.sim.blocks.length = 0;
+    const sleep = room.sim.sleepSnapshot(players);
     broadcast(room, {
       t: 'world_state',
       time: Math.round(room.sim.timeOfDay * 10000) / 10000,
@@ -721,12 +1458,15 @@ setInterval(() => {
       arrows: room.sim.arrowSnapshot().slice(0, MAX_ARROWS_PER_MESSAGE),
       removedArrows: room.sim.removedArrows.splice(0),
       mobDeaths: room.sim.mobDeaths.splice(0),
+      ...(sleep ? { sleep } : {}),
     });
+
+    if (now - room.lastSaveAt > AUTOSAVE_MS) saveRoom(room);
   }
 }, 1000 / SIM_HZ);
 
 // Drop silent connections (backgrounded mobile tabs that never came back) and
-// sweep rooms that have sat empty.
+// unload rooms that have sat empty — they are already on disk.
 setInterval(() => {
   const now = Date.now();
   for (const socket of wss.clients) {
@@ -741,25 +1481,45 @@ setInterval(() => {
       }
     }
     if (room.clients.size === 0 && room.emptySince && now - room.emptySince > EMPTY_ROOM_TTL_MS) {
+      saveRoom(room);
       rooms.delete(room.code);
-      log(`room ${room.code} swept (empty)`);
+      log(`room ${room.code} unloaded (empty); world ${room.worldId} saved`);
     }
   }
 }, 10_000);
 
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => {
-    log('shutting down');
-    for (const room of [...rooms.values()]) {
-      closeRoom(room, 'server_shutdown', 'The server is restarting.');
+function shutdown(): void {
+  log('shutting down');
+  for (const room of [...rooms.values()]) {
+    // Everyone's inventory goes into the file before the socket drops.
+    for (const client of [...room.clients.values()]) {
+      closeHolding(clickContext(client));
     }
-    wss.close();
-    httpServer.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1000);
-  });
+    saveRoomSync(room);
+    broadcast(room, { t: 'room_closed', reason: 'server_shutdown', message: 'The server is restarting.' });
+    for (const client of room.clients.values()) {
+      client.room = null;
+      setTimeout(() => client.socket.close(4000, 'server_shutdown'), 50);
+    }
+    room.clients.clear();
+    rooms.delete(room.code);
+  }
+  wss.close();
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000);
 }
 
-httpServer.listen(PORT, HOST, () => {
-  log(`Voxelcraft multiplayer server listening on ws://${HOST}:${PORT}`);
-  log(`Health check: http://${HOST}:${PORT}/health`);
-});
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, shutdown);
+}
+
+store
+  .init()
+  .catch((err) => log(`could not index ${DATA_DIR}`, err))
+  .then(() => {
+    httpServer.listen(PORT, HOST, () => {
+      log(`Voxelcraft multiplayer server listening on ws://${HOST}:${PORT}`);
+      log(`Health check: http://${HOST}:${PORT}/health`);
+      log(`Worlds are saved in ${store.dir} (${store.list().length} on disk)`);
+    });
+  });

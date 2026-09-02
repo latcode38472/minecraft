@@ -73,6 +73,22 @@ export const ItemTile = {
   String: 62,
   Flint: 63,
   Bone: 74,
+  // 75-93 are block tiles (see Tile in blocks.ts); items resume at 100.
+  Wheat: 100,
+  WheatSeeds: 101,
+  Bread: 102,
+  Carrot: 103,
+  RawBeef: 104,
+  CookedBeef: 105,
+  RawMutton: 106,
+  CookedMutton: 107,
+  Apple: 108,
+  Shears: 109,
+  Bed: 110,
+  WoodenHoe: 111,
+  StoneHoe: 112,
+  IronHoe: 113,
+  DiamondHoe: 114,
 } as const;
 export type ItemTile = (typeof ItemTile)[keyof typeof ItemTile];
 
@@ -257,6 +273,121 @@ const AXE = [
   '....Ss..........',
   '....Ss..........',
   '...Ss...........',
+  '................',
+];
+// A hoe: a short blade bent down at right angles from the top of the haft.
+const HOE = [
+  '................',
+  '.....LLLLLL.....',
+  '....LHHHHHHL....',
+  '....LH...Ss.....',
+  '....HH..Ss......',
+  '.......Ss.......',
+  '.......Ss.......',
+  '......Ss........',
+  '......Ss........',
+  '.....Ss.........',
+  '.....Ss.........',
+  '....Ss..........',
+  '....Ss..........',
+  '...Ss...........',
+  '................',
+  '................',
+];
+// Shears: two blades crossing above a pair of looped handles.
+const SHEARS = [
+  '................',
+  '..LL........LL..',
+  '..LHL......LHL..',
+  '...LHL....LHL...',
+  '....LHL..LHL....',
+  '.....LHLLHL.....',
+  '......LHHL......',
+  '......DHHD......',
+  '.....DDsDDD.....',
+  '....Ds..s.sD....',
+  '...Ds....s.sD...',
+  '...Ds.....s.D...',
+  '...Ds.....s.D...',
+  '....DD...DD.....',
+  '................',
+  '................',
+];
+const WHEAT_SPRITE = [
+  '................',
+  '......LL..LL....',
+  '.....LHHLLHHL...',
+  '......LH..LH....',
+  '.....LHHLLHHL...',
+  '......LH..LH....',
+  '.....LHHLLHHL...',
+  '......LH..LH....',
+  '.....LHHLLHHL...',
+  '.......Ss.Ss....',
+  '.......Ss.Ss....',
+  '........SsS.....',
+  '........Ss......',
+  '........Ss......',
+  '................',
+  '................',
+];
+const SEEDS = [
+  '........',
+  '..H.....',
+  '.....H..',
+  '...H....',
+  '......H.',
+  '.H......',
+  '....H...',
+  '........',
+];
+const BREAD = [
+  '........',
+  '........',
+  '..HHHH..',
+  '.HLLLLH.',
+  'HLLDLLLH',
+  'HHHHHHHH',
+  '.HHHHHH.',
+  '........',
+];
+const CARROT = [
+  '.....LL.',
+  '....LLL.',
+  '...HHL..',
+  '..HHH...',
+  '.HHH....',
+  '.HH.....',
+  'HH......',
+  '........',
+];
+const APPLE = [
+  '....s...',
+  '...s....',
+  '.HHHHHH.',
+  'HHHHHHHH',
+  'HHHHHHHH',
+  'HHHHHHHH',
+  '.HHHHHH.',
+  '..HH.HH.',
+];
+// A single-block bed seen from above: a pillow, then the blanket.
+const BED_SPRITE = [
+  '................',
+  '.DDDDDDDDDDDDDD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DLLLLDHHHHHHHD.',
+  '.DDDDDDDDDDDDDD.',
+  '.Ss..........Ss.',
+  '.Ss..........Ss.',
+  '................',
   '................',
 ];
 const LUMP = [
@@ -658,6 +789,106 @@ function buildAtlas(): HTMLCanvasElement {
     }
     return cobble(px, py);
   });
+  // The same opening, roaring, for a furnace that is smelting.
+  fillSpeckled(ctx, Tile.FurnaceLit, [117, 117, 117], 0.08, (px, py, rand) => {
+    if (px >= 3 && px <= 12 && py >= 6 && py <= 13) {
+      const flame = 13 - py + (rand - 0.5) * 3;
+      if (flame > 4.5) return [246, 210, 90];
+      if (flame > 2.5) return [236, 140, 48];
+      if (flame > 1.2) return [196, 84, 32];
+      return [46, 36, 30];
+    }
+    return cobble(px, py);
+  });
+
+  // Wool: soft, fluffy, lightly tufted.
+  fillSpeckled(ctx, Tile.Wool, [236, 236, 232], 0.05, (px, py, rand) =>
+    rand < 0.12 && (px + py) % 3 === 0 ? [214, 214, 208] : null,
+  );
+
+  // Farmland: dark, moist soil furrowed in rows.
+  fillSpeckled(ctx, Tile.Farmland, [96, 66, 44], 0.1, (px, py) =>
+    py % 4 === 1 ? [74, 50, 32] : px % 5 === 2 && py % 4 === 3 ? [116, 82, 56] : null,
+  );
+
+  // Dirt path: trodden earth, lighter and smoother than dirt.
+  fillSpeckled(ctx, Tile.DirtPath, [150, 122, 76], 0.07, (px, py, rand) =>
+    rand < 0.1 ? [128, 102, 62] : (px * 3 + py) % 11 === 0 ? [166, 138, 88] : null,
+  );
+
+  // Hay bale: bundled straw, banded on the sides, spiralled on the ends.
+  const STRAW: RGB = [200, 164, 64];
+  fillSpeckled(ctx, Tile.HaySide, STRAW, 0.1, (px, py) => {
+    if (py === 4 || py === 11) return [122, 96, 44];
+    return px % 2 === 0 ? [214, 178, 76] : null;
+  });
+  fillSpeckled(ctx, Tile.HayTop, STRAW, 0.1, (px, py) => {
+    const ring = Math.max(Math.abs(px - 7.5), Math.abs(py - 7.5));
+    return Math.floor(ring) % 2 === 0 ? [172, 138, 54] : null;
+  });
+
+  // Chest: plank sides with a dark rim, a latch on the front.
+  const chestWood = (px: number, py: number): RGB | null => {
+    if (px === 0 || py === 0 || px === TILE_PX - 1 || py === TILE_PX - 1) return [92, 66, 34];
+    if (py === 6) return [110, 78, 40]; // the lid seam
+    return null;
+  };
+  fillSpeckled(ctx, Tile.ChestSide, [160, 116, 60], 0.05, chestWood);
+  fillSpeckled(ctx, Tile.ChestTop, [160, 116, 60], 0.05, (px, py) =>
+    px === 0 || py === 0 || px === TILE_PX - 1 || py === TILE_PX - 1 ? [92, 66, 34] : null,
+  );
+  fillSpeckled(ctx, Tile.ChestFront, [160, 116, 60], 0.05, (px, py) => {
+    if (px >= 7 && px <= 8 && py >= 5 && py <= 8) return [70, 70, 74]; // latch
+    return chestWood(px, py);
+  });
+
+  // Bed: a pillow at one end and a red blanket over the rest, on plank sides.
+  const BLANKET: RGB = [178, 46, 46];
+  fillSpeckled(ctx, Tile.BedTop, BLANKET, 0.05, (px, py) => {
+    if (px === 0 || px === TILE_PX - 1 || py === 0 || py === TILE_PX - 1) return [120, 84, 48];
+    if (px < 5) return [236, 236, 230]; // pillow
+    if (px === 5) return [140, 34, 34];
+    return null;
+  });
+  fillSpeckled(ctx, Tile.BedSide, PLANK, 0.05, (px, py) => {
+    if (py < 5) return px < 5 ? [236, 236, 230] : BLANKET;
+    if (py === 5) return [120, 84, 48];
+    return null;
+  });
+
+  // Crops: growth stages as cross sprites, from seedling to golden ear.
+  const cropStage = (tile: number, stage: number, ripe: RGB, stalk: RGB, shoots: number): void => {
+    fillSpeckled(ctx, tile, [0, 0, 0], 0, (px, py, rand) => {
+      // Each stage grows taller; the ripe one carries ears at the top.
+      const height = 4 + stage * 3;
+      const column = px % 4 === 1 || px % 4 === 2;
+      const shoot = Math.floor(px / 4);
+      if (!column || shoot >= shoots) return [0, 0, 0, 0] as RGBA;
+      const y = TILE_PX - 1 - py;
+      const sway = Math.floor(rand * 2);
+      if (y + sway > height) return [0, 0, 0, 0] as RGBA;
+      if (stage === 3 && y > height - 4) return ripe;
+      return px % 4 === 1 ? stalk : [stalk[0] * 0.8, stalk[1] * 0.8, stalk[2] * 0.8];
+    });
+  };
+  const WHEAT_STALK: RGB = [96, 168, 62];
+  cropStage(Tile.Wheat0, 0, [220, 186, 78], WHEAT_STALK, 3);
+  cropStage(Tile.Wheat1, 1, [220, 186, 78], WHEAT_STALK, 4);
+  cropStage(Tile.Wheat2, 2, [220, 186, 78], [150, 170, 62], 4);
+  cropStage(Tile.Wheat3, 3, [224, 190, 80], [196, 170, 70], 4);
+  const CARROT_TOP: RGB = [70, 150, 58];
+  cropStage(Tile.Carrots0, 0, CARROT_TOP, CARROT_TOP, 2);
+  cropStage(Tile.Carrots1, 1, CARROT_TOP, CARROT_TOP, 3);
+  cropStage(Tile.Carrots2, 2, CARROT_TOP, CARROT_TOP, 4);
+  fillSpeckled(ctx, Tile.Carrots3, [0, 0, 0], 0, (px, py, rand) => {
+    const column = px % 4 === 1 || px % 4 === 2;
+    if (!column) return [0, 0, 0, 0] as RGBA;
+    const y = TILE_PX - 1 - py;
+    if (y + Math.floor(rand * 2) > 13) return [0, 0, 0, 0] as RGBA;
+    // The orange root shows above the soil line on a ripe plant.
+    if (y < 3) return [226, 120, 40];
+    return px % 4 === 1 ? CARROT_TOP : [56, 120, 46];
+  });
 
   // --- Item icons ---
   const tool = (tile: number, shape: string[], tier: keyof typeof TIER_COLORS): void => {
@@ -720,6 +951,29 @@ function buildAtlas(): HTMLCanvasElement {
   drawSprite(ctx, ItemTile.String, STRING_SPRITE, { H: [232, 232, 226] });
   drawSprite(ctx, ItemTile.Flint, FLINT, { H: [72, 68, 68], D: [44, 42, 42] });
   drawSprite(ctx, ItemTile.Bone, BONE, { H: [226, 224, 208] });
+
+  // Farming, foraging and cooking.
+  tool(ItemTile.WoodenHoe, HOE, 'wood');
+  tool(ItemTile.StoneHoe, HOE, 'stone');
+  tool(ItemTile.IronHoe, HOE, 'iron');
+  tool(ItemTile.DiamondHoe, HOE, 'diamond');
+  drawSprite(ctx, ItemTile.Shears, SHEARS, {
+    H: [206, 208, 214], L: [236, 238, 242], D: [150, 152, 158], S: [150, 90, 50], s: [110, 66, 36],
+  });
+  drawSprite(ctx, ItemTile.Wheat, WHEAT_SPRITE, {
+    H: [222, 186, 78], L: [240, 212, 110], S: [176, 142, 60], s: [138, 108, 44],
+  });
+  drawSprite(ctx, ItemTile.WheatSeeds, SEEDS, { H: [120, 160, 60] });
+  drawSprite(ctx, ItemTile.Bread, BREAD, { H: [180, 122, 58], L: [214, 164, 92], D: [136, 88, 40] });
+  drawSprite(ctx, ItemTile.Carrot, CARROT, { H: [228, 122, 40], L: [92, 168, 62] });
+  drawSprite(ctx, ItemTile.Apple, APPLE, { H: [212, 52, 44], s: [110, 76, 44] });
+  drawSprite(ctx, ItemTile.RawBeef, MEAT, { H: [204, 78, 72], D: [236, 200, 190] });
+  drawSprite(ctx, ItemTile.CookedBeef, MEAT, { H: [126, 74, 44], D: [92, 52, 30] });
+  drawSprite(ctx, ItemTile.RawMutton, MEAT, { H: [230, 100, 96], D: [246, 220, 214] });
+  drawSprite(ctx, ItemTile.CookedMutton, MEAT, { H: [166, 104, 62], D: [122, 74, 42] });
+  drawSprite(ctx, ItemTile.Bed, BED_SPRITE, {
+    H: [178, 46, 46], L: [236, 236, 230], D: [120, 84, 48], S: [150, 108, 62], s: [110, 76, 44],
+  });
 
   drawCrackTiles(ctx);
 

@@ -244,7 +244,8 @@ test('other deaths are named too', () => {
   assert.equal(fall.survival.lastCause, 'fall');
 
   const starve = rig();
-  starve.survival.eat(-MAX_HEALTH); // no-op; hunger is drained below instead
-  starve.run(60 * 20); // long enough to empty the hunger bar and start starving
+  // Hunger now drains over the best part of two hours; start empty instead.
+  starve.survival.load(MAX_HEALTH, 0);
+  starve.run(10);
   assert.equal(starve.survival.lastCause, 'starve');
 });

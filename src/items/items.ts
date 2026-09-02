@@ -1,11 +1,16 @@
 // Item registry. Items are keyed by string id so recipes, drops and saves stay
 // readable and new items can be added in one place. Anything with a `block`
 // can be placed; anything with a `tool` mines faster; anything with `attack`
-// hits harder than a fist; anything with `food` restores hunger.
+// hits harder than a fist; anything with `food` restores hunger; anything with
+// `plants` can be sown on farmland.
+//
+// Imports carry explicit `.ts` extensions because the multiplayer server loads
+// this registry through Node's native type stripping, which does no extension
+// guessing.
 
-import { Block, type ToolKind } from '../blocks';
-import { ItemTile } from '../textures';
-import { BLOCKS } from '../blocks';
+import { Block, type ToolKind } from '../blocks.ts';
+import { ItemTile } from '../textures.ts';
+import { BLOCKS } from '../blocks.ts';
 
 /** Tool tiers: 0 hand, 1 wood, 2 stone, 3 iron, 4 diamond. */
 export const TIER_HAND = 0;
@@ -30,6 +35,13 @@ export interface ArmorStats {
   tier: number;
 }
 
+export interface FoodStats {
+  /** Hunger points restored (20 is a full bar). */
+  hunger: number;
+  /** Seconds the eating animation runs before the bite lands. */
+  eatTime: number;
+}
+
 export interface ItemDef {
   id: string;
   name: string;
@@ -38,12 +50,14 @@ export interface ItemDef {
   block?: Block;
   tool?: ToolStats;
   attack?: { damage: number; cooldown: number };
-  food?: { hunger: number };
+  food?: FoodStats;
   armor?: ArmorStats;
   /** Ranged weapon: charges up, then fires the named ammo item. */
   ranged?: { ammo: string; maxDamage: number; drawTime: number; durability: number };
   /** Held to block: reduces incoming damage while raised. */
   blocking?: { reduction: number; durability: number };
+  /** Seed: the crop block sown when used on farmland. */
+  plants?: Block;
 }
 
 const items = new Map<string, ItemDef>();
@@ -53,12 +67,12 @@ function register(def: ItemDef): ItemDef {
   return def;
 }
 
-/** Placeable block item; its icon is the block's side texture. */
-function blockItem(id: string, block: Block, name?: string): void {
+/** Placeable block item; its icon is the block's side texture unless given. */
+function blockItem(id: string, block: Block, name?: string, tile?: number): void {
   register({
     id,
     name: name ?? BLOCKS[block].name,
-    tile: BLOCKS[block].tiles.side,
+    tile: tile ?? BLOCKS[block].tiles.side,
     maxStack: 64,
     block,
   });
@@ -66,6 +80,10 @@ function blockItem(id: string, block: Block, name?: string): void {
 
 function material(id: string, name: string, tile: number): void {
   register({ id, name, tile, maxStack: 64 });
+}
+
+function food(id: string, name: string, tile: number, hunger: number, plants?: Block): void {
+  register({ id, name, tile, maxStack: 64, food: { hunger, eatTime: 1.2 }, plants });
 }
 
 const TOOL_TIERS = [
@@ -88,6 +106,7 @@ const SWORD_TILES = [
   ItemTile.IronSword,
   ItemTile.DiamondSword,
 ];
+const HOE_TILES = [ItemTile.WoodenHoe, ItemTile.StoneHoe, ItemTile.IronHoe, ItemTile.DiamondHoe];
 
 // --- Blocks ---
 blockItem('dirt', Block.Dirt);
@@ -107,6 +126,10 @@ blockItem('coal_ore', Block.CoalOre, 'Coal Ore');
 blockItem('iron_ore', Block.IronOre, 'Iron Ore');
 blockItem('gold_ore', Block.GoldOre, 'Gold Ore');
 blockItem('diamond_ore', Block.DiamondOre, 'Diamond Ore');
+blockItem('wool', Block.Wool);
+blockItem('chest', Block.Chest);
+blockItem('hay_bale', Block.HayBale, 'Hay Bale');
+blockItem('bed', Block.Bed, 'Bed', ItemTile.Bed);
 
 // --- Materials ---
 material('stick', 'Stick', ItemTile.Stick);
@@ -120,29 +143,28 @@ material('leather', 'Leather', ItemTile.Leather);
 material('string', 'String', ItemTile.String);
 material('flint', 'Flint', ItemTile.Flint);
 material('bone', 'Bone', ItemTile.Bone);
+material('wheat', 'Wheat', ItemTile.Wheat);
+register({
+  id: 'wheat_seeds',
+  name: 'Wheat Seeds',
+  tile: ItemTile.WheatSeeds,
+  maxStack: 64,
+  plants: Block.Wheat0,
+});
 
 // --- Food ---
-register({
-  id: 'raw_porkchop',
-  name: 'Raw Porkchop',
-  tile: ItemTile.RawPorkchop,
-  maxStack: 64,
-  food: { hunger: 3 },
-});
-register({
-  id: 'cooked_porkchop',
-  name: 'Cooked Porkchop',
-  tile: ItemTile.CookedPorkchop,
-  maxStack: 64,
-  food: { hunger: 8 },
-});
-register({
-  id: 'rotten_flesh',
-  name: 'Rotten Flesh',
-  tile: ItemTile.RottenFlesh,
-  maxStack: 64,
-  food: { hunger: 2 },
-});
+// Cooked meat is worth far more than raw, which is what makes the furnace
+// worth building; bread and carrots are the farmer's staples.
+food('raw_porkchop', 'Raw Porkchop', ItemTile.RawPorkchop, 3);
+food('cooked_porkchop', 'Cooked Porkchop', ItemTile.CookedPorkchop, 8);
+food('raw_beef', 'Raw Beef', ItemTile.RawBeef, 3);
+food('cooked_beef', 'Steak', ItemTile.CookedBeef, 8);
+food('raw_mutton', 'Raw Mutton', ItemTile.RawMutton, 2);
+food('cooked_mutton', 'Cooked Mutton', ItemTile.CookedMutton, 6);
+food('rotten_flesh', 'Rotten Flesh', ItemTile.RottenFlesh, 2);
+food('bread', 'Bread', ItemTile.Bread, 5);
+food('apple', 'Apple', ItemTile.Apple, 4);
+food('carrot', 'Carrot', ItemTile.Carrot, 3, Block.Carrots0);
 
 // --- Tools and weapons ---
 TOOL_TIERS.forEach((t, i) => {
@@ -170,6 +192,22 @@ TOOL_TIERS.forEach((t, i) => {
     tool: { kind: 'sword', tier: t.tier, speed: 1.5, durability: t.durability },
     attack: { damage: 3 + t.tier, cooldown: 0.35 },
   });
+  register({
+    id: `${t.key}_hoe`,
+    name: `${t.name} Hoe`,
+    tile: HOE_TILES[i],
+    maxStack: 1,
+    tool: { kind: 'hoe', tier: t.tier, speed: t.speed, durability: t.durability },
+    attack: { damage: 1, cooldown: 0.4 },
+  });
+});
+register({
+  id: 'shears',
+  name: 'Shears',
+  tile: ItemTile.Shears,
+  maxStack: 1,
+  tool: { kind: 'shears', tier: 1, speed: 6, durability: 238 },
+  attack: { damage: 1, cooldown: 0.4 },
 });
 
 // --- Combat gear ---
@@ -241,4 +279,9 @@ export function requireItem(id: string): ItemDef {
 
 export function allItems(): ItemDef[] {
   return [...items.values()];
+}
+
+/** Every item that can be eaten, for the food registry and the recipe book. */
+export function allFoods(): ItemDef[] {
+  return allItems().filter((def) => def.food !== undefined);
 }

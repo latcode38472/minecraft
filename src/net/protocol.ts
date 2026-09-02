@@ -9,7 +9,7 @@
 // Encoding is JSON today. Everything goes through encodeMessage/decodeMessage
 // so a binary codec can replace the transport without touching game code.
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Hard room cap: one host plus two guests. Enforced server-side. */
 export const MAX_PLAYERS = 3;
@@ -36,8 +36,17 @@ export const EDITS_PER_MESSAGE = 2000;
 // These mirror the game's own constants; the client asserts they agree at
 // startup (see session.ts) so the two can never silently drift apart.
 export const WORLD_HEIGHT_LIMIT = 72;
-export const MAX_BLOCK_ID = 19;
+export const MAX_BLOCK_ID = 34;
 export const MAX_HORIZONTAL_COORD = 30_000_000;
+
+/** Longest item id accepted from the wire; registry ids are far shorter. */
+export const ITEM_ID_MAX_LENGTH = 40;
+/** World names are shown in the world list, so they get the same scrub as names. */
+export const WORLD_NAME_MAX_LENGTH = 24;
+/** A world id is a hex string the server minted; anything else is rejected. */
+export const WORLD_ID_PATTERN = /^[a-f0-9]{8,32}$/;
+/** Player keys are minted by the client once and reused across sessions. */
+export const PLAYER_KEY_PATTERN = /^[a-f0-9]{16,64}$/;
 
 /** Client state send rate; remote players are interpolated between these. */
 export const STATE_SEND_HZ = 15;
@@ -68,8 +77,16 @@ export const FLAG_GROUNDED = 4;
 export const FLAG_SNEAKING = 8;
 /** Mid-swing: mining or attacking. Drives the arm animation on other screens. */
 export const FLAG_SWINGING = 16;
+/** Using the held item: eating, drawing a bow, raising a shield. */
+export const FLAG_USING = 32;
+/** Just took a hit: other screens flash the body red and knock it back a step. */
+export const FLAG_HURT = 64;
+/** Lying dead; the body topples instead of standing at the death spot. */
+export const FLAG_DEAD = 128;
+/** In bed; the body lies flat on the bed block. */
+export const FLAG_SLEEPING = 256;
 /** Mask applied to inbound flags — widen this when adding a flag above. */
-export const FLAG_MASK = 0x1f;
+export const FLAG_MASK = 0x1ff;
 
 export interface WorldInfo {
   seed: number;
@@ -121,7 +138,21 @@ export interface MobStateData {
    * coming and take cover instead of being hit out of nowhere.
    */
   d?: number;
+  /** Behaviour flags (MOB_FLAG_*), omitted when zero. */
+  f?: number;
+  /** Head yaw relative to the body while looking around; omitted when zero. */
+  hy?: number;
 }
+
+/** Head down, eating grass. */
+export const MOB_FLAG_GRAZING = 1;
+/** A sheep with its wool off. */
+export const MOB_FLAG_SHEARED = 2;
+/** Just took damage: flash red on every screen. */
+export const MOB_FLAG_HURT = 4;
+/** Sheep colour, a small palette index shifted into the flags. */
+export const MOB_FLAG_COLOR_SHIFT = 4;
+export const MOB_FLAG_COLOR_MASK = 0x7;
 
 /** An arrow fired by a mob, in flight. */
 export interface ArrowStateData {
@@ -136,6 +167,9 @@ export interface ArrowStateData {
 export const MOB_KIND_ZOMBIE = 0;
 export const MOB_KIND_PIG = 1;
 export const MOB_KIND_SKELETON = 2;
+export const MOB_KIND_COW = 3;
+export const MOB_KIND_SHEEP = 4;
+export const MOB_KIND_VILLAGER = 5;
 /** Server world-snapshot rate; clients interpolate between these. */
 export const MOB_SYNC_HZ = 10;
 /** How often the server steps its authoritative simulation. */
@@ -163,8 +197,81 @@ export interface WorldStateData {
   /** Arrows fired by mobs; player arrows are relayed separately. */
   arrows: ArrowStateData[];
   removedArrows: number[];
-  /** Where mobs died this tick, so clients can play the sound. */
-  mobDeaths: { x: number; y: number; z: number }[];
+  /** Mobs that died this tick: where (for the sound) and which (for the topple). */
+  mobDeaths: { i: number; k: number; x: number; y: number; z: number }[];
+  /** Blocks the simulation changed on its own this tick (crops, lit furnaces). */
+  blocks?: { x: number; y: number; z: number; id: number }[];
+  /** Who is in bed and how many sleepers a night skip needs; omitted when nobody is. */
+  sleep?: SleepStateData;
+}
+
+export interface SleepStateData {
+  sleeping: string[];
+  needed: number;
+}
+
+/** One inventory or container slot addressed on the wire. */
+export interface SlotRef {
+  kind: 'inv' | 'armor' | 'craft' | 'result' | 'container';
+  index: number;
+}
+
+export interface WireStack {
+  id: string;
+  count: number;
+  damage?: number;
+}
+
+/** Container kinds a client can have open. */
+export type ContainerKind = 'chest' | 'furnace';
+
+/** Everything the server knows about one player's inventory, sent after each change. */
+export interface InventoryStateData {
+  /** Sequence number of the last client action this state reflects. */
+  ack: number;
+  slots: (WireStack | null)[];
+  armor: (WireStack | null)[];
+  cursor: WireStack | null;
+  craft: (WireStack | null)[];
+  gridSize: 2 | 3;
+  selected: number;
+}
+
+export interface ContainerStateData {
+  x: number;
+  y: number;
+  z: number;
+  kind: ContainerKind;
+  slots: (WireStack | null)[];
+  /** Furnace only: seconds of fuel left, the fuel item's full burn, and smelt progress 0..1. */
+  burn?: number;
+  burnMax?: number;
+  progress?: number;
+}
+
+/** Where a returning player was when they last left, and how they were doing. */
+export interface PlayerRestoreData {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  health: number;
+  hunger: number;
+  spawn?: { x: number; y: number; z: number };
+}
+
+export interface WorldListEntry {
+  id: string;
+  name: string;
+  host: string;
+  players: number;
+  maxPlayers: number;
+  /** Open rooms can be joined by code; saved worlds wait for their host. */
+  status: 'open' | 'saved';
+  code?: string;
+  /** Last played, as a Unix time in ms. */
+  updated: number;
 }
 
 export const MAX_MOBS_PER_MESSAGE = 40;
@@ -172,11 +279,8 @@ export const MAX_MOBS_PER_MESSAGE = 40;
 export const MAX_DAMAGE_PER_HIT = 40;
 /** Melee/arrow hits are rejected beyond this range from the attacker. */
 export const MAX_ATTACK_RANGE = 24;
-/**
- * A positioned drop (from a mined block) must land within this far of the
- * sender. Reach is 5 blocks; the slack absorbs a stale position report.
- */
-export const MAX_DROP_RANGE = 9;
+/** Block edits and container use must happen within this far of the sender. */
+export const MAX_INTERACT_RANGE = 9;
 export const RATE_LIMIT_COMBAT_PER_SEC = 20;
 
 export interface PlayerStateData {
@@ -186,9 +290,17 @@ export interface PlayerStateData {
   yaw: number;
   pitch: number;
   flags: number;
+  /** Held item id, so other players see what is in your hand; absent when empty. */
+  h?: string;
 }
 
-export type JoinErrorReason = 'room_full' | 'room_not_found' | 'bad_version' | 'invalid';
+export type JoinErrorReason =
+  | 'room_full'
+  | 'room_not_found'
+  | 'bad_version'
+  | 'invalid'
+  | 'world_not_found'
+  | 'not_owner';
 
 /** One chunk's edits: the chunk key plus flat [voxelIndex, blockId] pairs. */
 export interface ChunkEditEntry {
@@ -197,11 +309,24 @@ export interface ChunkEditEntry {
   data: number[];
 }
 
+/** How a slot was clicked: 0 left (take/put all), 1 right (half/one). */
+export type ClickButton = 0 | 1;
+
 // --- Client -> server ---
 export type ClientMessage =
-  | { t: 'create_room'; name: string; version: number }
-  | { t: 'join_room'; code: string; name: string; version: number }
+  | {
+      t: 'create_room';
+      name: string;
+      version: number;
+      /** Stable per-browser key so the same person gets their inventory back. */
+      key: string;
+      /** Reopen this saved world (must belong to `key`) instead of making a new one. */
+      worldId?: string;
+      worldName?: string;
+    }
+  | { t: 'join_room'; code: string; name: string; version: number; key: string }
   | { t: 'leave_room' }
+  | { t: 'list_worlds'; key: string }
   | { t: 'player_state'; s: PlayerStateData }
   | { t: 'block_break'; x: number; y: number; z: number }
   | { t: 'block_place'; x: number; y: number; z: number; id: number }
@@ -210,26 +335,59 @@ export type ClientMessage =
   // Combat
   | { t: 'attack_player'; target: string; damage: number }
   | { t: 'player_vitals'; health: number; hunger: number; dead: boolean }
-  | { t: 'equipment'; gear: number[] }
   | { t: 'respawn' }
   // Server-authoritative world
   | { t: 'attack_mob'; mob: number; damage: number }
-  /** Throw an item into the world (vanilla's Q), for handing items to others. */
-  | { t: 'drop_item'; item: string; count: number; p?: [number, number, number] }
+  /** Use the held item on a mob: shears on a sheep. */
+  | { t: 'use_on_mob'; mob: number }
+  /** Throw the held stack (or one of it) into the world. */
+  | { t: 'drop_item'; seq: number; all: boolean }
   | {
       t: 'arrow_spawn';
       x: number; y: number; z: number;
       dx: number; dy: number; dz: number;
       speed: number;
-    };
+    }
+  // Server-authoritative inventory. Every action carries a client sequence
+  // number; the server's inventory reply echoes the last one it applied.
+  | { t: 'select_slot'; index: number }
+  | { t: 'inv_click'; seq: number; slot: SlotRef; button: ClickButton; shift: boolean }
+  | { t: 'inv_craft'; seq: number; all: boolean }
+  | { t: 'inv_close'; seq: number }
+  | { t: 'open_container'; x: number; y: number; z: number }
+  /** A 3x3 grid needs a crafting table in reach; its position is given. */
+  | { t: 'open_grid'; size: 2 | 3; x?: number; y?: number; z?: number }
+  /** Turn dirt or grass into farmland with the held hoe. */
+  | { t: 'till'; x: number; y: number; z: number }
+  | { t: 'eat'; seq: number }
+  | { t: 'sleep'; x: number; y: number; z: number }
+  | { t: 'wake' };
 
 // --- Server -> client ---
 export type ServerMessage =
-  | { t: 'room_created'; code: string; self: PlayerInfo; world: WorldInfo; players: PlayerInfo[] }
-  | { t: 'join_success'; code: string; self: PlayerInfo; world: WorldInfo; players: PlayerInfo[] }
+  | {
+      t: 'room_created';
+      code: string;
+      self: PlayerInfo;
+      world: WorldInfo;
+      players: PlayerInfo[];
+      /** Present when this key has played this world before. */
+      restore?: PlayerRestoreData;
+    }
+  | {
+      t: 'join_success';
+      code: string;
+      self: PlayerInfo;
+      world: WorldInfo;
+      players: PlayerInfo[];
+      restore?: PlayerRestoreData;
+    }
   | { t: 'join_error'; reason: JoinErrorReason; message: string }
+  | { t: 'world_list'; worlds: WorldListEntry[] }
   | { t: 'player_joined'; player: PlayerInfo; players: PlayerInfo[] }
   | { t: 'player_left'; id: string; players: PlayerInfo[] }
+  /** The host left and another player now holds the room. */
+  | { t: 'host_changed'; id: string; players: PlayerInfo[] }
   | { t: 'player_state'; id: string; s: PlayerStateData }
   | { t: 'world_info'; world: WorldInfo }
   | { t: 'block_update'; x: number; y: number; z: number; id: number; by: string }
@@ -240,7 +398,6 @@ export type ServerMessage =
   // Combat
   | { t: 'player_hurt'; id: string; damage: number; by: string; health: number; dead: boolean }
   | { t: 'player_equipment'; id: string; gear: number[] }
-  | { t: 'loot_grant'; items: { id: string; count: number }[] }
   | { t: 'player_vitals'; vitals: PlayerVitals[] }
   | { t: 'player_respawned'; id: string }
   /** A mob hit you: shove the local player away from it. */
@@ -255,7 +412,16 @@ export type ServerMessage =
       speed: number;
       /** Server receive time, so receivers can fast-forward out the latency. */
       sentAt: number;
-    };
+    }
+  // Server-authoritative inventory and containers.
+  | ({ t: 'inventory' } & InventoryStateData)
+  | ({ t: 'container' } & ContainerStateData)
+  /** The container you had open is gone (broken, or too far away now). */
+  | { t: 'container_closed' }
+  /** Your health/hunger as the server sees them, after eating or sleeping. */
+  | { t: 'vitals_set'; health: number; hunger: number }
+  /** You got into (or out of) bed; the client shows the dark overlay. */
+  | { t: 'sleep_result'; sleeping: boolean; message?: string };
 
 export function encodeMessage(msg: ClientMessage | ServerMessage): string {
   return JSON.stringify(msg);
@@ -302,7 +468,7 @@ export function sanitizePlayerState(raw: unknown): PlayerStateData | null {
   if (Math.abs(s.x) > MAX_HORIZONTAL_COORD || Math.abs(s.z) > MAX_HORIZONTAL_COORD) return null;
   if (s.y < -64 || s.y > WORLD_HEIGHT_LIMIT + 64) return null;
   const flags = isFiniteNumber(s.flags) ? Math.floor(s.flags) & FLAG_MASK : 0;
-  return {
+  const out: PlayerStateData = {
     x: s.x,
     y: s.y,
     z: s.z,
@@ -310,6 +476,13 @@ export function sanitizePlayerState(raw: unknown): PlayerStateData | null {
     pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, s.pitch)),
     flags,
   };
+  if (isItemId(s.h)) out.h = s.h;
+  return out;
+}
+
+/** Item ids are short registry keys; the receiver still checks the registry. */
+export function isItemId(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && v.length <= ITEM_ID_MAX_LENGTH;
 }
 
 export function wrapAngle(a: number): number {
@@ -353,26 +526,46 @@ export function sanitizeEquipment(raw: unknown): number[] | null {
   return out;
 }
 
-/**
- * A thrown item, or the drop from a block the sender just mined. The id is
- * checked against the registry by the receiver, and `p` — present only for
- * block drops — is range-checked against the sender's own position, so it can
- * never place items across the map.
- */
-export function sanitizeDropRequest(
-  raw: Record<string, unknown>,
-): { item: string; count: number; p: [number, number, number] | null } | null {
-  if (typeof raw.item !== 'string' || raw.item.length > 40) return null;
-  if (!Number.isInteger(raw.count) || (raw.count as number) < 1 || (raw.count as number) > 64) {
+const SLOT_KINDS: SlotRef['kind'][] = ['inv', 'armor', 'craft', 'result', 'container'];
+/** Largest slot index on any container (a chest has 27). */
+export const MAX_SLOT_INDEX = 63;
+
+/** A slot reference is a known kind plus a small non-negative index. */
+export function sanitizeSlotRef(raw: unknown): SlotRef | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const s = raw as Record<string, unknown>;
+  if (!SLOT_KINDS.includes(s.kind as SlotRef['kind'])) return null;
+  if (!Number.isInteger(s.index) || (s.index as number) < 0 || (s.index as number) > MAX_SLOT_INDEX) {
     return null;
   }
-  let p: [number, number, number] | null = null;
-  if (raw.p !== undefined) {
-    if (!Array.isArray(raw.p) || raw.p.length !== 3) return null;
-    for (const v of raw.p) if (!Number.isFinite(v)) return null;
-    p = [raw.p[0] as number, raw.p[1] as number, raw.p[2] as number];
-  }
-  return { item: raw.item, count: raw.count as number, p };
+  return { kind: s.kind as SlotRef['kind'], index: s.index as number };
+}
+
+/** Client sequence numbers are small non-negative integers. */
+export function sanitizeSeq(raw: unknown): number | null {
+  return Number.isInteger(raw) && (raw as number) >= 0 && (raw as number) < 2 ** 31
+    ? (raw as number)
+    : null;
+}
+
+export function sanitizePlayerKey(raw: unknown): string | null {
+  return typeof raw === 'string' && PLAYER_KEY_PATTERN.test(raw) ? raw : null;
+}
+
+export function sanitizeWorldId(raw: unknown): string | null {
+  return typeof raw === 'string' && WORLD_ID_PATTERN.test(raw) ? raw : null;
+}
+
+/** World names get the display-name scrub, with a longer cap and a different default. */
+export function sanitizeWorldName(raw: unknown, fallback = 'New World'): string {
+  if (typeof raw !== 'string') return fallback;
+  const cleaned = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    .replace(/[^\w \-.']/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, WORLD_NAME_MAX_LENGTH);
+  return cleaned.length > 0 ? cleaned : fallback;
 }
 
 /** Damage values are clamped, never trusted verbatim. */

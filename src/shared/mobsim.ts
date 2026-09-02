@@ -4,7 +4,9 @@
 // the snapshots it produces. Singleplayer runs the identical code locally, so
 // there is exactly one implementation of how a zombie behaves.
 //
-// No THREE, no DOM — just numbers and a BlockQuery.
+// Numbers and behaviour flags come from the mob registry (mobs.ts); loot comes
+// from the loot tables (loot.ts). No THREE, no DOM — just numbers and a
+// BlockQuery.
 
 import { Block } from '../blocks.ts';
 import {
@@ -12,57 +14,41 @@ import {
   NIGHT_END,
   NIGHT_START,
   TERMINAL_VELOCITY,
+  WOOL_REGROW_S,
   ZOMBIE_DETECT_RANGE,
 } from '../constants.ts';
+import {
+  MOB_FLAG_COLOR_SHIFT,
+  MOB_FLAG_GRAZING,
+  MOB_FLAG_HURT,
+  MOB_FLAG_SHEARED,
+} from '../net/protocol.ts';
+import { MOB_DEFS, pickSheepColor, type MobDef, type MobKind } from './mobs.ts';
+import { SHEAR_LOOT, SHEEP_WOOL_LOOT, rollLoot, type LootRoll } from './loot.ts';
+import type { SavedMob } from './save.ts';
 import { moveWithCollision, type BlockQuery, type BodyShape, type Vec3 } from './voxel.ts';
 
-export type MobKind = 'zombie' | 'pig' | 'skeleton';
+export type { MobKind } from './mobs.ts';
 
-export interface MobStats {
-  maxHealth: number;
-  shape: BodyShape;
-  speed: number;
-  /** Melee attackers only. */
-  attackDamage: number;
-  attackRange: number;
-  attackCooldown: number;
-}
-
-export const MOB_STATS: Record<MobKind, MobStats> = {
-  zombie: {
-    maxHealth: 20,
-    shape: { halfWidth: 0.3, height: 1.95 },
-    // Slower than the player's 4.3, so running away always works.
-    speed: 2.4,
-    attackDamage: 3,
-    attackRange: 1.7,
-    attackCooldown: 1.1,
-  },
-  pig: {
-    maxHealth: 10,
-    shape: { halfWidth: 0.45, height: 0.9 },
-    speed: 0.9,
-    attackDamage: 0,
-    attackRange: 0,
-    attackCooldown: 0,
-  },
-  skeleton: {
-    maxHealth: 16,
-    shape: { halfWidth: 0.3, height: 1.95 },
-    speed: 2.6,
-    // Damage comes from the arrow, not from touching you.
-    attackDamage: 0,
-    attackRange: 0,
-    attackCooldown: 0,
-  },
-};
-
-const PIG_FLEE_SPEED = 2.8;
-const PIG_FLEE_DURATION_S = 4;
+/** How long a hit keeps an animal running. */
+const FLEE_DURATION_S = 4;
 /** How long a landed hit keeps the mob's arms mid-swing on every client. */
 const SWING_TIME_S = 0.35;
 const HURT_FLASH_S = 0.4;
 const JUMP_SPEED = 7.2;
+/** A grazing animal keeps its head down this long. */
+const GRAZE_MIN_S = 2.5;
+const GRAZE_MAX_S = 5;
+/** Chance per idle stretch that a grazer eats rather than just standing. */
+const GRAZE_CHANCE = 0.45;
+/** How far a villager strays from home before turning back. */
+const VILLAGER_ROAM = 12;
+/** A villager runs from a zombie inside this range. */
+const VILLAGER_FEAR_RANGE = 8;
+/** A villager turns to look at a player standing this close. */
+const VILLAGER_GREET_RANGE = 5;
+/** Head turn limit while looking around, radians. */
+const LOOK_MAX = 0.9;
 
 // --- Skeleton -------------------------------------------------------------
 /** How far a skeleton will notice and start shooting at a player. */
@@ -127,11 +113,13 @@ let nextMobId = 1;
 export class MobSim {
   readonly id: number;
   readonly kind: MobKind;
-  readonly stats: MobStats;
+  readonly def: MobDef;
   readonly position: Vec3 = { x: 0, y: 0, z: 0 };
   readonly velocity: Vec3 = { x: 0, y: 0, z: 0 };
   health: number;
   yaw = 0;
+  /** Head yaw relative to the body: animals look around while idle. */
+  headYaw = 0;
   onGround = false;
   dead = false;
   /** Seconds of hurt flash left; doubles as a damage cooldown. */
@@ -146,6 +134,15 @@ export class MobSim {
    * coming rather than being hit out of nowhere.
    */
   drawTime = 0;
+  /** Seconds left with the head down in the grass; 0 when not grazing. */
+  grazeTime = 0;
+  /** Sheep: fleece off, and how long until it grows back. */
+  sheared = false;
+  woolTimer = 0;
+  /** Sheep: index into SHEEP_COLORS. */
+  color = 0;
+  /** Villagers: the spot they wander around. */
+  home: Vec3 | null = null;
 
   private attackCooldown = 0;
   private reloadTime = 0;
@@ -156,20 +153,23 @@ export class MobSim {
   private moving = false;
   private fleeTime = 0;
   private fleeFrom: [number, number] = [0, 0];
+  private lookTimer = 1 + Math.random() * 3;
+  private lookTarget = 0;
 
   constructor(kind: MobKind, x: number, y: number, z: number, id?: number) {
     this.id = id ?? nextMobId++;
     this.kind = kind;
-    this.stats = MOB_STATS[kind];
-    this.health = this.stats.maxHealth;
+    this.def = MOB_DEFS[kind];
+    this.health = this.def.maxHealth;
     this.position.x = x;
     this.position.y = y;
     this.position.z = z;
     this.yaw = Math.random() * Math.PI * 2;
+    if (kind === 'sheep') this.color = pickSheepColor(Math.random);
   }
 
   get shape(): BodyShape {
-    return this.stats.shape;
+    return this.def.shape;
   }
 
   takeDamage(amount: number, fromX: number, fromZ: number, attackerId: string | null): void {
@@ -177,6 +177,7 @@ export class MobSim {
     this.health -= amount;
     this.hurtTime = HURT_FLASH_S;
     this.lastAttackerId = attackerId;
+    this.grazeTime = 0;
 
     const dx = this.position.x - fromX;
     const dz = this.position.z - fromZ;
@@ -185,8 +186,8 @@ export class MobSim {
     this.velocity.z = (dz / len) * 6;
     this.velocity.y = Math.max(this.velocity.y, 3.2);
 
-    if (this.kind === 'pig') {
-      this.fleeTime = PIG_FLEE_DURATION_S;
+    if (!this.def.hostile) {
+      this.fleeTime = FLEE_DURATION_S;
       this.fleeFrom = [fromX, fromZ];
     }
     if (this.health <= 0) this.dead = true;
@@ -197,9 +198,24 @@ export class MobSim {
     this.attackCooldown = Math.max(0, this.attackCooldown - dt);
     this.swingTime = Math.max(0, this.swingTime - dt);
 
-    if (this.kind === 'zombie') this.updateZombie(dt, world, players, events);
-    else if (this.kind === 'skeleton') this.updateSkeleton(dt, world, players, events);
-    else this.updatePig(dt, world);
+    if (this.sheared) {
+      this.woolTimer = Math.max(0, this.woolTimer - dt);
+      if (this.woolTimer === 0) this.sheared = false;
+    }
+
+    switch (this.kind) {
+      case 'zombie':
+        this.updateZombie(dt, world, players, events);
+        break;
+      case 'skeleton':
+        this.updateSkeleton(dt, world, players, events);
+        break;
+      case 'villager':
+        this.updateVillager(dt, world, players);
+        break;
+      default:
+        this.updateAnimal(dt, world);
+    }
 
     this.applyGravity(dt, world);
   }
@@ -226,7 +242,7 @@ export class MobSim {
         this.wanderTimer = 3 + Math.random() * 4;
         this.wanderYaw = Math.random() * Math.PI * 2;
       }
-      this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.stats.speed * 0.3);
+      this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.def.speed * 0.3);
       return;
     }
 
@@ -240,9 +256,9 @@ export class MobSim {
     const clearShot = this.canSee(world, target);
 
     if (distance < SKELETON_PREFERRED_MIN) {
-      this.walkToward(world, -dx, -dz, this.stats.speed); // too close: back off
+      this.walkToward(world, -dx, -dz, this.def.speed); // too close: back off
     } else if (distance > SKELETON_PREFERRED_MAX || !clearShot) {
-      this.walkToward(world, dx, dz, this.stats.speed); // close in, or find an angle
+      this.walkToward(world, dx, dz, this.def.speed); // close in, or find an angle
       this.yaw = Math.atan2(dx / distance, dz / distance);
     } else if (this.drawTime === 0) {
       // In the pocket and not yet committed: circle, so it is a moving target.
@@ -251,7 +267,7 @@ export class MobSim {
         this.strafeTimer = 1.2 + Math.random() * 1.6;
         this.strafeDir = this.strafeDir === 1 ? -1 : 1;
       }
-      this.walkToward(world, -dz * this.strafeDir, dx * this.strafeDir, this.stats.speed * 0.7);
+      this.walkToward(world, -dz * this.strafeDir, dx * this.strafeDir, this.def.speed * 0.7);
       this.yaw = Math.atan2(dx / distance, dz / distance);
     } else {
       // Committed to the shot: plant the feet so the arrow goes where it aimed.
@@ -362,32 +378,20 @@ export class MobSim {
   ): void {
     // Chase the closest living player in range — in multiplayer that may be
     // any of them, which is what makes a zombie a shared threat.
-    let target: SimPlayer | null = null;
-    let bestSq = ZOMBIE_DETECT_RANGE * ZOMBIE_DETECT_RANGE;
-    for (const candidate of players) {
-      if (candidate.dead) continue;
-      const dx = candidate.position.x - this.position.x;
-      const dz = candidate.position.z - this.position.z;
-      const dy = candidate.position.y - this.position.y;
-      const sq = dx * dx + dz * dz;
-      if (sq < bestSq && Math.abs(dy) < 8) {
-        bestSq = sq;
-        target = candidate;
-      }
-    }
+    const target = this.nearestPlayer(players, ZOMBIE_DETECT_RANGE);
 
     if (target) {
       const dx = target.position.x - this.position.x;
       const dz = target.position.z - this.position.z;
       const dy = target.position.y - this.position.y;
-      this.walkToward(world, dx, dz, this.stats.speed);
+      this.walkToward(world, dx, dz, this.def.speed);
       if (
-        Math.sqrt(bestSq) < this.stats.attackRange &&
+        Math.hypot(dx, dz) < this.def.attackRange &&
         Math.abs(dy) < 2 &&
         this.attackCooldown === 0
       ) {
-        events.onPlayerHit(target.id, this.stats.attackDamage, this.position.x, this.position.z);
-        this.attackCooldown = this.stats.attackCooldown;
+        events.onPlayerHit(target.id, this.def.attackDamage, this.position.x, this.position.z);
+        this.attackCooldown = this.def.attackCooldown;
         this.swingTime = SWING_TIME_S;
       }
       return;
@@ -399,17 +403,23 @@ export class MobSim {
       this.wanderYaw = Math.random() * Math.PI * 2;
     }
     // Shamble aimlessly when nobody is close.
-    this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.stats.speed * 0.35);
+    this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.def.speed * 0.35);
   }
 
-  private updatePig(dt: number, world: BlockQuery): void {
+  /**
+   * Pigs, cows and sheep: stroll, stand, look around, and (for grazers) put
+   * the head down to eat. A hit sends them running for a few seconds.
+   */
+  private updateAnimal(dt: number, world: BlockQuery): void {
     if (this.fleeTime > 0) {
       this.fleeTime -= dt;
+      this.grazeTime = 0;
+      this.headYaw = 0;
       this.walkToward(
         world,
         this.position.x - this.fleeFrom[0],
         this.position.z - this.fleeFrom[1],
-        PIG_FLEE_SPEED,
+        this.def.fleeSpeed,
       );
       return;
     }
@@ -419,14 +429,108 @@ export class MobSim {
       // Alternate between strolling and standing still.
       this.moving = !this.moving;
       this.wanderTimer = this.moving ? 2 + Math.random() * 3 : 2 + Math.random() * 5;
-      if (this.moving) this.wanderYaw = Math.random() * Math.PI * 2;
+      if (this.moving) {
+        this.wanderYaw = Math.random() * Math.PI * 2;
+        this.grazeTime = 0;
+      } else if (this.def.grazes && Math.random() < GRAZE_CHANCE && this.onGround) {
+        this.grazeTime = GRAZE_MIN_S + Math.random() * (GRAZE_MAX_S - GRAZE_MIN_S);
+        this.wanderTimer = Math.max(this.wanderTimer, this.grazeTime + 0.5);
+      }
     }
+
     if (this.moving) {
-      this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.stats.speed);
-    } else {
-      this.velocity.x = 0;
-      this.velocity.z = 0;
+      this.headYaw *= Math.max(0, 1 - dt * 6);
+      this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.def.speed);
+      return;
     }
+
+    this.velocity.x = 0;
+    this.velocity.z = 0;
+    if (this.grazeTime > 0) {
+      this.grazeTime = Math.max(0, this.grazeTime - dt);
+      this.headYaw *= Math.max(0, 1 - dt * 6);
+      return;
+    }
+    this.lookAround(dt);
+  }
+
+  /**
+   * Villagers keep to their village: they wander near home, turn to greet a
+   * player who walks up, and run from any zombie that gets close.
+   */
+  private updateVillager(dt: number, world: BlockQuery, players: SimPlayer[]): void {
+    if (this.fleeTime > 0) {
+      this.fleeTime -= dt;
+      this.headYaw = 0;
+      this.walkToward(
+        world,
+        this.position.x - this.fleeFrom[0],
+        this.position.z - this.fleeFrom[1],
+        this.def.fleeSpeed,
+      );
+      return;
+    }
+
+    const home = this.home ?? this.position;
+    const homeDx = home.x - this.position.x;
+    const homeDz = home.z - this.position.z;
+    const farFromHome = Math.hypot(homeDx, homeDz) > VILLAGER_ROAM;
+
+    this.wanderTimer -= dt;
+    if (this.wanderTimer <= 0 || (farFromHome && this.moving && this.wanderTimer < 1)) {
+      this.moving = !this.moving;
+      this.wanderTimer = this.moving ? 2 + Math.random() * 4 : 1.5 + Math.random() * 4;
+      if (this.moving) {
+        // Strayed too far: head back rather than drifting off across the map.
+        this.wanderYaw = farFromHome
+          ? Math.atan2(homeDx, homeDz) + (Math.random() - 0.5) * 0.6
+          : Math.random() * Math.PI * 2;
+      }
+    }
+
+    if (this.moving) {
+      this.headYaw *= Math.max(0, 1 - dt * 6);
+      this.walkToward(world, Math.sin(this.wanderYaw), Math.cos(this.wanderYaw), this.def.speed);
+      return;
+    }
+
+    this.velocity.x = 0;
+    this.velocity.z = 0;
+    const visitor = this.nearestPlayer(players, VILLAGER_GREET_RANGE);
+    if (visitor) {
+      // Face the visitor with the whole body; the head follows the body.
+      const dx = visitor.position.x - this.position.x;
+      const dz = visitor.position.z - this.position.z;
+      this.yaw = Math.atan2(dx, dz);
+      this.headYaw *= Math.max(0, 1 - dt * 6);
+      return;
+    }
+    this.lookAround(dt);
+  }
+
+  /** Idle head movement: pick a new direction every few seconds and ease to it. */
+  private lookAround(dt: number): void {
+    this.lookTimer -= dt;
+    if (this.lookTimer <= 0) {
+      this.lookTimer = 1.5 + Math.random() * 3.5;
+      this.lookTarget = Math.random() < 0.3 ? 0 : (Math.random() * 2 - 1) * LOOK_MAX;
+    }
+    this.headYaw += (this.lookTarget - this.headYaw) * Math.min(1, dt * 4);
+  }
+
+  /** Something hostile is near a villager: run from it. Called by the room. */
+  scare(fromX: number, fromZ: number): void {
+    if (this.kind !== 'villager') return;
+    this.fleeTime = Math.max(this.fleeTime, 2.5);
+    this.fleeFrom = [fromX, fromZ];
+  }
+
+  /** Is this villager within fear range of the given hostile position? */
+  fears(x: number, z: number): boolean {
+    if (this.kind !== 'villager') return false;
+    const dx = x - this.position.x;
+    const dz = z - this.position.z;
+    return dx * dx + dz * dz < VILLAGER_FEAR_RANGE * VILLAGER_FEAR_RANGE;
   }
 
   /**
@@ -474,22 +578,66 @@ export class MobSim {
     this.onGround = moveWithCollision(world, this.position, this.velocity, this.shape, dt);
   }
 
+  /** Behaviour flags for the wire (MOB_FLAG_*). */
+  flags(): number {
+    let f = 0;
+    if (this.grazeTime > 0) f |= MOB_FLAG_GRAZING;
+    if (this.sheared) f |= MOB_FLAG_SHEARED;
+    if (this.hurtTime > 0) f |= MOB_FLAG_HURT;
+    if (this.kind === 'sheep') f |= (this.color & 0x7) << MOB_FLAG_COLOR_SHIFT;
+    return f;
+  }
+
+  /**
+   * Shear a sheep: wool comes off and grows back later. Returns the wool, or
+   * null when there was nothing to shear (not a sheep, or already bare).
+   */
+  shear(): LootRoll[] | null {
+    if (this.kind !== 'sheep' || this.sheared || this.dead) return null;
+    this.sheared = true;
+    this.woolTimer = WOOL_REGROW_S;
+    this.grazeTime = 0;
+    return rollLoot(SHEAR_LOOT);
+  }
+
   /** Loot table, rolled once on death — same numbers everywhere. */
-  loot(): { id: string; count: number }[] {
-    const out: { id: string; count: number }[] = [];
-    if (this.kind === 'pig') {
-      out.push({ id: 'raw_porkchop', count: 1 + Math.floor(Math.random() * 2) });
-      out.push({ id: 'leather', count: Math.random() < 0.7 ? 1 : 2 });
-    } else if (this.kind === 'skeleton') {
-      // Killing an archer arms you as one: this is the main arrow supply.
-      out.push({ id: 'bone', count: 1 + Math.floor(Math.random() * 2) });
-      if (Math.random() < 0.75) out.push({ id: 'arrow', count: 1 + Math.floor(Math.random() * 2) });
-    } else {
-      if (Math.random() < 0.6) out.push({ id: 'rotten_flesh', count: 1 });
-      // String from zombies keeps bows reachable without a spider mob.
-      if (Math.random() < 0.5) out.push({ id: 'string', count: 1 });
+  loot(): LootRoll[] {
+    const out = rollLoot(this.def.loot);
+    if (this.kind === 'sheep' && !this.sheared) out.push(...rollLoot(SHEEP_WOOL_LOOT));
+    return out;
+  }
+
+  toSave(): SavedMob {
+    const saved: SavedMob = {
+      kind: this.kind,
+      x: this.position.x,
+      y: this.position.y,
+      z: this.position.z,
+      yaw: this.yaw,
+      hp: this.health,
+    };
+    if (this.kind === 'sheep') {
+      saved.color = this.color;
+      if (this.sheared) {
+        saved.sheared = true;
+        saved.woolTimer = this.woolTimer;
+      }
     }
-    return out.filter((e) => e.count > 0);
+    if (this.home) saved.home = { ...this.home };
+    return saved;
+  }
+
+  static fromSave(saved: SavedMob): MobSim {
+    const mob = new MobSim(saved.kind, saved.x, saved.y, saved.z);
+    mob.yaw = saved.yaw;
+    mob.health = Math.min(mob.def.maxHealth, saved.hp);
+    if (saved.color !== undefined) mob.color = saved.color;
+    if (saved.sheared) {
+      mob.sheared = true;
+      mob.woolTimer = saved.woolTimer ?? WOOL_REGROW_S;
+    }
+    if (saved.home) mob.home = { ...saved.home };
+    return mob;
   }
 }
 
@@ -507,6 +655,8 @@ export class DropSim {
   readonly id: number;
   readonly itemId: string;
   count: number;
+  /** Wear carried by a dropped tool, so throwing one does not repair it. */
+  damage?: number;
   readonly position: Vec3;
   readonly velocity: Vec3 = { x: 0, y: 0, z: 0 };
   age = 0;

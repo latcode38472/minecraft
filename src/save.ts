@@ -1,14 +1,17 @@
 // World persistence in IndexedDB. Saves are small because we store only the
-// seed, player state, and per-chunk *edit diffs* — terrain regenerates from
-// the seed and the diffs are re-applied on top.
+// seed, player state, per-chunk *edit diffs* — terrain regenerates from the
+// seed and the diffs are re-applied on top — and the simulation's own state:
+// chests, furnaces, mobs, dropped items and the clock.
 
 import type { ItemStack } from './items/inventory';
+import { validateSimState, type SavedSimState } from './shared/save';
 import type { ChunkEdits } from './world/world';
 
 const DB_NAME = 'voxelcraft';
 const DB_VERSION = 1;
 const STORE = 'world';
 const META_KEY = 'meta';
+const STATE_KEY = 'state';
 const EDITS_PREFIX = 'edits:';
 
 export interface SaveMeta {
@@ -56,6 +59,12 @@ export class SaveStore {
     return (await this.request(this.tx('readonly').get(META_KEY))) as SaveMeta | undefined;
   }
 
+  /** The simulation's state, validated; empty defaults when none was saved. */
+  async loadState(): Promise<SavedSimState | undefined> {
+    const raw = await this.request(this.tx('readonly').get(STATE_KEY));
+    return raw === undefined ? undefined : validateSimState(raw);
+  }
+
   async loadAllEdits(): Promise<Map<string, ChunkEdits>> {
     const store = this.tx('readonly');
     const keys = (await this.request(store.getAllKeys())) as string[];
@@ -74,6 +83,10 @@ export class SaveStore {
 
   saveMeta(meta: SaveMeta): Promise<IDBValidKey> {
     return this.request(this.tx('readwrite').put(meta, META_KEY));
+  }
+
+  saveState(state: SavedSimState): Promise<IDBValidKey> {
+    return this.request(this.tx('readwrite').put(state, STATE_KEY));
   }
 
   saveChunkEdits(chunkKey: string, edits: ChunkEdits): Promise<IDBValidKey> {

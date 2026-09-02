@@ -134,6 +134,21 @@ export type SegmentName =
   | 'legsA'
   | 'legsB';
 
+/** Idle and activity behaviours layered on top of the gait. */
+export interface PoseExtras {
+  /** Head turned relative to the body, radians. */
+  headYaw?: number;
+  /** 0..1: head lowered to the grass. */
+  graze?: number;
+  /** 0..1: right arm held out, using or eating something. */
+  using?: number;
+}
+
+/** How far a grazing head drops, radians. */
+const GRAZE_ANGLE = 0.95;
+/** How far the arm comes up when using an item, radians. */
+const USE_ARM_RAISE = 1.15;
+
 export interface RigSegment {
   name: SegmentName;
   /**
@@ -151,11 +166,13 @@ export interface RigSegment {
  * which is exactly what makes animation code a no-op there instead of a crash.
  */
 export class Rig {
-  readonly group = new THREE.Group();
+  readonly group: THREE.Group;
   readonly segments = new Map<SegmentName, THREE.Mesh>();
   readonly articulated: boolean;
 
-  constructor(key: string, def: () => RigSegment[], articulated: boolean) {
+  /** Builds into `group` when given, so a body can be rebuilt in place. */
+  constructor(key: string, def: () => RigSegment[], articulated: boolean, group = new THREE.Group()) {
+    this.group = group;
     this.articulated = articulated;
     const material = getMobMaterial();
 
@@ -190,15 +207,25 @@ export class Rig {
     mesh.rotation.z = z;
   }
 
+  /** Turn the head to look somewhere, and lower it to graze. */
+  private poseHead(pitch: number, extras?: PoseExtras): void {
+    const head = this.segments.get('head');
+    if (!head) return;
+    head.rotation.x = Math.max(-0.6, Math.min(0.6, pitch)) + (extras?.graze ?? 0) * GRAZE_ANGLE;
+    head.rotation.y = extras?.headYaw ?? 0;
+    head.rotation.z = 0;
+  }
+
   /**
    * Pose the rig for one frame.
    *
    * `walkPhase` advances with distance travelled, so the gait matches the
    * ground rather than the frame rate; `walkAmount` (0..1) fades the swing in
    * as a body gets going. `swing` (0..1) is an attack or mining stroke, and
-   * `pitch` tilts the head where the model has a separate one.
+   * `pitch` tilts the head where the model has a separate one. `extras`
+   * carries the idle behaviours: looking around, grazing, using an item.
    */
-  pose(walkPhase: number, walkAmount: number, swing: number, pitch = 0, aim = 0): void {
+  pose(walkPhase: number, walkAmount: number, swing: number, pitch = 0, aim = 0, extras?: PoseExtras): void {
     if (!this.articulated) return;
 
     // Aiming overrides the arms entirely: they come up level and hold there
@@ -214,7 +241,7 @@ export class Rig {
       const stride = Math.sin(walkPhase) * 0.5 * walkAmount;
       this.rotate('legL', stride);
       this.rotate('legR', -stride);
-      this.rotate('head', Math.max(-0.6, Math.min(0.6, pitch)));
+      this.poseHead(pitch, extras);
       return;
     }
 
@@ -234,12 +261,15 @@ export class Rig {
     // sin(pi*t) arcs up and back down over the stroke; the lean adds follow-through.
     const strokeLift = swing > 0 ? -Math.sin(Math.PI * swing) * 2.2 : 0;
     const strokeLean = swing > 0 ? Math.sin(Math.PI * swing) * 0.35 : 0;
-    this.rotate('armR', armSwing + strokeLift, -strokeLean);
+    // Using something (eating, placing, a raised shield) holds the arm out
+    // in front instead; a stroke still wins when both apply.
+    const using = strokeLift === 0 ? (extras?.using ?? 0) : 0;
+    this.rotate('armR', armSwing * (1 - using) + strokeLift - using * USE_ARM_RAISE, -strokeLean);
 
     // Zombies hold both arms out together, so they swing as one unit.
     this.rotate('arms', strokeLift !== 0 ? strokeLift * 0.5 : Math.sin(walkPhase) * 0.12 * walkAmount);
 
-    this.rotate('head', Math.max(-0.6, Math.min(0.6, pitch)));
+    this.poseHead(pitch, extras);
 
     const torso = this.segments.get('torso') ?? this.segments.get('body');
     if (torso) torso.rotation.x = strokeLean * 0.4;
@@ -384,41 +414,130 @@ export const SKELETON_BOW_SEGMENTS = (): RigSegment[] => {
   ];
 };
 
+/**
+ * Four-legged bodies share one layout: a torso, a head on a neck pivot (so it
+ * can look around and drop to graze), and two leg segments — a four-legged
+ * gait moves diagonal pairs together, so two segments carry all four legs.
+ */
+function quadruped(
+  torso: BoxPart[],
+  neck: [number, number, number],
+  head: BoxPart[],
+  legHeight: number,
+  legSize: number,
+  legColor: number,
+  legX: number,
+  legZ: [number, number],
+): RigSegment[] {
+  const leg = (x: number, z: number): BoxPart => ({
+    pos: [x, -legHeight / 2, z],
+    size: [legSize, legHeight, legSize],
+    color: legColor,
+  });
+  return [
+    { name: 'body', pivot: [0, 0, 0], parts: torso },
+    { name: 'head', pivot: neck, parts: head },
+    {
+      name: 'legsA',
+      pivot: [0, legHeight, 0],
+      parts: [leg(-legX, legZ[0]), leg(legX, legZ[1])],
+    },
+    {
+      name: 'legsB',
+      pivot: [0, legHeight, 0],
+      parts: [leg(legX, legZ[0]), leg(-legX, legZ[1])],
+    },
+  ];
+}
+
 export const PIG_SEGMENTS = (): RigSegment[] => {
   const body = 0xe89a96;
   const snout = 0xd4746f;
-  const leg = (color: number): BoxPart => ({
-    pos: [0, -0.14, 0],
-    size: [0.16, 0.28, 0.16],
-    color,
-  });
+  return quadruped(
+    [{ pos: [0, 0.55, -0.05], size: [0.6, 0.55, 0.9], color: body }],
+    [0, 0.62, 0.38],
+    [
+      { pos: [0, 0, 0.17], size: [0.45, 0.45, 0.35], color: body },
+      { pos: [0, -0.06, 0.37], size: [0.22, 0.18, 0.1], color: snout },
+    ],
+    0.28,
+    0.16,
+    body,
+    0.2,
+    [0.3, -0.35],
+  );
+};
+
+export const COW_SEGMENTS = (): RigSegment[] => {
+  const hide = 0x4a3325;
+  const patch = 0xe8e8e8;
+  const muzzle = 0xc9a08c;
+  const horn = 0xd9d3b9;
+  return quadruped(
+    [
+      { pos: [0, 0.85, -0.05], size: [0.7, 0.6, 1.1], color: hide },
+      { pos: [0, 0.95, -0.3], size: [0.72, 0.28, 0.4], color: patch },
+      { pos: [0, 0.52, -0.25], size: [0.3, 0.16, 0.3], color: 0xe8b6b0 }, // udder
+    ],
+    [0, 1.0, 0.5],
+    [
+      { pos: [0, 0.02, 0.2], size: [0.42, 0.42, 0.4], color: hide },
+      { pos: [0, -0.1, 0.42], size: [0.3, 0.2, 0.1], color: muzzle },
+      { pos: [-0.2, 0.22, 0.05], size: [0.08, 0.16, 0.08], color: horn },
+      { pos: [0.2, 0.22, 0.05], size: [0.08, 0.16, 0.08], color: horn },
+    ],
+    0.55,
+    0.18,
+    hide,
+    0.22,
+    [0.35, -0.4],
+  );
+};
+
+/** A sheep in a given fleece colour; sheared, only the skin body remains. */
+export const SHEEP_SEGMENTS = (wool: number, sheared: boolean): RigSegment[] => {
+  const skin = 0xe5d6c7;
+  const torso: BoxPart[] = [{ pos: [0, 0.75, -0.05], size: [0.55, 0.5, 0.9], color: skin }];
+  const head: BoxPart[] = [{ pos: [0, 0, 0.18], size: [0.4, 0.4, 0.38], color: skin }];
+  if (!sheared) {
+    torso.push({ pos: [0, 0.8, -0.05], size: [0.8, 0.68, 1.02], color: wool });
+    head.push({ pos: [0, 0.14, 0.1], size: [0.46, 0.3, 0.36], color: wool });
+  }
+  return quadruped(torso, [0, 0.95, 0.45], head, 0.5, 0.18, skin, 0.2, [0.3, -0.35]);
+};
+
+export const VILLAGER_SEGMENTS = (): RigSegment[] => {
+  const skin = 0xc9a27e;
+  const robe = 0x6b4f3a;
+  const robeDark = 0x4c3728;
   return [
     {
       name: 'body',
       pivot: [0, 0, 0],
       parts: [
-        { pos: [0, 0.55, -0.05], size: [0.6, 0.55, 0.9], color: body },
-        { pos: [0, 0.62, 0.55], size: [0.45, 0.45, 0.35], color: body }, // head
-        { pos: [0, 0.56, 0.75], size: [0.22, 0.18, 0.1], color: snout },
-      ],
-    },
-    // A four-legged gait moves diagonal pairs together, so two segments carry
-    // all four legs — three draw calls for a whole pig.
-    {
-      name: 'legsA',
-      pivot: [0, 0.28, 0],
-      parts: [
-        { ...leg(body), pos: [-0.2, -0.14, 0.3] },
-        { ...leg(body), pos: [0.2, -0.14, -0.35] },
+        { pos: [0, 1.0, 0], size: [0.55, 0.9, 0.32], color: robe }, // robe
+        { pos: [0, 0.95, 0.2], size: [0.6, 0.2, 0.18], color: robe }, // folded arms
+        { pos: [0, 0.98, 0.3], size: [0.16, 0.16, 0.06], color: skin }, // hands
       ],
     },
     {
-      name: 'legsB',
-      pivot: [0, 0.28, 0],
+      name: 'head',
+      pivot: [0, 1.48, 0],
       parts: [
-        { ...leg(body), pos: [0.2, -0.14, 0.3] },
-        { ...leg(body), pos: [-0.2, -0.14, -0.35] },
+        { pos: [0, 0.25, 0], size: [0.5, 0.55, 0.5], color: skin },
+        { pos: [0, 0.12, 0.3], size: [0.14, 0.22, 0.12], color: skin }, // the nose
+        { pos: [0, 0.4, 0.26], size: [0.5, 0.08, 0.02], color: 0x5a4a3a }, // brow
       ],
+    },
+    {
+      name: 'legL',
+      pivot: [-0.14, 0.55, 0],
+      parts: [{ pos: [0, -0.28, 0], size: [0.24, 0.55, 0.24], color: robeDark }],
+    },
+    {
+      name: 'legR',
+      pivot: [0.14, 0.55, 0],
+      parts: [{ pos: [0, -0.28, 0], size: [0.24, 0.55, 0.24], color: robeDark }],
     },
   ];
 };

@@ -5,6 +5,7 @@
 // straight in. The server runs the very same code, which is what lets mob
 // movement be authoritative without the two sides drifting apart.
 
+import { blockHeight } from '../blocks.ts';
 import { MAX_MOVE_PER_SUBSTEP } from '../constants.ts';
 
 export interface Vec3 {
@@ -80,6 +81,10 @@ function moveAxis(
     for (let bz = Math.floor(minZ); bz <= Math.floor(maxZ - EPSILON); bz++) {
       for (let bx = Math.floor(minX); bx <= Math.floor(maxX - EPSILON); bx++) {
         if (!world.isSolidAt(bx, by, bz)) continue;
+        // Slabs (beds, farmland, paths) only fill the cell up to their height:
+        // a body whose feet are above that walks over them unimpeded.
+        const top = by + blockHeight(world.getBlock(bx, by, bz));
+        if (minY >= top - EPSILON) continue;
         if (axis === 0) {
           pos.x = delta > 0 ? bx - shape.halfWidth - EPSILON : bx + 1 + shape.halfWidth + EPSILON;
           vel.x = 0;
@@ -87,7 +92,7 @@ function moveAxis(
           pos.z = delta > 0 ? bz - shape.halfWidth - EPSILON : bz + 1 + shape.halfWidth + EPSILON;
           vel.z = 0;
         } else {
-          pos.y = delta > 0 ? by - shape.height - EPSILON : by + 1 + EPSILON;
+          pos.y = delta > 0 ? by - shape.height - EPSILON : top + EPSILON;
           vel.y = 0;
         }
         return true;
