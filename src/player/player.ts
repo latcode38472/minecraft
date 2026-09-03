@@ -2,7 +2,7 @@
 // this file owns intent (walk/jump/swim), water state and fall tracking.
 
 import * as THREE from 'three';
-import { Block } from '../blocks';
+import { isWater } from '../blocks';
 import {
   GRAVITY,
   JUMP_SPEED,
@@ -178,11 +178,12 @@ export class Player {
 
   private updateWaterState(): void {
     const { x, y, z } = this.position;
-    this.feetInWater =
-      this.world.getBlock(Math.floor(x), Math.floor(y + 0.4), Math.floor(z)) === Block.Water;
-    this.eyeInWater =
-      this.world.getBlock(Math.floor(x), Math.floor(y + PLAYER_EYE_HEIGHT), Math.floor(z)) ===
-      Block.Water;
+    this.feetInWater = isWater(
+      this.world.getBlock(Math.floor(x), Math.floor(y + 0.4), Math.floor(z)),
+    );
+    this.eyeInWater = isWater(
+      this.world.getBlock(Math.floor(x), Math.floor(y + PLAYER_EYE_HEIGHT), Math.floor(z)),
+    );
   }
 
   /** Would a block placed at these voxel coords intersect the player's AABB? */

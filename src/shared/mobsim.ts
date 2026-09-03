@@ -8,7 +8,7 @@
 // from the loot tables (loot.ts). No THREE, no DOM — just numbers and a
 // BlockQuery.
 
-import { Block } from '../blocks.ts';
+import { isWater } from '../blocks.ts';
 import {
   FIST_KNOCKBACK,
   GRAVITY,
@@ -614,12 +614,13 @@ export class MobSim {
   }
 
   private applyGravity(dt: number, world: BlockQuery): void {
-    const inWater =
+    const inWater = isWater(
       world.getBlock(
         Math.floor(this.position.x),
         Math.floor(this.position.y + 0.3),
         Math.floor(this.position.z),
-      ) === Block.Water;
+      ),
+    );
     if (inWater) {
       // Gentle buoyancy keeps mobs bobbing rather than sinking forever.
       this.velocity.y = Math.min(this.velocity.y + GRAVITY * 0.25 * dt, 2);

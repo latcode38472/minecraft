@@ -1049,6 +1049,159 @@ try {
     await context.close();
   });
 
+  await testCase('a cave is dark until you put a torch in it', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    await until(page, () => window.__voxel.player.onGround, 30000, 'landing');
+
+    // Hollow a sealed room out of the rock, well below the surface.
+    const room = await page.evaluate(() => {
+      const v = window.__voxel;
+      const p = v.player.position;
+      const cx = Math.floor(p.x) + 6;
+      const cz = Math.floor(p.z);
+      const floor = 12;
+      for (let y = floor; y <= floor + 3; y++)
+        for (let z = cz - 4; z <= cz + 4; z++)
+          for (let x = cx - 4; x <= cx + 4; x++) v.world.setBlock(x, y, z, v.Block.Air);
+      return { cx, cz, floor };
+    });
+
+    const dark = await page.evaluate((r) => window.__voxel.lightAt(r.cx, r.floor, r.cz), room);
+    assert.equal(dark.sky, 0, 'no daylight reaches a sealed room, whatever the hour');
+    assert.equal(dark.block, 0, 'and nothing else lights it either');
+
+    const lit = await page.evaluate((r) => {
+      const v = window.__voxel;
+      v.world.setBlock(r.cx, r.floor, r.cz, v.Block.Torch);
+      return {
+        at: v.lightAt(r.cx, r.floor, r.cz),
+        two: v.lightAt(r.cx + 2, r.floor, r.cz),
+        four: v.lightAt(r.cx + 4, r.floor, r.cz),
+      };
+    }, room);
+    assert.equal(lit.at.block, 14, 'a torch is the brightest thing you can carry');
+    assert.equal(lit.two.block, 12, 'and it fades a level per block');
+    assert.equal(lit.four.block, 10);
+
+    // The mesh has to carry that light, or none of it reaches the screen.
+    await sleep(1200);
+    const mesh = await page.evaluate((r) => {
+      const v = window.__voxel;
+      const key = `${Math.floor(r.cx / 16)},${Math.floor(r.cz / 16)}`;
+      const geo = v.world.chunks.get(key)?.opaqueMesh?.geometry;
+      const attr = geo?.getAttribute('voxLight');
+      if (!attr) return null;
+      let maxBlock = 0;
+      for (let i = 0; i < attr.count; i++) maxBlock = Math.max(maxBlock, attr.getY(i));
+      return { maxBlock, daylight: v.getDaylight() };
+    }, room);
+    assert.ok(mesh, 'chunk geometry must carry a per-vertex light attribute');
+    assert.ok(mesh.maxBlock > 0.5, `torchlight never reached the mesh (${mesh?.maxBlock})`);
+
+    // Take it out and the room goes back to being a hole in the ground.
+    await page.evaluate((r) => {
+      window.__voxel.world.setBlock(r.cx, r.floor, r.cz, window.__voxel.Block.Air);
+    }, room);
+    const out = await page.evaluate((r) => window.__voxel.lightAt(r.cx + 2, r.floor, r.cz), room);
+    assert.equal(out.block, 0, 'removing a torch must take all of its light with it');
+    await context.close();
+  });
+
+  await testCase('the world dims at night without a chunk being rebuilt', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    await until(page, () => window.__voxel.world.chunks.size > 20, 40000, 'chunks');
+    // Let streaming finish, so the only thing that could queue a remesh is the clock.
+    await until(page, () => window.__voxel.world.pendingMeshCount === 0, 60000, 'meshing');
+
+    const noon = await page.evaluate(async () => {
+      const v = window.__voxel;
+      v.sky.timeOfDay = 0.5;
+      v.getLocalSim().timeOfDay = 0.5;
+      await new Promise((r) => setTimeout(r, 400));
+      const chunk = [...v.world.chunks.values()].find((c) => c.opaqueMesh);
+      return { daylight: v.getDaylight(), geometry: chunk?.opaqueMesh.geometry.uuid };
+    });
+    const midnight = await page.evaluate(async (want) => {
+      const v = window.__voxel;
+      v.sky.timeOfDay = 0.0;
+      v.getLocalSim().timeOfDay = 0.0;
+      await new Promise((r) => setTimeout(r, 600));
+      const chunk = [...v.world.chunks.values()].find((c) => c.opaqueMesh?.geometry.uuid === want);
+      return { daylight: v.getDaylight(), sameGeometry: Boolean(chunk) };
+    }, noon.geometry);
+
+    assert.ok(noon.daylight > 0.95, `noon should be full strength, got ${noon.daylight}`);
+    assert.ok(midnight.daylight < 0.2, `midnight should be dim, got ${midnight.daylight}`);
+    assert.ok(
+      midnight.sameGeometry,
+      'the day/night cycle must dim the world through the shader, not by rebuilding chunks',
+    );
+    await context.close();
+  });
+
+  await testCase('water poured out runs, and a dam stops it', async () => {
+    const { context, page } = await openGame(browser);
+    await startSingleplayer(page);
+    await until(page, () => window.__voxel.player.onGround, 30000, 'landing');
+
+    // A walled channel underground, so the stream has banks and nothing else
+    // can wander into the test.
+    const scene = await page.evaluate(() => {
+      const v = window.__voxel;
+      const B = v.Block;
+      const cx = Math.floor(v.player.position.x) + 8;
+      const cz = Math.floor(v.player.position.z);
+      const floor = 14;
+      for (let x = cx; x <= cx + 12; x++) {
+        for (let y = floor; y <= floor + 2; y++) {
+          v.world.setBlock(x, y, cz, B.Air);
+          v.world.setBlock(x, y, cz - 1, B.Stone);
+          v.world.setBlock(x, y, cz + 1, B.Stone);
+        }
+        v.world.setBlock(x, floor - 1, cz, B.Stone);
+      }
+      return { cx, cz, floor };
+    });
+    await sleep(1200);
+
+    const ran = await page.evaluate(async (s) => {
+      const v = window.__voxel;
+      const sim = v.getLocalSim();
+      v.world.setBlock(s.cx, s.floor, s.cz, v.Block.Water);
+      sim.blockPlaced(s.cx, s.floor, s.cz, v.Block.Water);
+      for (let i = 0; i < 60 && sim.pendingWaterCount > 0; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const row = [];
+      for (let d = 0; d <= 8; d++) row.push(v.world.getBlock(s.cx + d, s.floor, s.cz));
+      return row;
+    }, scene);
+    // A source reaches seven blocks and no further.
+    assert.ok(ran.slice(1, 8).every((id) => id >= 36 && id <= 42), `the stream did not run: ${ran}`);
+    assert.equal(ran[8], 0, `the stream ran too far: ${ran}`);
+
+    const dammed = await page.evaluate(async (s) => {
+      const v = window.__voxel;
+      const sim = v.getLocalSim();
+      v.world.setBlock(s.cx + 3, s.floor, s.cz, v.Block.Stone);
+      sim.blockPlaced(s.cx + 3, s.floor, s.cz, v.Block.Stone);
+      for (let i = 0; i < 80 && sim.pendingWaterCount > 0; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const row = [];
+      for (let d = 0; d <= 8; d++) row.push(v.world.getBlock(s.cx + d, s.floor, s.cz));
+      return row;
+    }, scene);
+    assert.ok(
+      dammed.slice(4).every((id) => id === 0),
+      `everything past the dam should have drained: ${dammed}`,
+    );
+    assert.ok(dammed[1] >= 36 && dammed[1] <= 42, 'and the near side should still be wet');
+    await context.close();
+  });
+
   await testCase('sprinting is faster, widens the view, and costs more food', async () => {
     const { context, page } = await openGame(browser);
     await startSingleplayer(page);

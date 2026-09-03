@@ -6,7 +6,7 @@
 // stops on exactly the same geometry the player walks on.
 
 import * as THREE from 'three';
-import { Block } from '../blocks';
+import { isWater } from '../blocks';
 import { GRAVITY, TERMINAL_VELOCITY } from '../constants';
 import { moveWithCollision, type BodyShape } from '../shared/voxel';
 import type { World } from '../world/world';
@@ -36,11 +36,13 @@ export abstract class Entity {
   protected applyGravity(ctx: EntityContext, buoyant = true): void {
     const inWater =
       buoyant &&
-      ctx.world.getBlock(
-        Math.floor(this.position.x),
-        Math.floor(this.position.y + 0.3),
-        Math.floor(this.position.z),
-      ) === Block.Water;
+      isWater(
+        ctx.world.getBlock(
+          Math.floor(this.position.x),
+          Math.floor(this.position.y + 0.3),
+          Math.floor(this.position.z),
+        ),
+      );
     if (inWater) {
       // Gentle buoyancy keeps entities bobbing at the surface instead of sinking.
       this.velocity.y = Math.min(this.velocity.y + GRAVITY * 0.25 * ctx.dt, 2);

@@ -10,6 +10,8 @@ import {
 import type { SimWorld, VillageInfo } from '../shared/roomsim';
 import type { Vec3 } from '../shared/voxel';
 import { Chunk } from './chunk';
+import { LightEngine, packLight } from './lighting';
+import { MAX_LIGHT } from '../blocks';
 import {
   buildChunkGeometry,
   getCutoutMaterial,
@@ -32,6 +34,13 @@ export class World implements SimWorld {
   readonly edits = new Map<string, ChunkEdits>();
   /** Chunk keys whose edits changed since the last save flush. */
   readonly unsavedEditKeys = new Set<string>();
+
+  /** Sky and block light for every loaded chunk. */
+  readonly lighting = new LightEngine({
+    peekChunk: (cx, cz) => this.chunks.get(Chunk.key(cx, cz)) ?? null,
+    // Light spilling into a chunk changes how it looks, so it has to be rebuilt.
+    onLightChanged: (chunk) => this.markDirty(chunk),
+  });
 
   private readonly scene: THREE.Scene;
   private readonly dirtyQueue = new Set<Chunk>();
@@ -122,6 +131,29 @@ export class World implements SimWorld {
     return chunk.get(wx - chunk.cx * CHUNK_SIZE, wy, wz - chunk.cz * CHUNK_SIZE);
   };
 
+  /**
+   * Light sampler for meshing. Anything not loaded reads as open sky, so the
+   * edge of the world is a bright wall rather than a black one.
+   */
+  readonly lightSampler = (wx: number, wy: number, wz: number): number => {
+    if (wy < 0) return 0;
+    if (wy >= WORLD_HEIGHT) return packLight(MAX_LIGHT, 0);
+    const chunk = this.chunkAtWorld(wx, wz);
+    if (!chunk || !chunk.lit) return packLight(MAX_LIGHT, 0);
+    return chunk.light[Chunk.index(wx - chunk.cx * CHUNK_SIZE, wy, wz - chunk.cz * CHUNK_SIZE)];
+  };
+
+  /**
+   * Part of the SimWorld contract: the packed light byte at a position, or -1
+   * where the chunk has not streamed in and nothing is known.
+   */
+  lightAt(wx: number, wy: number, wz: number): number {
+    if (wy < 0 || wy >= WORLD_HEIGHT) return -1;
+    const chunk = this.chunkAtWorld(wx, wz);
+    if (!chunk || !chunk.lit) return -1;
+    return chunk.light[Chunk.index(wx - chunk.cx * CHUNK_SIZE, wy, wz - chunk.cz * CHUNK_SIZE)];
+  }
+
   /** Collision query: unloaded chunks and below-world read as solid so the player never falls through terrain that hasn't streamed in yet. */
   isSolidAt(wx: number, wy: number, wz: number): boolean {
     if (wy < 0) return true;
@@ -142,6 +174,7 @@ export class World implements SimWorld {
     chunk.set(lx, wy, lz, id);
 
     this.recordEdit(Chunk.key(cx, cz), Chunk.index(lx, wy, lz), id);
+    this.lighting.blockChanged(wx, wy, wz, id);
     this.markDirty(chunk);
     this.markNeighborsDirty(cx, cz, lx, lz);
     this.onLocalEdit?.(wx, wy, wz, id);
@@ -184,6 +217,7 @@ export class World implements SimWorld {
     const chunk = this.chunks.get(Chunk.key(cx, cz));
     if (!chunk) return; // will be replayed on load
     chunk.set(lx, wy, lz, id);
+    this.lighting.blockChanged(wx, wy, wz, id);
     this.markDirty(chunk);
     this.markNeighborsDirty(cx, cz, lx, lz);
   }
@@ -214,6 +248,9 @@ export class World implements SimWorld {
     }
     if (this.persistEdits) this.unsavedEditKeys.add(key);
     if (chunk) {
+      // A backlog can change a whole chunk at once; relighting it from scratch
+      // costs less than one incremental update per block.
+      this.lighting.seedChunk(chunk);
       this.markDirty(chunk);
       // A bulk apply can touch any border, so refresh all four neighbours once.
       this.markDirtyAt(cx - 1, cz);
@@ -277,6 +314,7 @@ export class World implements SimWorld {
       for (const [idx, id] of edits) chunk.data[idx] = id;
     }
     this.chunks.set(key, chunk);
+    this.lighting.seedChunk(chunk);
     // Multiplayer: ask the server for any edits this chunk has that we missed.
     this.onChunkCreated?.(key);
     this.markDirty(chunk);
@@ -313,7 +351,11 @@ export class World implements SimWorld {
 
   private remesh(chunk: Chunk): void {
     this.disposeChunkMeshes(chunk);
-    const { opaque, cutout, water } = buildChunkGeometry(chunk, this.meshSampler);
+    const { opaque, cutout, water } = buildChunkGeometry(
+      chunk,
+      this.meshSampler,
+      this.lightSampler,
+    );
     const origin = new THREE.Vector3(chunk.cx * CHUNK_SIZE, 0, chunk.cz * CHUNK_SIZE);
     if (opaque) {
       chunk.opaqueMesh = new THREE.Mesh(opaque, getOpaqueMaterial());

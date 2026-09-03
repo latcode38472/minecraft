@@ -4,7 +4,7 @@
 // face normal (the axis we last stepped across).
 
 import * as THREE from 'three';
-import { Block, isSolid } from './blocks';
+import { Block, isWater } from './blocks';
 import type { World } from './world/world';
 
 export interface RayHit {
@@ -61,7 +61,9 @@ export function raycastVoxel(
 
     const id = world.getBlock(x, y, z);
     // Water is not targetable — rays pass through it like Minecraft's default.
-    if (id !== Block.Air && id !== Block.Water && isSolid(id)) {
+    // Everything else is, including things you can walk through: a torch you
+    // cannot aim at is a torch you can never take back.
+    if (id !== Block.Air && !isWater(id)) {
       return { x, y, z, id, normal };
     }
   }

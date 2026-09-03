@@ -131,6 +131,17 @@ export const MOB_DESPAWN_DISTANCE = 72;
 export const ZOMBIE_DETECT_RANGE = 18;
 export const NIGHT_START = 0.76; // time-of-day window where hostiles spawn
 export const NIGHT_END = 0.22;
+/**
+ * Spawning is decided by light, not by the clock. Anything this dark or
+ * darker is fair game for hostiles — the open ground at night, and the inside
+ * of an unlit cave at any hour. Put a torch down and the spot goes above the
+ * threshold, which is what makes torches a defence rather than decoration.
+ */
+export const HOSTILE_MAX_SPAWN_LIGHT = 7;
+/** How far below a player the spawner goes looking for a dark cave floor. */
+export const CAVE_SPAWN_DEPTH = 26;
+/** ...and how far above it, for the cave you are standing on top of. */
+export const CAVE_SPAWN_RISE = 6;
 
 // Farming
 /** Average seconds between growth stages of a planted crop. */

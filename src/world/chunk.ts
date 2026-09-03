@@ -11,6 +11,13 @@ export class Chunk {
   readonly cx: number;
   readonly cz: number;
   readonly data: Uint8Array;
+  /**
+   * Per-voxel light, one byte each: sky light in the high nibble, block light
+   * in the low one. Both are 0..15. Filled in by world/lighting.ts.
+   */
+  readonly light: Uint8Array;
+  /** False until the light engine has seeded this chunk. */
+  lit = false;
   dirty = true; // needs (re)meshing
   opaqueMesh: THREE.Mesh | null = null;
   cutoutMesh: THREE.Mesh | null = null;
@@ -20,6 +27,7 @@ export class Chunk {
     this.cx = cx;
     this.cz = cz;
     this.data = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT);
+    this.light = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT);
   }
 
   static index(lx: number, ly: number, lz: number): number {

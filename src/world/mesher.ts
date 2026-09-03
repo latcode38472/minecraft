@@ -1,19 +1,36 @@
-// Chunk mesher: culled face meshing with baked ambient occlusion.
+// Chunk mesher: culled face meshing with baked ambient occlusion and light.
 //
 // For every non-air voxel we emit a quad only for faces adjacent to a
 // non-opaque block, so interior faces cost nothing. Each vertex carries a
 // grayscale colour = directional face shade x ambient occlusion, computed from
 // the three blocks diagonally adjacent to the vertex (the classic 0fps AO
-// scheme). Water goes into a separate transparent mesh with its top surface
-// lowered slightly when exposed to air.
+// scheme), plus a second attribute holding the sky and block light averaged
+// over the same four cells — that average is what makes light fade smoothly
+// across a face instead of stepping from block to block.
+//
+// Terrain is lit entirely by that attribute and not by any scene lamp; see
+// applyVoxelLight below for why. Water goes into a separate transparent mesh
+// whose surface height comes from its flow level, so a stream steps down as it
+// thins out.
 
 import * as THREE from 'three';
-import { BLOCKS, Block, isCutout, isOpaque } from '../blocks';
+import {
+  BLOCKS,
+  Block,
+  MAX_LIGHT,
+  isCutout,
+  isOpaque,
+  isWater,
+  waterSurfaceHeight,
+} from '../blocks';
 import { CHUNK_SIZE, WORLD_HEIGHT } from '../constants';
 import { getAtlasTexture, tileUVRect } from '../textures';
 import { Chunk } from './chunk';
+import { blockOf, packLight, skyOf } from './lighting';
 
 export type BlockSampler = (wx: number, wy: number, wz: number) => number;
+/** Packed sky/block light at a world position; see world/lighting.ts. */
+export type LightSampler = (wx: number, wy: number, wz: number) => number;
 
 interface FaceDef {
   dir: [number, number, number];
@@ -93,13 +110,21 @@ const FACES: FaceDef[] = [
 ];
 
 const AO_LEVELS = [0.45, 0.62, 0.8, 1.0];
-const WATER_SURFACE_Y = 0.875;
+/** How thick a torch post is, in blocks. */
+const POST_WIDTH = 2 / 16;
+/**
+ * How dark a cell with no light at all gets. Not quite zero: a pitch-black
+ * cave should be frightening, not unrenderable.
+ */
+const MIN_BRIGHTNESS = 0.05;
 
 class MeshBuilder {
   positions: number[] = [];
   normals: number[] = [];
   colors: number[] = [];
   uvs: number[] = [];
+  /** Per-vertex (sky, block) light, 0..1 each; combined in the shader. */
+  lights: number[] = [];
   indices: number[] = [];
 
   build(): THREE.BufferGeometry | null {
@@ -109,38 +134,96 @@ class MeshBuilder {
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(this.normals, 3));
     geo.setAttribute('color', new THREE.Float32BufferAttribute(this.colors, 3));
     geo.setAttribute('uv', new THREE.Float32BufferAttribute(this.uvs, 2));
+    geo.setAttribute('voxLight', new THREE.Float32BufferAttribute(this.lights, 2));
     geo.setIndex(new THREE.Uint32BufferAttribute(this.indices, 1));
     return geo;
   }
 }
 
-let opaqueMaterial: THREE.MeshLambertMaterial | null = null;
-let cutoutMaterial: THREE.MeshLambertMaterial | null = null;
-let waterMaterial: THREE.MeshLambertMaterial | null = null;
+/**
+ * How much of the sky's strength is currently reaching the ground: 1 at noon,
+ * near 0 at midnight. Shared by every chunk material, so the whole world
+ * darkens at dusk without a single triangle being rebuilt — and block light,
+ * which ignores this entirely, keeps a torch-lit room exactly as bright.
+ */
+const lightUniforms = { uDaylight: { value: 1 } };
 
-export function getOpaqueMaterial(): THREE.MeshLambertMaterial {
+export function setDaylight(value: number): void {
+  lightUniforms.uDaylight.value = Math.max(0, Math.min(1, value));
+}
+
+export function getDaylight(): number {
+  return lightUniforms.uDaylight.value;
+}
+
+/**
+ * Overall gain on a fully lit block face. Terrain carries its own light rather
+ * than taking it from the scene's lamps, so this is what keeps midday looking
+ * like midday instead of like a flat texture swatch.
+ */
+const EXPOSURE = 1.25;
+
+/**
+ * Fold per-voxel light into the vertex colour, which already carries the face
+ * shade and ambient occlusion. Sky light is scaled by the time of day; block
+ * light is not; the brighter of the two wins.
+ *
+ * This is the whole lighting model for terrain — no scene lamp touches a
+ * chunk. It has to be: three.js lights have no idea where the walls are, so a
+ * cave lit by the scene's sun is as bright as the field above it, and a torch
+ * could never add anything to a surface the sun was already hitting. Baking
+ * the light into the mesh is both what makes a cave dark and what makes a
+ * torch worth carrying.
+ */
+function applyVoxelLight(material: THREE.Material): void {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uDaylight = lightUniforms.uDaylight;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+         attribute vec2 voxLight;
+         uniform float uDaylight;`,
+      )
+      .replace(
+        '#include <color_vertex>',
+        `#include <color_vertex>
+         float voxBrightness = max(voxLight.x * uDaylight, voxLight.y);
+         vColor.rgb *= ${EXPOSURE.toFixed(3)} * mix(${MIN_BRIGHTNESS.toFixed(3)}, 1.0, voxBrightness);`,
+      );
+  };
+  material.customProgramCacheKey = () => 'voxel-light';
+}
+
+let opaqueMaterial: THREE.MeshBasicMaterial | null = null;
+let cutoutMaterial: THREE.MeshBasicMaterial | null = null;
+let waterMaterial: THREE.MeshBasicMaterial | null = null;
+
+export function getOpaqueMaterial(): THREE.MeshBasicMaterial {
   if (!opaqueMaterial) {
-    opaqueMaterial = new THREE.MeshLambertMaterial({ map: getAtlasTexture(), vertexColors: true });
+    opaqueMaterial = new THREE.MeshBasicMaterial({ map: getAtlasTexture(), vertexColors: true });
+    applyVoxelLight(opaqueMaterial);
   }
   return opaqueMaterial;
 }
 
-/** See-through blocks (glass): alpha-tested, so no transparency sorting. */
-export function getCutoutMaterial(): THREE.MeshLambertMaterial {
+/** See-through blocks (glass, crops, torches): alpha-tested, so no sorting. */
+export function getCutoutMaterial(): THREE.MeshBasicMaterial {
   if (!cutoutMaterial) {
-    cutoutMaterial = new THREE.MeshLambertMaterial({
+    cutoutMaterial = new THREE.MeshBasicMaterial({
       map: getAtlasTexture(),
       vertexColors: true,
       alphaTest: 0.5,
       side: THREE.DoubleSide,
     });
+    applyVoxelLight(cutoutMaterial);
   }
   return cutoutMaterial;
 }
 
-export function getWaterMaterial(): THREE.MeshLambertMaterial {
+export function getWaterMaterial(): THREE.MeshBasicMaterial {
   if (!waterMaterial) {
-    waterMaterial = new THREE.MeshLambertMaterial({
+    waterMaterial = new THREE.MeshBasicMaterial({
       map: getAtlasTexture(),
       vertexColors: true,
       transparent: true,
@@ -148,6 +231,7 @@ export function getWaterMaterial(): THREE.MeshLambertMaterial {
       depthWrite: false,
       side: THREE.DoubleSide,
     });
+    applyVoxelLight(waterMaterial);
   }
   return waterMaterial;
 }
@@ -158,7 +242,11 @@ export interface ChunkGeometry {
   water: THREE.BufferGeometry | null;
 }
 
-export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeometry {
+export function buildChunkGeometry(
+  chunk: Chunk,
+  sample: BlockSampler,
+  sampleLight: LightSampler = fullDaylight,
+): ChunkGeometry {
   const opaque = new MeshBuilder();
   const cutout = new MeshBuilder();
   const water = new MeshBuilder();
@@ -172,22 +260,42 @@ export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeo
         if (id === Block.Air) continue;
         const wx = ox + lx;
         const wz = oz + lz;
-        const isWater = id === Block.Water;
+        const liquid = isWater(id);
         const cut = isCutout(id);
         const def = BLOCKS[id];
-        const target = isWater ? water : cut ? cutout : opaque;
+        const target = liquid ? water : cut ? cutout : opaque;
 
         if (def.shape === 'cross') {
           // Crops: two diagonal sprites, drawn from both sides, never culled.
-          emitCross(cutout, lx, y, lz, def.tiles.side);
+          emitCross(cutout, lx, y, lz, def.tiles.side, sampleLight(wx, y, wz));
+          continue;
+        }
+        if (def.shape === 'post') {
+          // Torches: a thin standing box, lit by the cell it occupies.
+          emitPost(cutout, lx, y, lz, def.tiles.side, def.height, sampleLight(wx, y, wz));
           continue;
         }
 
         const slab = def.shape === 'slab';
+        // Water under water fills its cell completely, so a waterfall is a
+        // solid column rather than a stack of gaps.
+        const surface = !liquid
+          ? 1
+          : isWater(sample(wx, y + 1, wz))
+            ? 1
+            : waterSurfaceHeight(id);
         for (const face of FACES) {
           const neighbor = sample(wx + face.dir[0], y + face.dir[1], wz + face.dir[2]);
-          if (isWater) {
-            if (neighbor !== Block.Air) continue;
+          if (liquid) {
+            if (face.kind === 'top') {
+              if (isWater(neighbor)) continue; // more water above: no surface here
+            } else if (neighbor === Block.Air) {
+              // Exposed to air: this is the edge of the stream.
+            } else if (isWater(neighbor) && waterSurfaceHeight(neighbor) < surface - 1e-3) {
+              // A shallower neighbour leaves the side of this cell showing.
+            } else {
+              continue;
+            }
           } else if (slab && face.kind === 'top') {
             // A slab's top sits below the cell's ceiling, so a block above it
             // never fully hides it.
@@ -199,7 +307,8 @@ export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeo
             continue;
           }
           const tile = def.tiles[face.kind];
-          emitFace(target, face, lx, y, lz, wx, wz, tile, isWater, sample, slab ? def.height : 1);
+          const height = liquid ? surface : slab ? def.height : 1;
+          emitFace(target, face, lx, y, lz, wx, wz, tile, liquid, sample, sampleLight, height);
         }
       }
     }
@@ -207,6 +316,9 @@ export function buildChunkGeometry(chunk: Chunk, sample: BlockSampler): ChunkGeo
 
   return { opaque: opaque.build(), cutout: cutout.build(), water: water.build() };
 }
+
+/** Fallback light for callers that have none: broad daylight everywhere. */
+const fullDaylight: LightSampler = () => packLight(MAX_LIGHT, 0);
 
 /**
  * Only a full opaque cube hides a neighbour's face completely. A slab leaves
@@ -218,12 +330,21 @@ function coversFace(id: number): boolean {
 }
 
 /** Two diagonal quads through the cell; the cutout material draws both sides. */
-function emitCross(out: MeshBuilder, lx: number, y: number, lz: number, tile: number): void {
+function emitCross(
+  out: MeshBuilder,
+  lx: number,
+  y: number,
+  lz: number,
+  tile: number,
+  light: number,
+): void {
   const [u0, v0, u1, v1] = tileUVRect(tile);
   const quads: [number, number, number, number][] = [
     [0, 0, 1, 1],
     [1, 0, 0, 1],
   ];
+  const sky = skyOf(light) / MAX_LIGHT;
+  const block = blockOf(light) / MAX_LIGHT;
   for (const [xa, za, xb, zb] of quads) {
     const base = out.positions.length / 3;
     const corners: [number, number, number, number, number][] = [
@@ -236,7 +357,45 @@ function emitCross(out: MeshBuilder, lx: number, y: number, lz: number, tile: nu
       out.positions.push(px, py, pz);
       out.normals.push(0, 1, 0);
       out.colors.push(0.95, 0.95, 0.95);
+      out.lights.push(sky, block);
       out.uvs.push(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v);
+    }
+    out.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+}
+
+/**
+ * A thin box standing in the middle of the cell: the torch. The whole tile is
+ * mapped onto each side, so the flame at the top of the texture ends up at the
+ * top of the post however short it is.
+ */
+function emitPost(
+  out: MeshBuilder,
+  lx: number,
+  y: number,
+  lz: number,
+  tile: number,
+  height: number,
+  light: number,
+): void {
+  const [u0, v0, u1, v1] = tileUVRect(tile);
+  const sky = skyOf(light) / MAX_LIGHT;
+  const block = blockOf(light) / MAX_LIGHT;
+  // A torch is its own little light source, so nothing shades it: full bright
+  // on every face, which is what makes it read as glowing.
+  for (const face of FACES) {
+    const base = out.positions.length / 3;
+    const [nx, ny, nz] = face.dir;
+    for (const corner of face.corners) {
+      out.positions.push(
+        lx + 0.5 + (corner.pos[0] - 0.5) * POST_WIDTH,
+        y + corner.pos[1] * height,
+        lz + 0.5 + (corner.pos[2] - 0.5) * POST_WIDTH,
+      );
+      out.normals.push(nx, ny, nz);
+      out.colors.push(1, 1, 1);
+      out.lights.push(sky, block);
+      out.uvs.push(u0 + (u1 - u0) * corner.uv[0], v0 + (v1 - v0) * corner.uv[1]);
     }
     out.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
@@ -251,8 +410,9 @@ function emitFace(
   wx: number,
   wz: number,
   tile: number,
-  isWater: boolean,
+  liquid: boolean,
   sample: BlockSampler,
+  sampleLight: LightSampler,
   height = 1,
 ): void {
   const [u0, v0, u1, v1full] = tileUVRect(tile);
@@ -260,28 +420,27 @@ function emitFace(
   const v1 = face.kind === 'side' ? v0 + (v1full - v0) * height : v1full;
   const base = out.positions.length / 3;
   const [nx, ny, nz] = face.dir;
-  // The air cell the face looks into; AO neighbours live in its plane.
+  // The air cell the face looks into; AO and light neighbours live in its plane.
   const ax = wx + nx;
   const ay = y + ny;
   const az = wz + nz;
   // Tangent axes of the face (the two axes where corner coords vary).
   const uAxis = nx !== 0 ? 1 : 0;
   const vAxis = nz !== 0 ? 1 : 2;
-  const lowerTop = isWater && sample(wx, y + 1, wz) !== Block.Water;
 
   const ao: number[] = [];
   for (const corner of face.corners) {
-    let px = lx + corner.pos[0];
-    let py = y + corner.pos[1] * height;
-    let pz = lz + corner.pos[2];
-    if (lowerTop && corner.pos[1] === 1) py = y + WATER_SURFACE_Y;
+    const px = lx + corner.pos[0];
+    const py = y + corner.pos[1] * height;
+    const pz = lz + corner.pos[2];
+
+    const du = [0, 0, 0];
+    const dv = [0, 0, 0];
+    du[uAxis] = corner.pos[uAxis] === 0 ? -1 : 1;
+    dv[vAxis] = corner.pos[vAxis] === 0 ? -1 : 1;
 
     let aoLevel = 3;
-    if (!isWater) {
-      const du = [0, 0, 0];
-      const dv = [0, 0, 0];
-      du[uAxis] = corner.pos[uAxis] === 0 ? -1 : 1;
-      dv[vAxis] = corner.pos[vAxis] === 0 ? -1 : 1;
+    if (!liquid) {
       const side1 = isOpaque(sample(ax + du[0], ay + du[1], az + du[2])) ? 1 : 0;
       const side2 = isOpaque(sample(ax + dv[0], ay + dv[1], az + dv[2])) ? 1 : 0;
       const cornerOcc = isOpaque(
@@ -293,10 +452,32 @@ function emitFace(
     }
     ao.push(aoLevel);
 
+    // Smooth lighting: average the four cells that meet at this corner, on the
+    // lit side of the face, ignoring any that are solid enough to hold no light.
+    let skySum = 0;
+    let blockSum = 0;
+    let count = 0;
+    for (const [ox, oy, oz] of [
+      [0, 0, 0],
+      [du[0], du[1], du[2]],
+      [dv[0], dv[1], dv[2]],
+      [du[0] + dv[0], du[1] + dv[1], du[2] + dv[2]],
+    ]) {
+      const cx = ax + ox;
+      const cy = ay + oy;
+      const cz = az + oz;
+      if (count > 0 && coversFace(sample(cx, cy, cz))) continue;
+      const packed = sampleLight(cx, cy, cz);
+      skySum += skyOf(packed);
+      blockSum += blockOf(packed);
+      count++;
+    }
+
     const shade = face.shade * AO_LEVELS[aoLevel];
     out.positions.push(px, py, pz);
     out.normals.push(nx, ny, nz);
     out.colors.push(shade, shade, shade);
+    out.lights.push(skySum / count / MAX_LIGHT, blockSum / count / MAX_LIGHT);
     out.uvs.push(u0 + (u1 - u0) * corner.uv[0], v0 + (v1 - v0) * corner.uv[1]);
   }
 

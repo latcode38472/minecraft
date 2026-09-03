@@ -12,8 +12,9 @@ import { ArrowSim, MobSim, isNightTime, solveArrowArc } from '../src/shared/mobs
 import { MOB_DEFS } from '../src/shared/mobs.ts';
 import { moveWithCollision, rayBoxDistance } from '../src/shared/voxel.ts';
 import { Block } from '../src/blocks.ts';
-import { MAX_MOBS, NIGHT_START } from '../src/constants.ts';
-import type { SimPlayer } from '../src/shared/mobsim.ts';
+import { HOSTILE_MAX_SPAWN_LIGHT, MAX_MOBS, NIGHT_START } from '../src/constants.ts';
+import { effectiveLight, skyLightFactor } from '../src/world/lighting.ts';
+import type { MobKind, SimPlayer } from '../src/shared/mobsim.ts';
 
 const SEED = 1337;
 
@@ -121,18 +122,46 @@ test('night brings both zombies and skeletons, not just one', () => {
   assert.ok(kinds.has('skeleton'), `no skeletons spawned: ${[...kinds]}`);
 });
 
-test('daytime spawns passive mobs instead of hostiles', () => {
+test('daylight fills the open ground with animals and leaves hostiles to the dark', () => {
   const { world, sim } = makeRoom();
   const player = spawnPlayer(world);
   sim.timeOfDay = 0.3; // midday
-  run(sim, [player], 60);
 
-  assert.ok(sim.mobs.size > 0, 'daytime should still populate the room');
-  const kinds = [...sim.mobs.values()].map((m) => m.kind);
-  assert.ok(
-    kinds.every((k) => !MOB_DEFS[k].hostile),
-    `daylight spawns passive mobs only, got ${kinds}`,
-  );
+  // Note where each mob first appeared, not where it has wandered to since:
+  // the rule under test is about spawning.
+  const dt = 1 / 20;
+  const born = new Map<number, { kind: MobKind; x: number; y: number; z: number }>();
+  for (let t = 0; t < 60; t += dt) {
+    sim.update(dt, [player]);
+    for (const mob of sim.mobs.values()) {
+      if (born.has(mob.id)) continue;
+      born.set(mob.id, {
+        kind: mob.kind,
+        x: Math.floor(mob.position.x),
+        y: Math.floor(mob.position.y),
+        z: Math.floor(mob.position.z),
+      });
+    }
+  }
+
+  assert.ok(born.size > 0, 'daytime should still populate the room');
+  const kinds = [...born.values()].map((m) => m.kind);
+  assert.ok(kinds.some((k) => !MOB_DEFS[k].hostile), 'animals come out in the day');
+
+  // Spawning is decided by light now, not by the clock, so anything hostile
+  // that appeared at noon must have found somewhere genuinely dark to do it,
+  // and every animal must have found somewhere lit. (Villagers are placed by
+  // their village, not by the light, so they are not part of this rule.)
+  const daylight = skyLightFactor(sim.timeOfDay);
+  for (const mob of born.values()) {
+    if (mob.kind === 'villager') continue;
+    const light = effectiveLight(world.lightAt(mob.x, mob.y, mob.z), daylight);
+    if (MOB_DEFS[mob.kind].hostile) {
+      assert.ok(light <= HOSTILE_MAX_SPAWN_LIGHT, `a ${mob.kind} spawned in daylight (light ${light})`);
+    } else {
+      assert.ok(light > HOSTILE_MAX_SPAWN_LIGHT, `a ${mob.kind} spawned in the dark (light ${light})`);
+    }
+  }
 });
 
 test('a zombie closes on the nearest player and hits them', () => {

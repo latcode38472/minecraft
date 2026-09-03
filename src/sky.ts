@@ -4,6 +4,8 @@
 
 import * as THREE from 'three';
 import { DAY_LENGTH_SECONDS, START_TIME_OF_DAY } from './constants';
+import { skyLightFactor } from './world/lighting';
+import { setDaylight } from './world/mesher';
 
 interface SkyKeyframe {
   t: number;
@@ -24,6 +26,12 @@ const KEYFRAMES: SkyKeyframe[] = [
 export class Sky {
   timeOfDay = START_TIME_OF_DAY;
   readonly skyColor = new THREE.Color();
+  /**
+   * How much of full sunlight is reaching the ground, 0..1. Fed to the chunk
+   * shader every frame, which is how the whole world dims at dusk without a
+   * single chunk being rebuilt.
+   */
+  daylight = 1;
 
   private readonly sun: THREE.DirectionalLight;
   private readonly hemi: THREE.HemisphereLight;
@@ -49,6 +57,9 @@ export class Sky {
     const daylight = Math.max(0, elevation);
     this.sun.intensity = 1.5 * Math.pow(daylight, 0.6);
     this.hemi.intensity = 0.18 + 0.55 * daylight;
+
+    this.daylight = skyLightFactor(t);
+    setDaylight(this.daylight);
 
     this.sampleSky(t, this.skyColor);
     this.scene.background = this.skyColor;

@@ -11,9 +11,12 @@
 // the server's chunk cache and the client's streaming World satisfy.
 
 import {
+  CAVE_SPAWN_DEPTH,
+  CAVE_SPAWN_RISE,
   CROP_GROWTH_MEAN_S,
   DAY_LENGTH_SECONDS,
   FIST_KNOCKBACK,
+  HOSTILE_MAX_SPAWN_LIGHT,
   MAX_MOBS,
   MOB_DESPAWN_DISTANCE,
   MOB_SPAWN_INTERVAL_S,
@@ -25,8 +28,22 @@ import {
   SLEEP_WAKE_TIME,
   SMELT_TIME_S,
   START_TIME_OF_DAY,
+  WORLD_HEIGHT,
 } from '../constants.ts';
-import { Block, BLOCKS, isCrop, isFurnace } from '../blocks.ts';
+import {
+  Block,
+  BLOCKS,
+  WATER_LEVELS,
+  isCrop,
+  isFurnace,
+  isSolid,
+  isWater,
+  isWaterReplaceable,
+  isWaterSource,
+  waterBlockFor,
+  waterLevel,
+} from '../blocks.ts';
+import { effectiveLight, skyLightFactor } from '../world/lighting.ts';
 import { getItem } from '../items/items.ts';
 import { FURNACE_FUEL, FURNACE_INPUT, FURNACE_OUTPUT, cloneSlots, slotCount } from '../items/containers.ts';
 import type { ItemStack } from '../items/inventory.ts';
@@ -70,6 +87,11 @@ export interface SimWorld extends BlockQuery {
   drainNewCrops?(): Vec3[];
   /** Villages whose centre lies within `radius` of the point. */
   villagesNear?(x: number, z: number, radius: number): VillageInfo[];
+  /**
+   * Packed sky/block light at a position (see world/lighting.ts), or -1 when
+   * nothing is loaded there. Worlds without light fall back to the clock.
+   */
+  lightAt?(x: number, y: number, z: number): number;
 }
 
 const MAX_HOSTILE = 12;
@@ -96,6 +118,35 @@ const VILLAGE_ACTIVE_RANGE = 64;
 const VILLAGERS_PER_VILLAGE = 4;
 /** Herd members spawn within this many blocks of the first one. */
 const HERD_SPREAD = 3;
+/**
+ * Water moves in steps, not continuously: every cell waiting for an answer
+ * gets one a quarter of a second later, which is what makes a stream visibly
+ * run rather than appear all at once.
+ */
+const WATER_TICK_S = 0.25;
+/**
+ * Cells looked at per water tick. Most of them turn out to be already right —
+ * settling a pool means asking the same cell several times as the levels
+ * around it converge — so this is generous; it is the number of *changes*
+ * below that is actually kept in check.
+ */
+const MAX_WATER_UPDATES = 1024;
+/**
+ * Block changes per water tick. Every one of these is broadcast to the room
+ * and written to the save, so a flood is paced rather than dumped: fast
+ * enough to look like running water, slow enough that draining a lake into a
+ * cave cannot swamp the wire.
+ */
+const MAX_WATER_CHANGES = 96;
+/** Hard ceiling on cells waiting to be settled. */
+const MAX_WATER_QUEUE = 4096;
+/** The four ways water can spread sideways. */
+const HORIZONTAL: [number, number][] = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1],
+];
 
 export type WakeReason = 'morning' | 'bed_gone' | 'dead';
 
@@ -178,6 +229,11 @@ export class RoomSimulation {
 
   private spawnTimer = 0;
   private sleepTimer = 0;
+  /** Cells whose water level needs working out, oldest first. */
+  private readonly waterQueue: Vec3[] = [];
+  private readonly waterQueued = new Set<string>();
+  private waterHead = 0;
+  private waterTimer = 0;
 
   private readonly hooks: SimulationHooks;
 
@@ -217,6 +273,7 @@ export class RoomSimulation {
     this.updateDrops(dt, players);
     this.updateFurnaces(dt);
     this.updateCrops(dt, players);
+    this.updateWater(dt);
     this.updateSleep(dt, players);
 
     this.spawnTimer -= dt;
@@ -412,29 +469,43 @@ export class RoomSimulation {
       if (mob.def.hostile) hostiles++;
       else if (mob.kind !== 'villager') passives++;
     }
-    if (night ? hostiles >= MAX_HOSTILE : passives >= MAX_PASSIVE) return;
-    const kind = pickSpawnKind(night ? 'night' : 'day', Math.random);
-    if (!kind) return;
-    const rule = MOB_DEFS[kind].spawn;
+    if (hostiles >= MAX_HOSTILE && passives >= MAX_PASSIVE) return;
 
-    // Spawn in a ring around a random player, on real ground.
+    // Spawn in a ring around a random player. Half the attempts look at the
+    // open surface, half go underground — which is how a cave stays dangerous
+    // at noon and a torched-out one stops being.
     const anchor = players[Math.floor(Math.random() * players.length)];
-    for (let attempt = 0; attempt < 12; attempt++) {
+    for (let attempt = 0; attempt < 14; attempt++) {
       const angle = Math.random() * Math.PI * 2;
       const dist =
         MOB_SPAWN_MIN_DISTANCE + Math.random() * (MOB_SPAWN_MAX_DISTANCE - MOB_SPAWN_MIN_DISTANCE);
       const x = Math.floor(anchor.position.x + Math.cos(angle) * dist);
       const z = Math.floor(anchor.position.z + Math.sin(angle) * dist);
-      const y = this.canSpawnAt(x, z, rule.needsGrass);
+      const underground = attempt % 2 === 1;
+      const y = underground
+        ? this.undergroundSpawnY(x, z, anchor.position.y)
+        : this.surfaceSpawnY(x, z);
       if (y === null) continue;
 
+      // Whichever it is, the light where it lands decides what may appear.
+      const dark = this.isDarkEnoughForHostiles(x, y, z);
+      if (dark ? hostiles >= MAX_HOSTILE : passives >= MAX_PASSIVE) continue;
+      const kind = pickSpawnKind(dark ? 'night' : 'day', Math.random);
+      if (!kind) continue;
+      const rule = MOB_DEFS[kind].spawn;
+      if (rule.needsGrass && this.world.getBlock(x, y - 1, z) !== Block.Grass) continue;
+
       // Animals arrive as a small herd; a lone cow in a field looks lost.
+      // The rest of the group is looked for the same way the first one was, so
+      // a pair of zombies in a cave stays in the cave.
       const size = rule.group[0] + Math.floor(Math.random() * (rule.group[1] - rule.group[0] + 1));
       this.addMob(new MobSim(kind, x + 0.5, y, z + 0.5));
       for (let i = 1; i < size && this.mobs.size < MAX_MOBS; i++) {
         const hx = x + Math.floor(Math.random() * (HERD_SPREAD * 2 + 1)) - HERD_SPREAD;
         const hz = z + Math.floor(Math.random() * (HERD_SPREAD * 2 + 1)) - HERD_SPREAD;
-        const hy = this.canSpawnAt(hx, hz, rule.needsGrass);
+        const hy = underground
+          ? this.undergroundSpawnY(hx, hz, y)
+          : this.canSpawnAt(hx, hz, rule.needsGrass);
         if (hy === null || Math.abs(hy - y) > 3) continue;
         this.addMob(new MobSim(kind, hx + 0.5, hy, hz + 0.5));
       }
@@ -448,9 +519,43 @@ export class RoomSimulation {
     if (y === null) return null;
     // Never spawn in water or on leaves; animals want grass under their feet.
     const ground = this.world.getBlock(x, y - 1, z);
-    if (ground === Block.Water || ground === Block.Leaves) return null;
+    if (isWater(ground) || ground === Block.Leaves) return null;
     if (needsGrass && ground !== Block.Grass) return null;
     return y;
+  }
+
+  /** The open ground at this column, if anything could stand on it. */
+  private surfaceSpawnY(x: number, z: number): number | null {
+    return this.canSpawnAt(x, z, false);
+  }
+
+  /**
+   * A cave floor somewhere in the rock near the player: the first place, going
+   * down from a random probe, with head room and something solid underfoot.
+   */
+  private undergroundSpawnY(x: number, z: number, fromY: number): number | null {
+    const top = Math.min(WORLD_HEIGHT - 3, Math.floor(fromY + CAVE_SPAWN_RISE));
+    const bottom = Math.max(1, Math.floor(fromY - CAVE_SPAWN_DEPTH));
+    if (top < bottom) return null;
+    const start = bottom + Math.floor(Math.random() * (top - bottom + 1));
+    for (let y = start; y >= bottom; y--) {
+      if (this.world.getBlock(x, y, z) !== Block.Air) continue;
+      if (this.world.getBlock(x, y + 1, z) !== Block.Air) continue;
+      const ground = this.world.getBlock(x, y - 1, z);
+      if (!isSolid(ground) || ground === Block.Leaves) continue;
+      return y;
+    }
+    return null;
+  }
+
+  /**
+   * Is it dark enough here for something hostile? Falls back to the clock for
+   * worlds that carry no light data, which is how it used to work.
+   */
+  private isDarkEnoughForHostiles(x: number, y: number, z: number): boolean {
+    const packed = this.world.lightAt?.(x, y, z) ?? -1;
+    if (packed < 0) return isNightTime(this.timeOfDay);
+    return effectiveLight(packed, skyLightFactor(this.timeOfDay)) <= HOSTILE_MAX_SPAWN_LIGHT;
   }
 
   /** Villages near a player keep a few villagers about, until they have enough. */
@@ -537,6 +642,8 @@ export class RoomSimulation {
    * was standing on it.
    */
   blockRemoved(x: number, y: number, z: number): void {
+    // Whatever was holding the water back has gone; let it move.
+    this.queueWaterAround(x, y, z);
     const key = blockKey(x, y, z);
     const entity = this.containers.get(key);
     if (entity) {
@@ -549,8 +656,10 @@ export class RoomSimulation {
     for (const [playerId, bed] of [...this.sleepers]) {
       if (bed.x === x && bed.y === y && bed.z === z) this.wake(playerId, 'bed_gone');
     }
+    // Anything that was only standing there because this block held it up —
+    // a crop, a torch — comes down with it.
     const above = this.world.getBlock(x, y + 1, z);
-    if (isCrop(above)) {
+    if (isCrop(above) || above === Block.Torch) {
       for (const roll of blockDrops(BLOCKS[above], null)) {
         this.spawnDrop(roll.id, roll.count, x + 0.5, y + 1.3, z + 0.5);
       }
@@ -565,6 +674,9 @@ export class RoomSimulation {
     if (this.containers.has(key)) this.blockRemoved(x, y, z);
     if (isCrop(id)) this.registerCrop(x, y, z);
     else this.crops.delete(key);
+    // A new block dams what was flowing past, and what it displaced has to
+    // find somewhere else to be.
+    this.queueWaterAround(x, y, z);
   }
 
   registerCrop(x: number, y: number, z: number): void {
@@ -662,6 +774,129 @@ export class RoomSimulation {
       this.setBlock(at.x, at.y, at.z, next);
       if (BLOCKS[next].growsInto === null) this.crops.delete(key);
     }
+  }
+
+  // --- Water --------------------------------------------------------------
+  //
+  // Water is worked out by *pulling*, not pushing: a cell asks what is around
+  // it and decides what it should hold. A source is level 0 and never changes;
+  // anything fed from above is level 1; otherwise a cell is one level thinner
+  // than its shallowest neighbour, and at level 8 it has run dry. Water that
+  // has somewhere to fall does not spread sideways at all, so a stream runs
+  // off a ledge instead of pooling on it.
+  //
+  // Only cells that actually changed queue their neighbours, so a settled
+  // ocean costs nothing and the whole thing comes to a stop on its own.
+
+  /** Ask for this cell's water to be worked out on the next water tick. */
+  queueWater(x: number, y: number, z: number): void {
+    if (y < 0 || y >= WORLD_HEIGHT) return;
+    if (this.waterQueue.length - this.waterHead >= MAX_WATER_QUEUE) return;
+    const key = blockKey(x, y, z);
+    if (this.waterQueued.has(key)) return;
+    this.waterQueued.add(key);
+    this.waterQueue.push({ x, y, z });
+  }
+
+  /** A block changed here, so this cell and everything touching it may flow. */
+  queueWaterAround(x: number, y: number, z: number): void {
+    this.queueWater(x, y, z);
+    this.queueWater(x + 1, y, z);
+    this.queueWater(x - 1, y, z);
+    this.queueWater(x, y, z + 1);
+    this.queueWater(x, y, z - 1);
+    this.queueWater(x, y + 1, z);
+    this.queueWater(x, y - 1, z);
+  }
+
+  private updateWater(dt: number): void {
+    this.waterTimer -= dt;
+    if (this.waterTimer > 0) return;
+    this.waterTimer = WATER_TICK_S;
+
+    // Only the cells that were already waiting when the tick began. Anything
+    // they queue waits for the next one, so a stream advances one block every
+    // quarter second instead of appearing all at once.
+    const frontier = this.waterQueue.length;
+    let looks = MAX_WATER_UPDATES;
+    let changes = MAX_WATER_CHANGES;
+    while (looks-- > 0 && changes > 0 && this.waterHead < frontier) {
+      const at = this.waterQueue[this.waterHead++];
+      this.waterQueued.delete(blockKey(at.x, at.y, at.z));
+      if (this.settleWater(at.x, at.y, at.z)) changes--;
+    }
+    // Drop the settled prefix rather than shifting one cell at a time.
+    if (this.waterHead >= this.waterQueue.length) {
+      this.waterQueue.length = 0;
+      this.waterHead = 0;
+    } else if (this.waterHead > 512) {
+      this.waterQueue.splice(0, this.waterHead);
+      this.waterHead = 0;
+    }
+  }
+
+  /**
+   * Give this cell the water level its neighbours say it should have.
+   * Returns true when that actually changed the block.
+   */
+  private settleWater(x: number, y: number, z: number): boolean {
+    const id = this.world.getBlock(x, y, z);
+    if (isWaterSource(id)) return false; // a source is forever
+    if (!isWaterReplaceable(id)) return false; // solid ground holds no water
+
+    const want = this.waterLevelFor(x, y, z);
+    const current = isWater(id) ? waterLevel(id) : -1;
+    if (want === current) return false;
+
+    if (want < 0) {
+      this.setBlock(x, y, z, Block.Air);
+    } else {
+      // Water washing over a crop or a torch carries it away.
+      if (id !== Block.Air && !isWater(id)) {
+        for (const roll of blockDrops(BLOCKS[id], null)) {
+          this.spawnDrop(roll.id, roll.count, x + 0.5, y + 0.5, z + 0.5);
+        }
+        this.crops.delete(blockKey(x, y, z));
+      }
+      this.setBlock(x, y, z, waterBlockFor(want));
+    }
+    this.queueWaterAround(x, y, z);
+    return true;
+  }
+
+  /** The level this cell should hold: 0 for a source, 1..7 flowing, -1 dry. */
+  private waterLevelFor(x: number, y: number, z: number): number {
+    // Anything with water above it is being fed from above, at full pressure.
+    if (isWater(this.world.getBlock(x, y + 1, z))) return 1;
+
+    let best = WATER_LEVELS;
+    let sources = 0;
+    for (const [dx, dz] of HORIZONTAL) {
+      const neighbour = this.world.getBlock(x + dx, y, z + dz);
+      if (!isWater(neighbour)) continue;
+      const level = waterLevel(neighbour);
+      // A neighbour with somewhere to fall is draining, not spreading.
+      if (level > 0 && this.drainsDown(x + dx, y, z + dz)) continue;
+      if (level === 0) sources++;
+      best = Math.min(best, level + 1);
+    }
+    // Two sources either side, and something to sit on: the water levels out
+    // and this cell becomes a source too. That is what heals a lake you dug
+    // a channel out of, instead of draining it away for good.
+    if (sources >= 2 && !isWaterReplaceable(this.world.getBlock(x, y - 1, z))) return 0;
+    return best >= WATER_LEVELS ? -1 : best;
+  }
+
+  /** Is there somewhere below this cell for its water to fall into? */
+  private drainsDown(x: number, y: number, z: number): boolean {
+    if (y <= 0) return false;
+    const below = this.world.getBlock(x, y - 1, z);
+    return isWaterReplaceable(below) && !isWater(below);
+  }
+
+  /** How many cells are still waiting to settle; for tests and the debug overlay. */
+  get pendingWaterCount(): number {
+    return this.waterQueue.length - this.waterHead;
   }
 
   // --- Beds ---------------------------------------------------------------

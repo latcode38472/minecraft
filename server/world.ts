@@ -9,6 +9,7 @@
 import { BLOCKS, isCrop } from '../src/blocks.ts';
 import { CHUNK_SIZE, WORLD_HEIGHT } from '../src/constants.ts';
 import { Chunk } from '../src/world/chunk.ts';
+import { LightEngine } from '../src/world/lighting.ts';
 import { TerrainGenerator } from '../src/world/terrain.ts';
 import type { Vec3 } from '../src/shared/voxel.ts';
 import type { SimWorld, VillageInfo } from '../src/shared/roomsim.ts';
@@ -31,6 +32,14 @@ export class ServerWorld implements SimWorld {
 
   /** Live reference to the room's edits: chunkKey -> voxelIndex -> blockId. */
   private readonly edits: Map<string, Map<number, number>>;
+  /**
+   * The server lights its chunks too. Nothing here is drawn, but the room
+   * simulation asks how dark a spot is before it lets anything spawn there,
+   * and that answer has to be the same one the players' clients would give.
+   */
+  private readonly lighting = new LightEngine({
+    peekChunk: (cx, cz) => this.chunks.get(Chunk.key(cx, cz)) ?? null,
+  });
 
   constructor(seed: number, edits: Map<string, Map<number, number>>) {
     this.seed = seed;
@@ -66,6 +75,7 @@ export class ServerWorld implements SimWorld {
       const edits = this.edits.get(key);
       if (edits) for (const [index, id] of edits) chunk.data[index] = id;
       this.chunks.set(key, chunk);
+      this.lighting.seedChunk(chunk);
     }
     this.touched.set(key, this.tick);
     return chunk;
@@ -97,7 +107,19 @@ export class ServerWorld implements SimWorld {
     // Only touch a chunk we already hold; otherwise the edit is already in the
     // room's edit map and will be replayed when the chunk is next generated.
     const chunk = this.chunks.get(key);
-    if (chunk) chunk.set(x - cx * CHUNK_SIZE, y, z - cz * CHUNK_SIZE, id);
+    if (!chunk) return;
+    chunk.set(x - cx * CHUNK_SIZE, y, z - cz * CHUNK_SIZE, id);
+    this.lighting.blockChanged(x, y, z, id);
+  }
+
+  /** Packed sky/block light, or -1 where no chunk is loaded to answer. */
+  lightAt(x: number, y: number, z: number): number {
+    if (y < 0 || y >= WORLD_HEIGHT) return -1;
+    const cx = Math.floor(x / CHUNK_SIZE);
+    const cz = Math.floor(z / CHUNK_SIZE);
+    const chunk = this.chunkAt(cx, cz);
+    if (!chunk.lit) return -1;
+    return chunk.light[Chunk.index(x - cx * CHUNK_SIZE, y, z - cz * CHUNK_SIZE)];
   }
 
   /** Untouched terrain: no player edit has ever landed on this voxel. */

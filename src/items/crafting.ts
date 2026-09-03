@@ -100,6 +100,9 @@ export const RECIPES: Recipe[] = [
   shaped('chest', out('chest'), ['PPP', 'P.P', 'PPP'], { P: 'planks' }),
   shaped('furnace', out('furnace'), ['CCC', 'C.C', 'CCC'], { C: 'cobblestone' }),
   shaped('shears', out('shears'), ['.I', 'I.'], { I: 'iron_ingot' }),
+  // Four torches from one coal: the first thing worth making before you go
+  // underground, and the only way to keep a cave lit and empty.
+  shaped('torch', out('torch', 4), ['C', 'S'], { C: 'coal', S: 'stick' }),
 
   // Tools.
   ...TOOL_MATERIALS.flatMap(([tier, mat]) => [

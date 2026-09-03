@@ -70,6 +70,7 @@ import { InventoryUi, recipeCells } from './ui/inventoryui';
 import { StatusUi } from './ui/statusui';
 import { TouchControls, isTouchDevice } from './ui/touch';
 import { World } from './world/world';
+import { blockOf, skyOf } from './world/lighting';
 
 const STEP_INTERVAL_BLOCKS = 2.2;
 
@@ -1037,6 +1038,13 @@ async function boot(choice: StartChoice): Promise<void> {
       look.direction(lookDir);
       interaction.update(dt, performance.now(), eye, lookDir, { mining, using, useTaps: taps });
     },
+    /** Sky and block light at a voxel, as the renderer and the spawner see it. */
+    lightAt: (x: number, y: number, z: number) => {
+      const packed = world.lightAt(x, y, z);
+      return { packed, sky: skyOf(packed), block: blockOf(packed) };
+    },
+    /** How much of full sunlight is currently reaching the ground, 0..1. */
+    getDaylight: () => sky.daylight,
     __breakTime: (blockId: number, stack: ItemStack | null) =>
       breakTimeFor(BLOCKS[blockId], stack),
     __canHarvest: (blockId: number, stack: ItemStack | null) =>

@@ -172,8 +172,10 @@ export class TerrainGenerator {
         const wz = oz + lz;
         const ground = this.heightAt(wx, wz);
         const beach = ground <= SEA_LEVEL + 1;
-        // Keep the sea floor sealed: an open cave under water would be a dry
-        // air pocket, since water here is static.
+        // Keep the sea floor sealed under three blocks of rock. Water flows
+        // now, so a cave carved into the floor would not be a dry pocket — it
+        // would be an ocean draining into it. Flooding your own mine should
+        // take a deliberate dig, not a stray cave mouth.
         const underwater = ground < SEA_LEVEL;
 
         for (let y = 0; y < ground; y++) {

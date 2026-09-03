@@ -136,6 +136,7 @@ blockItem('wool', Block.Wool);
 blockItem('chest', Block.Chest);
 blockItem('hay_bale', Block.HayBale, 'Hay Bale');
 blockItem('bed', Block.Bed, 'Bed', ItemTile.Bed);
+blockItem('torch', Block.Torch);
 
 // --- Materials ---
 material('stick', 'Stick', ItemTile.Stick);

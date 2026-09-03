@@ -3,7 +3,7 @@
 // (crafting tables, furnaces, chests, beds).
 
 import * as THREE from 'three';
-import { BLOCKS, Block, isCrop, isFurnace, type BlockDef } from '../blocks';
+import { BLOCKS, Block, isCrop, isFurnace, isWater, type BlockDef } from '../blocks';
 import {
   ARROW_MIN_CHARGE,
   FIST_COOLDOWN_S,
@@ -328,11 +328,15 @@ export class Interaction {
     const pz = hit.z + hit.normal[2];
 
     const occupied = this.world.getBlock(px, py, pz);
-    if (occupied !== Block.Air && occupied !== Block.Water) return false;
+    if (occupied !== Block.Air && !isWater(occupied)) return false;
     const below = this.world.getBlock(px, py - 1, pz);
-    // Seeds only take in tilled soil; crops and beds need something under them.
+    // Seeds only take in tilled soil; crops, beds and torches need something
+    // under them — a torch will not stand on thin air or in a puddle.
     if (isSeed || isCrop(block)) {
       if (below !== Block.Farmland) return false;
+    } else if (block === Block.Torch) {
+      if (!BLOCKS[below].solid || BLOCKS[below].shape !== 'cube') return false;
+      if (isWater(occupied)) return false;
     } else if (block === Block.Bed && !BLOCKS[below].solid) {
       return false;
     }

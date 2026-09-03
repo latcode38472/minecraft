@@ -306,10 +306,31 @@ for two seconds so it does not snap straight back.
 - Seeded terrain: continents/oceans, plains, hills, mountains, beaches, valleys,
   and cave systems carved by 3D noise (~6% of underground volume)
 - Ore generation by depth: coal, then iron, gold, and diamond deepest and rarest
-- 34 block types including gravel, bricks, glass, wool, hay, farmland, paths,
-  crops, beds, chests, crafting tables and (lit) furnaces; slabs and crop
-  sprites are meshed as partial blocks
-- Trees, water, day/night cycle driving sun, sky and fog
+- 42 block types including gravel, bricks, glass, wool, hay, farmland, paths,
+  crops, beds, chests, torches, crafting tables and (lit) furnaces, plus seven
+  levels of flowing water; slabs, crop sprites and torches are meshed as
+  partial blocks
+- Trees, day/night cycle driving sun, sky and fog
+- **Light**, per voxel, in two channels. *Sky light* is seeded from the top of
+  the world and falls straight down at full strength through anything clear,
+  losing a level for every block it spreads sideways — so a cave with no way
+  out to the surface is genuinely dark, at noon as much as at midnight, and a
+  shaft you dig lights up to the bottom. *Block light* comes from torches
+  (14) and lit furnaces (13) and ignores the clock entirely. Both are flood
+  filled incrementally: breaking or placing a block relights only what that
+  block was responsible for. The time of day is a shader uniform, so dusk
+  dims the whole world without rebuilding a single chunk
+- **Torches**: four from a coal and a stick. Placed on top of a solid block,
+  they light about fourteen blocks of cave, pop off and drop when whatever
+  they were standing on is broken, and wash away if water reaches them
+- **Flowing water**: a source spreads seven blocks and falls before it
+  spreads, one block every quarter second, thinning by a level as it goes.
+  Break the wall of a lake and it pours through; dam a stream and everything
+  below the dam dries up; take the dam out and it runs again. Two sources
+  either side of a gap fill it with a source of their own, so water finds its
+  level and a lake you cut a channel out of heals rather than draining away.
+  It runs in the shared simulation, which means the server is the authority on
+  it in multiplayer and everyone sees the same stream
 - **Villages**: a well, four dirt paths, four to seven houses (cobblestone
   floors, plank walls, log corners, glass windows, a bed, a chest stocked from
   a seeded loot table, a crafting table or furnace) and up to three fenced
@@ -340,8 +361,15 @@ for two seconds so it does not snap straight back.
   refills the bar about four times faster than it drained
 - Death screen and respawn at your spawn point (or your bed), naming what killed you
 - Passive pigs, cows and sheep in small herds on grass, villagers in villages,
-  hostile zombies and skeletons at night; all take damage, die with a keel-over
-  animation and drop from a loot table (`shared/loot.ts`)
+  hostile zombies and skeletons in the dark; all take damage, die with a
+  keel-over animation and drop from a loot table (`shared/loot.ts`)
+- **Spawning goes by light, not by the clock.** The spawner looks both at the
+  open surface and at cave floors around each player, and whatever it finds
+  there, the light level at that spot decides what may appear: 7 or below and
+  it is a zombie or a skeleton, 8 or above and it is an animal. So an unlit
+  cave is dangerous at midday, the surface fills with hostiles at dusk on its
+  own, and a torch is a real defence — put enough of them down and nothing
+  spawns in your mine any more
 - **Animals** stroll, stand, look around, and (cows and sheep) put their head
   down to graze; a hit sends them running. **Sheep** come in several fleece
   colours; shears take the wool, which grows back in four minutes, and a
@@ -417,9 +445,9 @@ for two seconds so it does not snap straight back.
 - 36-slot inventory with a 9-slot hotbar, stacking, and tool durability
 - **Grid crafting**: a 2×2 grid in your pocket, 3×3 at a crafting table.
   Shaped and shapeless recipes from one registry (`items/crafting.ts`),
-  matched anywhere on the grid and mirrored: planks, sticks, tables, chests,
-  furnaces, beds, bread, hay, shears, bows, arrows, shields, tools and hoes
-  in four tiers, armour in three
+  matched anywhere on the grid and mirrored: planks, sticks, torches, tables,
+  chests, furnaces, beds, bread, hay, shears, bows, arrows, shields, tools and
+  hoes in four tiers, armour in three
 - **Furnaces** with input, fuel and output slots, a fuel registry (coal smelts
   eight items, planks one and a half, sticks half), burn time and progress
   bars, and a lit block while the fire is going — they keep working while
@@ -440,7 +468,7 @@ src/
   input.ts           keyboard/wheel state, discrete press queue
   raycast.ts         Amanatides & Woo voxel DDA
   audio.ts           WebAudio generated sound effects
-  sky.ts             day/night: sun/ambient lights, sky+fog colour keyframes
+  sky.ts             day/night: sun/ambient lights, sky+fog colour, daylight level
   save.ts            IndexedDB store (meta, sim state, per-chunk edit diffs)
   items/
     items.ts         item registry: blocks, materials, food, tools, weapons
@@ -456,7 +484,7 @@ src/
     harvest.ts       break time, tool tiers, what a block drops
     save.ts          save schema + validation for worlds, players, sim state
     mobsim.ts        mob behaviour (chase, shoot, wander/graze/flee), drops, arrows
-    roomsim.ts       the world simulation: mobs, drops, containers, crops, beds, clock
+    roomsim.ts       the world simulation: mobs, drops, containers, crops, water, beds, clock
   entities/
     entity.ts        Entity base: gravity, buoyancy, voxel collision
     arrow.ts         swept projectile: reports block, mob and player hits
@@ -481,7 +509,8 @@ server/
   store.ts           world files on disk: atomic writes, backups, validation
   world.ts           server-side terrain + chunk cache with eviction
 tests/
-  simulation.test.ts headless: terrain, mobs, loot, drops, memory bounds
+  simulation.test.ts headless: terrain, mobs, loot, drops, spawn light, memory bounds
+  lighting.test.ts   sky and torch light propagation, and how water flows
   gameplay.test.ts   clicks, grid crafting, furnaces, chests, crops, beds, saves, villages
   combat.test.ts     knockback per weapon, how far it really moves a mob, sprint costs
   protocol.test.ts   every sanitiser, from an attacker's point of view
@@ -490,12 +519,14 @@ tests/
   multiplayer.test.ts a real server driven by real WebSocket clients
   browser.mjs        real Chromium tabs, including a simulated phone
   world/
-    chunk.ts         flat Uint8Array voxel storage per 16x72x16 column
+    chunk.ts         flat Uint8Array voxel storage per 16x72x16 column, plus light
+    lighting.ts      sky/block light flood fill: seed a chunk, relight one block
     noise.ts         seeded value noise + fBm
     terrain.ts       heightmap layers, biome-ish masks, deterministic trees, villages
     village.ts       village layout (well, paths, houses, farms) and placement
     world.ts         chunk map, streaming, edit tracking, remesh queue
-    mesher.ts        culled face meshing with baked AO; cubes, slabs, crop sprites
+    mesher.ts        culled face meshing with baked AO and smooth light; cubes,
+                     slabs, crop sprites, torch posts, levelled water
   player/
     camera.ts        pointer-lock yaw/pitch
     player.ts        movement intent, water state, fall tracking
@@ -521,12 +552,61 @@ saves stay tiny and unloaded chunks can be regenerated and re-patched exactly.
 for faces that touch a non-opaque block, so interior geometry costs nothing.
 Each vertex bakes `directional face shade × ambient occlusion` into a vertex
 colour; AO uses the classic 3-neighbour corner test, and each quad's diagonal
-is flipped to match its AO gradient to avoid interpolation artifacts. Water
-goes into a second transparent mesh with its surface lowered slightly where
-exposed to air. One draw call per chunk per material; remeshing is queued and
-processed nearest-first under a per-frame time budget (edits near the player
-remesh the same frame, so interaction feels instant). Neighbour chunks are
-re-queued when a border block changes so culling/AO stays correct across seams.
+is flipped to match its AO gradient to avoid interpolation artifacts. Each
+vertex also carries a second attribute, the sky and block light averaged over
+the same four cells the AO test samples, which is what gives light a smooth
+gradient across a face instead of a per-block staircase. Water goes into a
+second transparent mesh whose surface height comes from its flow level, so a
+stream visibly steps down as it thins. One draw call per chunk per material;
+remeshing is queued and processed nearest-first under a per-frame time budget
+(edits near the player remesh the same frame, so interaction feels instant).
+Neighbour chunks are re-queued when a border block changes — or when light
+spills across the seam — so culling, AO and light stay correct across it.
+
+**Light.** Two channels, a nibble each, in a per-chunk `Uint8Array` alongside
+the block ids (`world/lighting.ts`). Sky light is seeded down every column from
+the top of the world: it passes through anything clear at full strength, loses
+a block's `lightOpacity` on the way (water takes 2, a canopy 3, a solid block
+all 15), and then floods sideways at a level per block. Block light works the
+same way from whatever emits it. Both use the same pair of passes — an *add*
+flood that pushes light outward from anything brighter than its neighbours, and
+a *removal* flood that unlights everything a vanished source was responsible
+for, collecting the still-lit cells at the edge of the hole so the add pass can
+fill it back in. That pair is what lets a single block change be relit in
+microseconds rather than relighting a chunk: place a block over a shaft and
+only the column below it goes dark.
+
+The engine only ever writes into chunks already in memory, so light stops at
+the edge of the loaded world and flows on when the next chunk arrives and seeds
+itself from its neighbours' borders. The server runs the identical engine —
+nothing there is drawn, but the spawner has to agree with the clients about how
+dark a spot is.
+
+Rendering does the last step in the shader: the vertex colour is multiplied by
+`max(sky × uDaylight, block)`, where `uDaylight` is one uniform shared by every
+chunk material. That is why dusk costs nothing — the whole world dims without a
+triangle being rebuilt — and why a torch-lit room holds its brightness while
+the surface goes dark. Terrain is deliberately *not* lit by the scene's lamps
+(chunks use `MeshBasicMaterial`): a three.js directional light has no idea
+where the walls are, so it lights the inside of a cave exactly as brightly as
+the field above it, and no torch could ever add to a surface the sun was
+already hitting.
+
+**Water.** Levels 0–7 as eight block ids: a source, then seven thinning steps.
+The simulation works by *pulling*, not pushing — a cell asks what is around it
+and decides what it should hold. Anything with water above it is fed at level
+1; otherwise it is one level thinner than its shallowest neighbour, and at
+level 8 it has run dry. Water with somewhere to fall does not spread sideways
+at all, so a stream runs off a ledge instead of pooling on it, and two sources
+either side of a gap fill it with a source of their own, which is what heals a
+lake you have cut a channel out of. Only cells that actually changed queue
+their neighbours, so a settled ocean costs nothing and a flood comes to a stop
+by itself. Each tick processes only the cells that were already waiting when it
+began, which is what makes a stream advance one block every quarter second
+rather than appearing all at once, and there are caps on both the cells looked
+at and the block changes made per tick so a large flood is paced rather than
+dumped onto the wire. Terrain-generated water is left alone: it is already in
+equilibrium, and nothing queues it until a player disturbs it.
 
 **Raycast.** Targeting uses the Amanatides & Woo DDA: starting from the camera
 voxel, repeatedly step across whichever axis boundary is nearest along the
@@ -636,11 +716,23 @@ protocol is identical on both platforms.
 
 ## Current limitations
 
-- Water is static (no flow simulation); placing/removing blocks doesn't make
-  water spread.
-- No per-voxel light propagation — lighting is sun + ambient + baked AO, so
-  caves aren't dark inside and torches don't exist yet. Hostile spawning is
-  gated on time of day rather than light level for the same reason.
+- Water has no buckets: you cannot pick a source up or put one down, so the
+  only water in a world is what the terrain generated (and what flows out of
+  it once you cut into it). Hook: an item with a `places`/`picks up` liquid
+  action in `items/items.ts`, and `RoomSimulation.queueWaterAround` to kick
+  the flow off. There is no lava, and water does not push entities along.
+- The sea floor is still sealed under three blocks of rock at generation time,
+  so an ocean cannot pour into a cave system you have never been near. Digging
+  into it yourself works exactly as you would hope.
+- Light is per block, not per face colour: there are no coloured lights, and
+  nothing smooths light across a chunk border differently from within one.
+  Entities (mobs, dropped items, the first-person hand) are lit by the scene's
+  lamps rather than by the voxel light, so a zombie standing in a dark cave is
+  brighter than the wall behind it. Hook: `WorldView` already knows each mob's
+  position, and `World.lightAt` is the query.
+- A chunk that streams in next to an already-lit one is lit from its
+  neighbours' borders, which is correct but not free: seeding light costs
+  about 1.4 ms per chunk on top of the 7 ms terrain generation takes.
 - Mobs other than villagers still despawn past 72 blocks and drops after 5
   minutes; what is alive at save time is saved (mobs and drops up to a cap of
   256 each).
@@ -690,12 +782,14 @@ protocol is identical on both platforms.
 
 ## Next 5 features (priority order)
 
-1. **Per-voxel lighting** — flood-fill sunlight + block light stored per voxel
-   and sampled in the mesher. Unlocks dark caves, torches, and light-based
-   hostile spawning, all of which the current systems are stubbed for.
-   Hook: add a light array to `Chunk`, sample it in `emitFace`.
+1. **Buckets, and lava** — the liquid simulation is in place and generic over
+   a level; buckets are an item that swaps a source for an empty bucket and
+   back, and lava is a second liquid with its own flow distance, its own light
+   emission (it is already a `lightEmission` away from glowing) and damage on
+   contact. Hook: `RoomSimulation.settleWater` and `Block.WaterFlow*`.
 2. **Web worker meshing/generation** — moves the remaining frame hitches off
-   the main thread; `mesher.ts`/`terrain.ts` are already pure functions.
+   the main thread; `mesher.ts`/`terrain.ts` are already pure functions, and
+   lighting a chunk is now part of that same cost.
 3. **Villager trading** — villagers already have homes, a greeting and a loot
    registry; a trade screen is the chest UI with two slots and a table of
    offers. Hook: `use_on_mob` in the protocol and `InventoryUi`'s container

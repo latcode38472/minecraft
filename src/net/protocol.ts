@@ -9,7 +9,7 @@
 // Encoding is JSON today. Everything goes through encodeMessage/decodeMessage
 // so a binary codec can replace the transport without touching game code.
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Hard room cap: one host plus two guests. Enforced server-side. */
 export const MAX_PLAYERS = 3;
@@ -36,7 +36,7 @@ export const EDITS_PER_MESSAGE = 2000;
 // These mirror the game's own constants; the client asserts they agree at
 // startup (see session.ts) so the two can never silently drift apart.
 export const WORLD_HEIGHT_LIMIT = 72;
-export const MAX_BLOCK_ID = 34;
+export const MAX_BLOCK_ID = 42;
 export const MAX_HORIZONTAL_COORD = 30_000_000;
 
 /** Longest item id accepted from the wire; registry ids are far shorter. */

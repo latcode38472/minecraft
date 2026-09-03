@@ -856,6 +856,28 @@ function buildAtlas(): HTMLCanvasElement {
     return null;
   });
 
+  // Torch: a charred stick with a flame on top. The whole tile is mapped onto
+  // the thin post the mesher builds, so the flame lands at the top of it.
+  fillSpeckled(ctx, Tile.Torch, [0, 0, 0], 0, (px, py, rand) => {
+    // Flame: a bright core fading to orange at the edges of the top rows.
+    if (py < 5) {
+      const heat = 4 - py + (rand - 0.5) * 1.4 - Math.abs(px - 7.5) * 0.55;
+      if (heat > 1.6) return [255, 244, 176];
+      if (heat > 0.4) return [252, 196, 62];
+      if (heat > -0.9) return [232, 128, 36];
+      return [0, 0, 0, 0] as RGBA;
+    }
+    // Stick: a lit wooden shaft, brightest just under the flame.
+    const glow = Math.max(0, 1 - (py - 5) / 6);
+    const shade = px === 4 || px === 11 ? 0.72 : px < 4 || px > 11 ? -1 : 1;
+    if (shade < 0) return [0, 0, 0, 0] as RGBA;
+    return [
+      (128 + glow * 96) * shade,
+      (92 + glow * 58) * shade,
+      (52 + glow * 20) * shade,
+    ];
+  });
+
   // Crops: growth stages as cross sprites, from seedling to golden ear.
   const cropStage = (tile: number, stage: number, ripe: RGB, stalk: RGB, shoots: number): void => {
     fillSpeckled(ctx, tile, [0, 0, 0], 0, (px, py, rand) => {

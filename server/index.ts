@@ -17,7 +17,7 @@
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { BLOCKS, Block } from '../src/blocks.ts';
+import { BLOCKS, Block, isWater } from '../src/blocks.ts';
 import { MAX_HEALTH, MAX_HUNGER, SAVE_INTERVAL_MS } from '../src/constants.ts';
 import {
   clickSlot,
@@ -869,12 +869,15 @@ function handleMessage(client: Client, raw: string): void {
       const placesBlock = heldDef?.block === id;
       const plants = heldDef?.plants === id;
       const below = room.serverWorld.getBlock(bx, by - 1, bz);
+      const torch = id === Block.Torch;
       if (
         !heldDef ||
         (!placesBlock && !plants) ||
         !withinReach(client, bx, by, bz) ||
-        (current !== Block.Air && current !== Block.Water) ||
-        (plants && below !== Block.Farmland)
+        (current !== Block.Air && !isWater(current)) ||
+        (plants && below !== Block.Farmland) ||
+        // A torch needs a full block under it, and will not stand in water.
+        (torch && (isWater(current) || !BLOCKS[below].solid || BLOCKS[below].shape !== 'cube'))
       ) {
         revert();
         return;
